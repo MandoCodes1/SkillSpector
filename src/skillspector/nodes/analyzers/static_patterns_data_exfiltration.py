@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 import sys
 
@@ -25,7 +26,16 @@ from skillspector.models import AnalyzerFinding, Location, Severity
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
-from .common import get_context, get_line_number, is_code_example
+from .common import (
+    apply_import_aliases,
+    build_import_aliases,
+    get_context,
+    get_context_from_lines,
+    get_line_number,
+    is_code_example,
+    resolve_call_name,
+    resolve_dotted_name,
+)
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
@@ -46,14 +56,18 @@ E1_PATTERNS = [
         0.7,
     ),
 ]
-E2_PATTERNS = [
-    (r"for\s+\w+\s*,\s*\w+\s+in\s+os\.environ\.items\(\)", 0.7),
+E2_PYTHON_FALLBACK_PATTERNS = [
+    (r"for\s+\w+\s*,\s*\w+\s+in\s+os\s*\.\s*environ\s*\.\s*items\s*\(\s*\)", 0.7),
     (
-        r"os\.environ\s*\[\s*['\"][^'\"]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)[^'\"]*['\"]\s*\]",
+        r"os\s*\.\s*environ\s*\[\s*['\"][^'\"]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)[^'\"]*['\"]\s*\]",
         0.8,
     ),
-    (r"os\.environ\.get\s*\([^)]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)", 0.7),
-    (r"os\.environ\s*\.\s*copy\s*\(\)", 0.6),
+    (r"os\s*\.\s*environ\s*\.\s*get\s*\([^)]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)", 0.7),
+    (r"os\s*\.\s*environ\s*\.\s*copy\s*\(\s*\)", 0.6),
+    (r"dict\s*\(\s*os\s*\.\s*environ\s*\)", 0.6),
+    (r"\{\s*\*\*\s*os\s*\.\s*environ\s*\}", 0.6),
+]
+E2_OTHER_PATTERNS = [
     (r"(?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)\s+in\s+(?:key|name|var)", 0.8),
     (r"process\.env\s*\[\s*['\"][^'\"]*(?:KEY|SECRET|TOKEN|PASSWORD)[^'\"]*['\"]\s*\]", 0.7),
     (r"Object\.keys\s*\(\s*process\.env\s*\)", 0.6),
@@ -62,6 +76,17 @@ E2_PATTERNS = [
     (r"collect\s+(?:all\s+)?(?:environment\s+variables?|env\s+vars?)", 0.7),
     (r"(?:extract|harvest|gather)\s+(?:api\s+)?keys?\s+from\s+environment", 0.8),
 ]
+E2_PATTERNS = E2_PYTHON_FALLBACK_PATTERNS + E2_OTHER_PATTERNS
+
+_ENVIRONMENT_MAPPING_METHOD_CONFIDENCE = {
+    "copy": 0.6,
+    "items": 0.7,
+    "keys": 0.6,
+    "values": 0.6,
+}
+_ENVIRONMENT_COLLECTION_CALLS = frozenset({"dict", "list", "tuple", "set", "frozenset"})
+_ENVIRONMENT_COPY_CALLS = frozenset({"copy.copy", "copy.deepcopy"})
+_SENSITIVE_ENV_KEY_PATTERN = re.compile(r"(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)", re.IGNORECASE)
 E3_PATTERNS = [
     (r"glob\s*\.\s*glob\s*\([^)]*(?:\.env|\.ssh|\.aws|\.config|credentials)", 0.8),
     (r"os\s*\.\s*walk\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
@@ -119,6 +144,146 @@ E5_PATTERNS = [
 ]
 
 
+def _resolve_expression_name(node: ast.expr, aliases: dict[str, str]) -> str | None:
+    """Resolve a Python expression to its import-normalized dotted name."""
+    name = resolve_dotted_name(node)
+    return apply_import_aliases(name, aliases) if name is not None else None
+
+
+def _is_os_environ_reference(node: ast.expr, aliases: dict[str, str]) -> bool:
+    """Return whether *node* is ``os.environ``, including imported aliases."""
+    return _resolve_expression_name(node, aliases) == "os.environ"
+
+
+def _is_sensitive_environment_key(node: ast.expr) -> bool:
+    """Return whether a literal environment key looks credential-like."""
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and _SENSITIVE_ENV_KEY_PATTERN.search(node.value) is not None
+    )
+
+
+def _has_direct_environ_argument(call: ast.Call, aliases: dict[str, str]) -> bool:
+    """Return whether a call receives ``os.environ`` directly, not via a lookup."""
+    return any(_is_os_environ_reference(arg, aliases) for arg in call.args) or any(
+        keyword.arg is None and _is_os_environ_reference(keyword.value, aliases)
+        for keyword in call.keywords
+    )
+
+
+def _is_dynamic_copy_call(call: ast.Call, aliases: dict[str, str]) -> bool:
+    """Recognize ``__import__('copy').copy(...)`` without broad call matching."""
+    func = call.func
+    if not isinstance(func, ast.Attribute) or func.attr not in {"copy", "deepcopy"}:
+        return False
+    if (
+        not isinstance(func.value, ast.Call)
+        or resolve_call_name(func.value, aliases) != "__import__"
+    ):
+        return False
+    return (
+        bool(func.value.args)
+        and isinstance(func.value.args[0], ast.Constant)
+        and func.value.args[0].value == "copy"
+    )
+
+
+def _analyze_python_environment_reads(content: str, file_path: str) -> list[AnalyzerFinding] | None:
+    """Detect materializing or enumerating the complete ``os.environ`` mapping.
+
+    A full mapping copy or enumeration is an environment-harvesting signal, unlike a
+    single-key lookup or passing ``os.environ`` through to a child process. AST parsing
+    makes the check insensitive to formatting and lets it resolve ``os`` / ``environ``
+    import aliases.
+
+    ``None`` means the source could not be parsed, so callers can retain the regex
+    fallback for malformed Python files.
+    """
+    try:
+        tree = ast.parse(content, filename=file_path)
+    except (SyntaxError, ValueError):
+        return None
+
+    aliases = build_import_aliases(tree)
+    lines = content.splitlines()
+    findings: list[AnalyzerFinding] = []
+    emitted: set[int] = set()
+    tag = [PatternCategory.DATA_EXFILTRATION.value]
+
+    def emit(node: ast.AST, confidence: float) -> None:
+        node_id = id(node)
+        if node_id in emitted:
+            return
+        emitted.add(node_id)
+        lineno = getattr(node, "lineno", 1)
+        end_lineno = getattr(node, "end_lineno", None)
+        matched_text = ast.get_source_segment(content, node)
+        findings.append(
+            AnalyzerFinding(
+                rule_id="E2",
+                message="Env Variable Harvesting",
+                severity=Severity.HIGH,
+                location=Location(file=file_path, start_line=lineno, end_line=end_lineno),
+                confidence=confidence,
+                tags=tag,
+                context=get_context_from_lines(lines, lineno),
+                matched_text=(matched_text or "os.environ")[:200],
+            )
+        )
+
+    for ast_node in ast.walk(tree):
+        if isinstance(ast_node, ast.Call):
+            call_name = resolve_call_name(ast_node, aliases)
+            if call_name == "os.environ.get" and ast_node.args:
+                if _is_sensitive_environment_key(ast_node.args[0]):
+                    emit(ast_node, 0.7)
+                continue
+
+            if call_name is not None:
+                method = call_name.rpartition(".")[2]
+                if (
+                    call_name.startswith("os.environ.")
+                    and method in _ENVIRONMENT_MAPPING_METHOD_CONFIDENCE
+                ):
+                    emit(ast_node, _ENVIRONMENT_MAPPING_METHOD_CONFIDENCE[method])
+                    continue
+                if call_name in _ENVIRONMENT_COLLECTION_CALLS and _has_direct_environ_argument(
+                    ast_node, aliases
+                ):
+                    emit(ast_node, 0.6)
+                    continue
+                if call_name in _ENVIRONMENT_COPY_CALLS and _has_direct_environ_argument(
+                    ast_node, aliases
+                ):
+                    emit(ast_node, 0.6)
+                    continue
+
+            if _is_dynamic_copy_call(ast_node, aliases) and _has_direct_environ_argument(
+                ast_node, aliases
+            ):
+                emit(ast_node, 0.6)
+
+        elif isinstance(ast_node, ast.Subscript):
+            if _is_os_environ_reference(ast_node.value, aliases) and _is_sensitive_environment_key(
+                ast_node.slice
+            ):
+                emit(ast_node, 0.8)
+
+        elif isinstance(ast_node, ast.Dict):
+            if any(
+                key is None and _is_os_environ_reference(value, aliases)
+                for key, value in zip(ast_node.keys, ast_node.values, strict=True)
+            ):
+                emit(ast_node, 0.6)
+
+        elif isinstance(ast_node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            if _is_os_environ_reference(ast_node.iter, aliases):
+                emit(ast_node.iter, 0.7)
+
+    return findings
+
+
 def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
     """Analyze content for data exfiltration patterns (E1–E5)."""
     findings: list[AnalyzerFinding] = []
@@ -151,7 +316,16 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     matched_text=match.group(0)[:200],
                 )
             )
-    for pattern, confidence in E2_PATTERNS:
+    e2_patterns = E2_PATTERNS
+    if file_type == "python":
+        python_e2_findings = _analyze_python_environment_reads(content, file_path)
+        if python_e2_findings is None:
+            logger.debug("Using E2 regex fallback for unparsable Python file: %s", file_path)
+        else:
+            findings.extend(python_e2_findings)
+            e2_patterns = E2_OTHER_PATTERNS
+
+    for pattern, confidence in e2_patterns:
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = get_line_number(content, match.start())
             findings.append(
