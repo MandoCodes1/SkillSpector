@@ -26,10 +26,12 @@ import os
 from pathlib import Path
 
 import pytest
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from skillspector.constants import MODEL_CONFIG
 from skillspector.nodes.build_context import build_context
 from skillspector.providers import reset_provider, use_provider
+from skillspector.python_ast import ParsedPythonFile, get_python_ast
 from skillspector.state import SkillspectorState
 
 _OMS_FIXTURE = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
@@ -90,7 +92,16 @@ def test_build_context_real_directory_with_skill_md(tmp_path: Path) -> None:
         "allowed-tools": [],
         "parameters": [],
     }
-    assert result["ast_cache"] == {}
+    python_ast_cache_key = result["python_ast_cache_key"]
+    assert isinstance(python_ast_cache_key, str)
+    parsed_python = get_python_ast(
+        python_ast_cache_key,
+        result["file_cache"]["scripts/run.py"],
+        "scripts/run.py",
+    )
+    assert isinstance(parsed_python, ParsedPythonFile)
+    assert parsed_python.is_parseable
+    assert parsed_python.tree is not None
     assert result["previous_manifest"] is None
     assert "component_metadata" in result
     assert isinstance(result["component_metadata"], list)
@@ -104,6 +115,27 @@ def test_build_context_real_directory_with_skill_md(tmp_path: Path) -> None:
     assert run_py_meta.get("lines") == 1
     assert "has_executable_scripts" in result
     assert result["has_executable_scripts"] is True
+
+
+def test_build_context_ast_cache_skips_oversized_python(tmp_path: Path) -> None:
+    """Prewarming respects the same source-size limit as AST analyzers."""
+    from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS
+
+    (tmp_path / "oversized.py").write_text("x = 1\n" + "#" * MAX_PYTHON_AST_SOURCE_CHARS)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert result["python_ast_cache_key"] is None
+
+
+def test_build_context_ast_cache_handle_is_checkpoint_serializable(tmp_path: Path) -> None:
+    """Raw AST objects remain in runtime storage, not checkpointed graph state."""
+    (tmp_path / "script.py").write_text("import os\n", encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    serializer = JsonPlusSerializer()
+    assert serializer.dumps_typed(result)
 
 
 def test_build_context_missing_skill_path() -> None:

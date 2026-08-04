@@ -40,6 +40,7 @@ from skillspector.inspection_ledger import (
     ledger_event,
 )
 from skillspector.logging_config import get_logger
+from skillspector.python_ast import prewarm_python_ast_cache
 from skillspector.state import SkillspectorState
 
 logger = get_logger(__name__)
@@ -428,6 +429,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         for path in sorted(recognized_oms_signatures)
     ]
     file_cache, cache_events = _read_file_cache(skill_dir, components)
+    python_ast_cache_key = prewarm_python_ast_cache(components, file_cache)
     manifest = _parse_manifest(skill_dir)
     component_metadata, has_executable_scripts = _build_component_metadata(
         skill_dir, inventoried_components, file_cache, recognized_oms_signatures
@@ -438,6 +440,7 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         "file_cache": file_cache,
         "inspection_ledger": [*discovery_events, *signature_events, *cache_events],
         "ast_cache": {},
+        "python_ast_cache_key": python_ast_cache_key,
         "manifest": manifest,
         "previous_manifest": None,
         "model_config": build_model_config(),

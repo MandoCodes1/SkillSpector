@@ -160,6 +160,14 @@ api_key = os.environ.get("OPENAI_API_KEY")
         assert len(findings) >= 1
         assert any(f.rule_id == "E2" for f in findings)
 
+    def test_e2_unparseable_python_uses_regex_fallback(self) -> None:
+        """Malformed Python preserves the pre-AST E2 regex coverage."""
+        content = "import os\nsecret = os.environ.get('API_KEY')\ndef broken(\n"
+
+        findings = data_exfiltration_module.analyze(content, "script.py", "python")
+
+        assert any(finding.rule_id == "E2" for finding in findings)
+
     @pytest.mark.parametrize(
         "expression",
         [

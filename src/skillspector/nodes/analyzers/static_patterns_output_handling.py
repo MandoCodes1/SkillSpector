@@ -30,11 +30,11 @@ import sys
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import (
-    build_import_aliases,
     get_context,
     get_context_from_lines,
     get_line_number,
@@ -47,6 +47,7 @@ from .pattern_defaults import PatternCategory
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_output_handling"
+USES_PYTHON_AST = True
 
 _SUBPROCESS_OUTPUT_NAMES = frozenset(
     {"response", "output", "result", "answer", "completion", "reply", "generated"}
@@ -210,18 +211,22 @@ def _analyze_subprocess_fallback(
 
 
 def _analyze_python_subprocess_calls(
-    content: str, file_path: str, tag: list[str]
+    content: str,
+    file_path: str,
+    tag: list[str],
+    python_ast: ParsedPythonFile | None = None,
 ) -> list[AnalyzerFinding]:
     """Detect output-like values used as Python subprocess command arguments."""
-    try:
-        tree = ast.parse(content, filename=file_path)
-    except SyntaxError:
+    if python_ast is None:
+        python_ast = parse_python_source(content, file_path)
+    tree = python_ast.tree
+    if tree is None:
         # Static pattern analysis also runs over partial/generated Python files.
         # Retain best-effort subprocess coverage without failing the analyzer.
         return _analyze_subprocess_fallback(content, file_path, tag)
 
-    aliases = build_import_aliases(tree)
-    lines = content.splitlines()
+    aliases = python_ast.import_aliases
+    lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
 
     for node in ast.walk(tree):
@@ -261,7 +266,13 @@ def _analyze_python_subprocess_calls(
     return findings
 
 
-def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+def analyze(
+    content: str,
+    file_path: str,
+    file_type: str,
+    *,
+    python_ast: ParsedPythonFile | None = None,
+) -> list[AnalyzerFinding]:
     """Analyze content for output handling patterns (OH1–OH3)."""
     findings: list[AnalyzerFinding] = []
 
@@ -294,7 +305,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     if file_type == "python":
-        subprocess_findings = _analyze_python_subprocess_calls(content, file_path, tag)
+        subprocess_findings = _analyze_python_subprocess_calls(content, file_path, tag, python_ast)
     else:
         # Other file types can contain embedded Python snippets, so preserve the
         # analyzer's previous best-effort subprocess coverage for those files.

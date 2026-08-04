@@ -23,12 +23,12 @@ import sys
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.python_ast import ParsedPythonFile, parse_python_source
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import (
     apply_import_aliases,
-    build_import_aliases,
     get_context,
     get_context_from_lines,
     get_line_number,
@@ -41,6 +41,7 @@ from .pattern_defaults import PatternCategory
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_data_exfiltration"
+USES_PYTHON_AST = True
 
 E1_PATTERNS = [
     (r"requests\s*\.\s*(?:post|put)\s*\(\s*['\"]https?://", 0.6),
@@ -189,7 +190,11 @@ def _is_dynamic_copy_call(call: ast.Call, aliases: dict[str, str]) -> bool:
     )
 
 
-def _analyze_python_environment_reads(content: str, file_path: str) -> list[AnalyzerFinding] | None:
+def _analyze_python_environment_reads(
+    content: str,
+    file_path: str,
+    python_ast: ParsedPythonFile | None = None,
+) -> list[AnalyzerFinding] | None:
     """Detect materializing or enumerating the complete ``os.environ`` mapping.
 
     A full mapping copy or enumeration is an environment-harvesting signal, unlike a
@@ -198,15 +203,17 @@ def _analyze_python_environment_reads(content: str, file_path: str) -> list[Anal
     import aliases.
 
     ``None`` means the source could not be parsed, so callers can retain the regex
-    fallback for malformed Python files.
+    fallback for malformed Python files.  Standalone callers parse through the
+    shared utility; graph scans pass the prewarmed result.
     """
-    try:
-        tree = ast.parse(content, filename=file_path)
-    except (SyntaxError, ValueError):
+    if python_ast is None:
+        python_ast = parse_python_source(content, file_path)
+    tree = python_ast.tree
+    if tree is None:
         return None
 
-    aliases = build_import_aliases(tree)
-    lines = content.splitlines()
+    aliases = python_ast.import_aliases
+    lines = python_ast.lines
     findings: list[AnalyzerFinding] = []
     emitted: set[int] = set()
     tag = [PatternCategory.DATA_EXFILTRATION.value]
@@ -284,7 +291,13 @@ def _analyze_python_environment_reads(content: str, file_path: str) -> list[Anal
     return findings
 
 
-def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+def analyze(
+    content: str,
+    file_path: str,
+    file_type: str,
+    *,
+    python_ast: ParsedPythonFile | None = None,
+) -> list[AnalyzerFinding]:
     """Analyze content for data exfiltration patterns (E1–E5)."""
     findings: list[AnalyzerFinding] = []
 
@@ -318,7 +331,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             )
     e2_patterns = E2_PATTERNS
     if file_type == "python":
-        python_e2_findings = _analyze_python_environment_reads(content, file_path)
+        python_e2_findings = _analyze_python_environment_reads(content, file_path, python_ast)
         if python_e2_findings is None:
             logger.debug("Using E2 regex fallback for unparsable Python file: %s", file_path)
         else:

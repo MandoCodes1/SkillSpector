@@ -30,6 +30,11 @@ from skillspector.inspection_ledger import (
 )
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Finding
+from skillspector.python_ast import (
+    MAX_PYTHON_AST_SOURCE_CHARS,
+    ParsedPythonFile,
+    get_python_ast,
+)
 from skillspector.state import AnalyzerNodeResponse
 
 from .common import is_code_example
@@ -57,7 +62,7 @@ FILE_TYPES: dict[str, str] = {
     ".rs": "rust",
 }
 
-MAX_FILE_CHARS = 1_000_000
+MAX_FILE_CHARS = MAX_PYTHON_AST_SOURCE_CHARS
 _EVAL_DATASET_FILES = {
     "evals/evals.json",
     "evals/evals.jsonl",
@@ -308,14 +313,36 @@ def analyzer_finding_to_finding(
     )
 
 
-def _scan_path(path: str, content: str, pattern_modules: list) -> list[Finding]:
+def _uses_python_ast(module: object) -> bool:
+    """Return whether a pattern module explicitly opts into the shared AST hook."""
+    return getattr(module, "USES_PYTHON_AST", False) is True
+
+
+def _scan_path(
+    path: str,
+    content: str,
+    pattern_modules: list,
+    python_ast_cache_key: str | None = None,
+) -> list[Finding]:
     """Run pattern modules for one already-applicable file path."""
     findings: list[Finding] = []
     file_type = _infer_file_type(path)
     is_doc_markdown = _is_documentation_markdown(path)
     is_non_executable = file_type in _NON_EXECUTABLE_FILE_TYPES
+    python_ast: ParsedPythonFile | None = None
+    if file_type == "python" and any(_uses_python_ast(module) for module in pattern_modules):
+        python_ast = get_python_ast(python_ast_cache_key, content, path)
+
     for module in pattern_modules:
-        raw = module.analyze(content=content, file_path=path, file_type=file_type)
+        if file_type == "python" and _uses_python_ast(module):
+            raw = module.analyze(
+                content=content,
+                file_path=path,
+                file_type=file_type,
+                python_ast=python_ast,
+            )
+        else:
+            raw = module.analyze(content=content, file_path=path, file_type=file_type)
         for af in raw:
             if _is_env_file_reference_in_docs(af, file_type, path, content):
                 logger.debug(
@@ -372,6 +399,7 @@ def run_static_patterns(
     """
     components = cast(list[str], state.get("components") or [])
     file_cache = cast(dict[str, str], state.get("file_cache") or {})
+    python_ast_cache_key = cast(str | None, state.get("python_ast_cache_key"))
     findings: list[Finding] = []
 
     for path in components:
@@ -393,7 +421,7 @@ def run_static_patterns(
         if _is_binary_file(path, content):
             logger.debug("Skipping binary file: %s", path)
             continue
-        findings.extend(_scan_path(path, content, pattern_modules))
+        findings.extend(_scan_path(path, content, pattern_modules, python_ast_cache_key))
 
     return findings
 
@@ -406,6 +434,7 @@ def run_static_patterns_with_ledger(
     analyzer_id = str(getattr(pattern_modules[0], "ANALYZER_ID", "static_patterns"))
     components = cast(list[str], state.get("components") or [])
     file_cache = cast(dict[str, str], state.get("file_cache") or {})
+    python_ast_cache_key = cast(str | None, state.get("python_ast_cache_key"))
     findings: list[Finding] = []
     events: list[InspectionLedgerEvent] = []
 
@@ -449,7 +478,7 @@ def run_static_patterns_with_ledger(
                 )
             else:
                 try:
-                    path_findings = _scan_path(path, content, pattern_modules)
+                    path_findings = _scan_path(path, content, pattern_modules, python_ast_cache_key)
                 except Exception as exc:
                     logger.warning("%s: scan error on %s: %s", analyzer_id, path, exc)
                     event = ledger_event(
