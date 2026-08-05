@@ -150,12 +150,16 @@ for key, val in os.environ.items():
         assert len(findings) >= 1
         assert any(f.rule_id == "E2" for f in findings)
 
-    def test_e2_env_get_secret(self) -> None:
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            'os.environ.get("OPENAI_API_KEY")',
+            'os.environ.get(key="OPENAI_API_KEY")',
+        ],
+    )
+    def test_e2_env_get_secret(self, expression: str) -> None:
         """Detection of specific secret access."""
-        content = """
-import os
-api_key = os.environ.get("OPENAI_API_KEY")
-"""
+        content = f"import os\napi_key = {expression}\n"
         findings = data_exfiltration_module.analyze(content, "script.py", "python")
         assert len(findings) >= 1
         assert any(f.rule_id == "E2" for f in findings)
@@ -214,6 +218,7 @@ api_key = os.environ.get("OPENAI_API_KEY")
         [
             'os.environ["PATH"]',
             'os.environ.get("PATH")',
+            'os.environ.get(key="PATH", default="API_KEY")',
             "os.environ.copy",
             "2 ** os.environ",
             "subprocess.run(command, env=os.environ, check=False)",

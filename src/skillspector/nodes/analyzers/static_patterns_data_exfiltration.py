@@ -242,8 +242,16 @@ def _analyze_python_environment_reads(
     for ast_node in ast.walk(tree):
         if isinstance(ast_node, ast.Call):
             call_name = resolve_call_name(ast_node, aliases)
-            if call_name == "os.environ.get" and ast_node.args:
-                if _is_sensitive_environment_key(ast_node.args[0]):
+            if call_name == "os.environ.get":
+                key = (
+                    ast_node.args[0]
+                    if ast_node.args
+                    else next(
+                        (keyword.value for keyword in ast_node.keywords if keyword.arg == "key"),
+                        None,
+                    )
+                )
+                if key is not None and _is_sensitive_environment_key(key):
                     emit(ast_node, 0.7)
                 continue
 
