@@ -102,6 +102,13 @@ def test_scp_url_is_git_url() -> None:
     assert InputHandler()._is_git_url("git@github.com:org/repo.git") is True
 
 
+def test_http_urls_are_not_accepted_as_remote_inputs() -> None:
+    """Network inputs require HTTPS unless they use SSH's scp-style syntax."""
+    handler = InputHandler()
+    assert handler._is_git_url("http://github.com/org/repo.git") is False
+    assert handler._is_file_url("http://raw.githubusercontent.com/org/repo/SKILL.md") is False
+
+
 def test_validate_url_host_scp_extracts_github() -> None:
     """_validate_url_host extracts 'github.com' from an scp-style URL."""
     host = InputHandler()._validate_url_host("git@github.com:org/repo.git", ALLOWED_GIT_HOSTS)

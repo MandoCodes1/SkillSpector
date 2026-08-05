@@ -1,3 +1,10 @@
+### 2.5.3 (Tuesday, August 04, 2026)
+### Features/Bug Fixes
+* fix(analyzers): share Python AST parsing for environment-read detection (#332)
+* fix(output-handling): avoid RegExp.exec false positives (#341)
+* docs(skill): allow delegated import MR preparation
+* docs(lifecycle): optimize OSS import queue and cutoff
+---
 ### 2.5.2 (Tuesday, August 04, 2026)
 ### Features/Bug Fixes
 * test(mp2): lock the layout-span guard against regressions (#342)

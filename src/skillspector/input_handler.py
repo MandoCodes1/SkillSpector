@@ -176,7 +176,7 @@ class InputHandler:
 
     def _is_git_url(self, path: str) -> bool:
         """Check if path is a Git repository URL."""
-        if not path.startswith(("http://", "https://", "git@")):
+        if not path.startswith(("https://", "git@")):
             return False
         parsed = urlparse(path)
         host = parsed.hostname or ""
@@ -190,7 +190,7 @@ class InputHandler:
 
     def _is_file_url(self, path: str) -> bool:
         """Check if path is a direct file URL."""
-        if not path.startswith(("http://", "https://")):
+        if not path.startswith("https://"):
             return False
         return not self._is_git_url(path)
 
