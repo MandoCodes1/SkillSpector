@@ -23,14 +23,16 @@ import logging
 import re
 import unicodedata
 
+from skillspector.inference_usage import InferenceUsageCollector, InferenceUsageRecord
 from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     analyzer_status_event,
     ledger_event,
 )
-from skillspector.llm_utils import chat_completion
+from skillspector.llm_utils import chat_completion, new_inference_usage_collector
 from skillspector.models import Finding
+from skillspector.providers import get_active_provider
 from skillspector.state import (
     AnalyzerNodeResponse,
     LLMCallRecord,
@@ -688,20 +690,29 @@ _TP4_EXECUTABLE_TYPES = frozenset(
 )
 
 
-def _check_tp4(state: SkillspectorState) -> tuple[list[Finding], LLMCallRecord | None, str | None]:
+def _check_tp4(
+    state: SkillspectorState,
+) -> tuple[
+    list[Finding],
+    LLMCallRecord | None,
+    str | None,
+    list[InferenceUsageRecord],
+]:
     """TP4: LLM-based description-behavior mismatch detection.
 
-    Returns ``(findings, record, error_class)`` where *record* is the LLM-call telemetry for
-    ``llm_call_log`` — or ``None`` when no LLM call was attempted (no
-    description / no executable code), so an intentional no-op is never counted
-    as a degraded LLM stage. See :func:`skillspector.state.llm_call_record`.
+    Returns ``(findings, record, error_class, inference_usage)`` where
+    *record* is the LLM-call telemetry for ``llm_call_log`` — or ``None`` when
+    no LLM call was attempted (no description / no executable code), so an
+    intentional no-op is never counted as a degraded LLM stage. Token usage is
+    emitted only when the provider response supplied it.
     """
     attempted = False
+    usage_collector: InferenceUsageCollector | None = None
     try:
         manifest: dict = state.get("manifest") or {}
         description = manifest.get("description")
         if not description or not isinstance(description, str) or not description.strip():
-            return [], None, None
+            return [], None, None, []
 
         triggers = manifest.get("triggers") or []
         permissions = manifest.get("permissions")
@@ -723,12 +734,17 @@ def _check_tp4(state: SkillspectorState) -> tuple[list[Finding], LLMCallRecord |
                 code_parts.append(f"### {path} ({file_type})\n{content}")
 
         if not code_parts:
-            return [], None, None
+            return [], None, None, []
 
         code_contents = "\n\n".join(code_parts)
 
         model_config: dict = state.get("model_config") or {}
         model = model_config.get(ANALYZER_ID) or model_config.get("default")
+        usage_collector = new_inference_usage_collector(
+            node=ANALYZER_ID,
+            request_kind="chat_completion",
+            model=model or get_active_provider().resolve_model(),
+        )
 
         prompt = f"""You are a security auditor. Your task: determine whether a skill's declared
 description accurately represents what its code actually does.
@@ -768,7 +784,12 @@ Respond in JSON matching this exact schema:
 }}"""
 
         attempted = True
-        response = chat_completion(prompt, model=model)
+        response = chat_completion(
+            prompt,
+            model=model,
+            usage_collector=usage_collector,
+            node=ANALYZER_ID,
+        )
 
         # Parse JSON — handle optional ```json code blocks
         json_text = response.strip()
@@ -785,11 +806,11 @@ Respond in JSON matching this exact schema:
         ok_record = llm_call_record(ANALYZER_ID, ok=True)
 
         if not result.get("is_mismatch"):
-            return [], ok_record, None
+            return [], ok_record, None, usage_collector.snapshot()
 
         confidence = float(result.get("confidence", 0.0))
         if confidence < 0.5:
-            return [], ok_record, None
+            return [], ok_record, None, usage_collector.snapshot()
 
         severity = "HIGH" if confidence >= 0.7 else "MEDIUM"
 
@@ -821,6 +842,7 @@ Respond in JSON matching this exact schema:
             ],
             ok_record,
             None,
+            usage_collector.snapshot(),
         )
 
     except Exception as exc:
@@ -828,8 +850,13 @@ Respond in JSON matching this exact schema:
         # Only record a failure if the LLM call was actually attempted; a failure
         # before the call (e.g. building the prompt) is not an LLM-stage failure.
         if attempted:
-            return [], llm_call_record(ANALYZER_ID, ok=False, error=str(exc)), type(exc).__name__
-        return [], None, None
+            return (
+                [],
+                llm_call_record(ANALYZER_ID, ok=False, error=str(exc)),
+                type(exc).__name__,
+                usage_collector.snapshot() if usage_collector is not None else [],
+            )
+        return [], None, None, []
 
 
 # ---------------------------------------------------------------------------
@@ -891,8 +918,9 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     tp4_record: LLMCallRecord | None = None
     tp4_findings: list[Finding] = []
     tp4_error_class: str | None = None
+    tp4_usage: list[InferenceUsageRecord] = []
     if state.get("use_llm", True):
-        tp4_findings, tp4_record, tp4_error_class = _check_tp4(state)
+        tp4_findings, tp4_record, tp4_error_class, tp4_usage = _check_tp4(state)
         findings.extend(tp4_findings)
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
@@ -929,4 +957,5 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     # degradation detector counts this node consistently with the semantic ones.
     if tp4_record is not None:
         result["llm_call_log"] = [tp4_record]
+        result["inference_usage"] = tp4_usage
     return result

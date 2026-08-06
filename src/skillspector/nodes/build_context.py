@@ -94,6 +94,42 @@ def _resolve_skill_dir(state: SkillspectorState) -> Path:
     return resolved
 
 
+def _selected_baseline_component(
+    state: SkillspectorState,
+    skill_dir: Path,
+    inventoried_components: list[str],
+) -> str | None:
+    """Return the selected baseline's component path when it is inside the skill.
+
+    The CLI records the exact path selected by ``scan --baseline`` or targeted
+    by ``baseline -o``. Excluding only that file prevents a rule's own sensitive
+    message glob from producing a fresh finding (or entering regenerated
+    fingerprints) while leaving every sibling YAML/JSON file in normal scope.
+    """
+    raw_path = state.get("baseline_path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+
+    baseline_path = Path(raw_path)
+    candidates: list[Path] = [baseline_path]
+    try:
+        resolved = baseline_path.resolve()
+    except (OSError, RuntimeError):
+        resolved = None
+    if resolved is not None and resolved != baseline_path:
+        candidates.append(resolved)
+
+    inventory = frozenset(inventoried_components)
+    for candidate in candidates:
+        try:
+            relative = candidate.relative_to(skill_dir).as_posix()
+        except ValueError:
+            continue
+        if relative in inventory:
+            return relative
+    return None
+
+
 def _walk_skill_files(
     skill_dir: Path,
 ) -> tuple[list[str], list[InspectionLedgerEvent]]:
@@ -417,7 +453,13 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         and _is_valid_oms_signature(skill_dir / _OMS_SIGNATURE_PATH)
         else set()
     )
-    components = [path for path in inventoried_components if path not in recognized_oms_signatures]
+    selected_baseline = _selected_baseline_component(state, skill_dir, inventoried_components)
+    selected_baselines = frozenset({selected_baseline} if selected_baseline else set())
+    components = [
+        path
+        for path in inventoried_components
+        if path not in recognized_oms_signatures and path not in selected_baselines
+    ]
     signature_events = [
         ledger_event(
             outcome=LedgerOutcome.OUT_OF_SCOPE,
@@ -428,17 +470,35 @@ def build_context(state: SkillspectorState) -> dict[str, object]:
         )
         for path in sorted(recognized_oms_signatures)
     ]
+    baseline_events = [
+        ledger_event(
+            outcome=LedgerOutcome.OUT_OF_SCOPE,
+            record_type=LedgerRecordType.SCOPE_BOUNDARY,
+            phase="discovery",
+            path=path,
+            reason=LedgerReason.BASELINE_FILE,
+        )
+        for path in sorted(selected_baselines)
+    ]
     file_cache, cache_events = _read_file_cache(skill_dir, components)
     python_ast_cache_key = prewarm_python_ast_cache(components, file_cache)
     manifest = _parse_manifest(skill_dir)
+    metadata_components = [
+        path for path in inventoried_components if path not in selected_baselines
+    ]
     component_metadata, has_executable_scripts = _build_component_metadata(
-        skill_dir, inventoried_components, file_cache, recognized_oms_signatures
+        skill_dir, metadata_components, file_cache, recognized_oms_signatures
     )
 
     return {
         "components": components,
         "file_cache": file_cache,
-        "inspection_ledger": [*discovery_events, *signature_events, *cache_events],
+        "inspection_ledger": [
+            *discovery_events,
+            *signature_events,
+            *baseline_events,
+            *cache_events,
+        ],
         "ast_cache": {},
         "python_ast_cache_key": python_ast_cache_key,
         "manifest": manifest,

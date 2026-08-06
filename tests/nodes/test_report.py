@@ -775,6 +775,51 @@ def test_report_not_degraded_when_no_llm_calls(monkeypatch: pytest.MonkeyPatch) 
     assert "llm_calls_attempted" not in meta
 
 
+def test_json_report_exposes_only_sanitized_provider_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))
+    state: SkillspectorState = {
+        "filtered_findings": [],
+        "component_metadata": [],
+        "has_executable_scripts": False,
+        "manifest": {},
+        "output_format": "json",
+        "use_llm": True,
+        "llm_call_log": [llm_call_record("meta_analyzer", ok=True)],
+        "inference_usage": [
+            {
+                "node": "meta_analyzer",
+                "request_kind": "structured_output",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "model_source": "provider_response",
+                "usage_source": "provider_response",
+                "prompt_tokens": 123,
+                "completion_tokens": 45,
+                "total_tokens": 168,
+                "secret": "not serialized",
+            }
+        ],
+    }
+
+    meta = _meta_from_json_report(state)
+
+    assert meta["inference_usage"] == [
+        {
+            "node": "meta_analyzer",
+            "request_kind": "structured_output",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "model_source": "provider_response",
+            "usage_source": "provider_response",
+            "prompt_tokens": 123,
+            "completion_tokens": 45,
+            "total_tokens": 168,
+        }
+    ]
+
+
 def test_report_no_llm_failures_not_counted_as_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
     """use_llm False -> failures (if any) never mark the scan degraded."""
     monkeypatch.setattr("skillspector.nodes.report.is_llm_available", lambda: (True, None))

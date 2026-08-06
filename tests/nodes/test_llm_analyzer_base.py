@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage
+from pydantic import ValidationError
 
 from skillspector.inspection_ledger import LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import (
@@ -39,6 +40,7 @@ from skillspector.llm_analyzer_base import (
     number_lines,
     resolve_max_concurrency,
 )
+from skillspector.llm_utils import AgentCLIChatModel
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
@@ -192,6 +194,13 @@ def _mock_get_chat_model(*_args, **_kwargs):
 
 
 MOCK_PATCH_TARGET = "skillspector.llm_analyzer_base.get_chat_model"
+
+
+def _structured_response_validation_error() -> ValidationError:
+    """Build the error raised when a provider returns malformed findings."""
+    with pytest.raises(ValidationError) as exc_info:
+        LLMAnalysisResult.model_validate({"findings": "not-an-array"})
+    return exc_info.value
 
 
 class _RawTextAnalyzer(LLMAnalyzerBase):
@@ -405,6 +414,18 @@ class TestRawStringMode:
         assert results[0][1] == ["chunk"]
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_run_batches_uses_agent_cli_message_content(self) -> None:
+        analyzer = _RawTextAnalyzer(base_prompt="test", model=self.MODEL)
+        provider = MagicMock()
+        provider.complete.return_value = "raw CLI response"
+        analyzer._llm = AgentCLIChatModel(provider, self.MODEL, 1024)
+
+        results = analyzer.run_batches([Batch(file_path="a.py", content="code")])
+
+        assert results[0][1] == ["raw CLI response"]
+        provider.complete.assert_called_once()
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     async def test_arun_batches_uses_message_text_for_content_blocks(self) -> None:
         analyzer = _RawTextAnalyzer(base_prompt="test", model=self.MODEL)
         analyzer._llm.ainvoke = AsyncMock(
@@ -414,6 +435,100 @@ class TestRawStringMode:
         results = await analyzer.arun_batches([Batch(file_path="a.py", content="code")])
 
         assert results[0][1] == ["async chunk"]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_arun_batches_uses_agent_cli_message_content(self) -> None:
+        analyzer = _RawTextAnalyzer(base_prompt="test", model=self.MODEL)
+        provider = MagicMock()
+        provider.complete.return_value = "async raw CLI response"
+        analyzer._llm = AgentCLIChatModel(provider, self.MODEL, 1024)
+
+        results = await analyzer.arun_batches([Batch(file_path="a.py", content="code")])
+
+        assert results[0][1] == ["async raw CLI response"]
+        provider.complete.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# LLMAnalyzerBase.run_batches (sync sequential execution)
+# ---------------------------------------------------------------------------
+
+
+class TestRunBatches:
+    MODEL = "nvidia/openai/gpt-oss-120b"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_structured_validation_error_recovers_on_retry(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[
+                _structured_response_validation_error(),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+        batch = Batch(file_path="a.py", content="code")
+
+        outcome = analyzer.run_batches_detailed([batch])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.invoke.call_count == 2
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_structured_validation_error_isolated_after_retry(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[
+                _structured_response_validation_error(),
+                _structured_response_validation_error(),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+        batches = [
+            Batch(file_path="malformed.py", content="bad response"),
+            Batch(file_path="clean.py", content="clean response"),
+        ]
+
+        outcome = analyzer.run_batches_detailed(batches)
+
+        assert [item[0].file_path for item in outcome.successful] == ["clean.py"]
+        assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
+            ("malformed.py", "ValidationError")
+        ]
+        assert analyzer._structured_llm.invoke.call_count == 3
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_value_error_still_propagates_without_retry(self) -> None:
+        """Non-validation ValueError instances still signal misconfiguration."""
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(side_effect=ValueError("no API key"))
+
+        with pytest.raises(ValueError, match="no API key"):
+            analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        analyzer._structured_llm.invoke.assert_called_once()
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_custom_parser_validation_error_propagates_without_retry(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(return_value=LLMAnalysisResult(findings=[]))
+        analyzer.parse_response = MagicMock(side_effect=_structured_response_validation_error())
+
+        with pytest.raises(ValidationError):
+            analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        analyzer._structured_llm.invoke.assert_called_once()
+        analyzer.parse_response.assert_called_once()
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_prompt_validation_error_propagates_without_invoke(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer.build_prompt = MagicMock(side_effect=_structured_response_validation_error())
+
+        with pytest.raises(ValidationError):
+            analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        analyzer._structured_llm.invoke.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +576,68 @@ class TestARunBatches:
         assert [batch.file_path for batch, _ in outcome.successful] == ["a.py"]
         assert outcome.failures[0].batch.file_path == "b.py"
         assert outcome.failures[0].error_class == "TimeoutError"
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_structured_validation_error_recovers_on_retry(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[
+                _structured_response_validation_error(),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+        batch = Batch(file_path="a.py", content="code")
+
+        outcome = await analyzer.arun_batches_detailed([batch])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.ainvoke.call_count == 2
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_structured_validation_error_isolated_after_retry(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[
+                _structured_response_validation_error(),
+                _structured_response_validation_error(),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+        batches = [
+            Batch(file_path="malformed.py", content="bad response"),
+            Batch(file_path="clean.py", content="clean response"),
+        ]
+
+        outcome = await analyzer.arun_batches_detailed(batches, max_concurrency=1)
+
+        assert [item[0].file_path for item in outcome.successful] == ["clean.py"]
+        assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
+            ("malformed.py", "ValidationError")
+        ]
+        assert analyzer._structured_llm.ainvoke.call_count == 3
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_custom_parser_validation_error_propagates_without_retry(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(return_value=LLMAnalysisResult(findings=[]))
+        analyzer.parse_response = MagicMock(side_effect=_structured_response_validation_error())
+
+        with pytest.raises(ValidationError):
+            await analyzer.arun_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        analyzer._structured_llm.ainvoke.assert_awaited_once()
+        analyzer.parse_response.assert_called_once()
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_prompt_validation_error_propagates_without_invoke(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer.build_prompt = MagicMock(side_effect=_structured_response_validation_error())
+
+        with pytest.raises(ValidationError):
+            await analyzer.arun_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        analyzer._structured_llm.ainvoke.assert_not_called()
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     async def test_returns_parsed_findings(self) -> None:

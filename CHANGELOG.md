@@ -1,3 +1,24 @@
+### 2.8.1 (Thursday, August 06, 2026)
+### Features/Bug Fixes
+* fix(llm): isolate malformed structured responses per batch
+---
+### 2.8.0 (Thursday, August 06, 2026)
+### Features/Bug Fixes
+* fix(baseline): exclude selected baseline from scans
+---
+### 2.7.2 (Thursday, August 06, 2026)
+### Features/Bug Fixes
+* fix(pe3): distinguish OAuth access-token nouns from credential access
+---
+### 2.7.0 (Thursday, August 06, 2026)
+### Features/Bug Fixes
+* fix(telemetry): harden inference usage normalization
+---
+### 2.6.0 (Wednesday, August 05, 2026)
+### Features/Bug Fixes
+* feat(release): auto-generate versioned release notes like CHANGELOG
+* feat(telemetry): export provider inference usage
+---
 ### 2.5.3 (Tuesday, August 04, 2026)
 ### Features/Bug Fixes
 * fix(analyzers): share Python AST parsing for environment-read detection (#332)

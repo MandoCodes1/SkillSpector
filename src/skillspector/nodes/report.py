@@ -35,6 +35,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from skillspector import __version__ as skillspector_version
+from skillspector.inference_usage import sanitize_inference_usage
 from skillspector.inspection_ledger import AnalysisCompleteness
 from skillspector.llm_utils import is_llm_available
 from skillspector.logging_config import get_logger
@@ -603,6 +604,7 @@ def _build_metadata(
     has_executable_scripts: bool,
     use_llm: bool,
     llm_call_log: Sequence[Mapping[str, object]] | None = None,
+    inference_usage: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
@@ -620,6 +622,10 @@ def _build_metadata(
         # available AND the stage was not fully degraded (every call failing).
         "llm_available": llm_available and not degraded,
         "meta_analysis_applied": meta_analysis_applied,
+        # A list (including an empty list) makes observability explicit. Empty
+        # means the provider/transport supplied no counters; it is never an
+        # estimated zero-cost assertion.
+        "inference_usage": sanitize_inference_usage(inference_usage),
     }
     if not meta_analysis_applied:
         meta["filtering_mode"] = "heuristic"
@@ -652,6 +658,7 @@ def _format_json(
     has_executable_scripts: bool,
     use_llm: bool = True,
     llm_call_log: Sequence[Mapping[str, object]] | None = None,
+    inference_usage: Sequence[Mapping[str, object]] | None = None,
     analysis_completeness: Mapping[str, object] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
     execution_successful: bool = True,
@@ -683,7 +690,12 @@ def _format_json(
         "issues": [f.to_dict() for f in findings],
         "suppressed_count": len(suppressed),
         "suppressed": [sf.to_dict() for sf in suppressed],
-        "metadata": _build_metadata(has_executable_scripts, use_llm, llm_call_log),
+        "metadata": _build_metadata(
+            has_executable_scripts,
+            use_llm,
+            llm_call_log,
+            inference_usage,
+        ),
         "execution_successful": execution_successful,
     }
     data["analysis_completeness"] = dict(analysis_completeness or {})
@@ -896,6 +908,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
     output_format = state.get("output_format") or "sarif"
     use_llm = state.get("use_llm", True)
     llm_call_log = state.get("llm_call_log") or []
+    inference_usage = state.get("inference_usage") or []
 
     _attempted, _succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
     degraded_notice = _llm_degradation_notice(use_llm, llm_call_log)
@@ -970,6 +983,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             has_executable_scripts,
             use_llm=use_llm,
             llm_call_log=llm_call_log,
+            inference_usage=inference_usage,
             analysis_completeness=analysis_completeness,
             suppressed=suppressed,
             execution_successful=execution_successful,

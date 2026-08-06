@@ -215,6 +215,10 @@ A baseline can also use drift-tolerant glob rules (by rule id, file path, or
 message) — see [`.skillspector-baseline.example.yaml`](.skillspector-baseline.example.yaml).
 Exact fingerprint baselines are evidence-bound: changing the scanned source or
 SkillSpector version keeps the finding active until it is reviewed again.
+When a selected baseline or baseline output is stored inside the skill
+directory, SkillSpector excludes that exact file from content analysis so its
+suppression text cannot create findings or enter regenerated fingerprints;
+sibling files remain in normal scan scope.
 
 ### LLM Analysis
 
@@ -639,13 +643,46 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
   "risk_assessment": { "score": 0, "severity": "LOW", "recommendation": "SAFE" },
   "components": [ { "path": "...", "type": "...", "lines": 0, "executable": false, "size_bytes": 0 } ],
   "issues": [ { "id": "...", "category": "...", "severity": "...", "confidence": 0.0, "location": { "file": "...", "start_line": 0 } } ],
-  "metadata": { "has_executable_scripts": false, "skillspector_version": "...", "llm_requested": true, "llm_available": true }
+  "metadata": {
+    "has_executable_scripts": false,
+    "skillspector_version": "...",
+    "llm_requested": true,
+    "llm_available": true,
+    "inference_usage": [
+      {
+        "node": "semantic_security_discovery",
+        "request_kind": "structured_output",
+        "provider": "anthropic",
+        "model": "claude-opus-4-6",
+        "model_source": "provider_response",
+        "usage_source": "provider_response",
+        "prompt_tokens": 1000,
+        "completion_tokens": 100,
+        "cached_tokens": 400,
+        "cache_write_tokens": 50,
+        "total_tokens": 1100
+      }
+    ]
+  }
 }
 ```
 
 - `risk_assessment.severity` ∈ `LOW | MEDIUM | HIGH | CRITICAL`.
 - `risk_assessment.recommendation` ∈ `SAFE | CAUTION | DO_NOT_INSTALL`, mapped from severity: `LOW → SAFE`, `MEDIUM → CAUTION`, `HIGH`/`CRITICAL → DO_NOT_INSTALL`.
 - `metadata.llm_error` appears only when LLM analysis was requested but unavailable.
+- `metadata.inference_usage` contains one sanitized record per LLM response when the
+  provider exposes token counters. It is an empty list when usage is unavailable;
+  SkillSpector never estimates missing tokens. Prompt totals are inclusive of cache
+  reads and writes so downstream pricing can separate those partitions safely.
+  `model_source` distinguishes an independently identified provider model from
+  the exact requested model used when response identity is absent or ambiguous.
+  SkillSpector does not currently send Anthropic prompt-cache controls, so its
+  scan requests cannot select the separate 5-minute or 1-hour cache-write tiers;
+  TTL-specific response fields are normalized defensively into the aggregate
+  cache-write counter.
+- See [Inference usage telemetry](docs/INFERENCE_USAGE.md) for the complete
+  provenance, cache-accounting, privacy, fail-closed ingestion, and downstream
+  pricing contract.
 - The full per-issue shape is defined by `Finding.to_dict()` in [models.py](src/skillspector/models.py); rely on the fields above and treat any additional fields as best-effort.
 
 For CI/IDE tooling, `--format sarif` emits SARIF 2.1.0.

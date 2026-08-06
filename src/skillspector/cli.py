@@ -137,6 +137,7 @@ def _scan_state(
     if baseline is not None:
         # Loading may raise FileNotFoundError/ValueError, mapped to exit code 2 by scan().
         state["baseline"] = load_baseline(baseline)
+        state["baseline_path"] = os.path.abspath(baseline.expanduser())
         state["show_suppressed"] = show_suppressed
     return state
 
@@ -616,6 +617,7 @@ def baseline(
             console.print("[dim]Scanning to build baseline...[/dim]")
         # output_format is irrelevant here; we consume findings, not report_body.
         state = _scan_state(input_path, FormatChoice.json, no_llm)
+        state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
         findings = result.get("filtered_findings") or result.get("findings") or []
         data = build_baseline_dict(

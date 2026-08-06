@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 from langchain_core.messages import BaseMessage
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from skillspector.inspection_ledger import (
     AnalyzerStatusEvent,
@@ -44,7 +44,13 @@ from skillspector.inspection_ledger import (
     analyzer_status_event,
     ledger_event,
 )
-from skillspector.llm_utils import get_chat_model
+from skillspector.llm_utils import (
+    _AgentCLIMessage,
+    _ainvoke_with_usage,
+    _invoke_with_usage,
+    get_chat_model,
+    new_inference_usage_collector,
+)
 from skillspector.logging_config import get_logger
 from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
@@ -52,6 +58,11 @@ from skillspector.models import Finding
 logger = get_logger(__name__)
 
 DEFAULT_MAX_LLM_CONCURRENCY = 10
+STRUCTURED_RESPONSE_MAX_ATTEMPTS = 2
+
+
+class _StructuredResponseValidationError(Exception):
+    """Signal that provider output failed structured-response validation."""
 
 
 def resolve_max_concurrency() -> int:
@@ -389,6 +400,13 @@ def _message_text(response: object) -> str:
     return str(response.text)
 
 
+def _raw_response_text(response: object) -> str:
+    """Extract raw analyzer text from LangChain and CLI adapter messages."""
+    if isinstance(response, _AgentCLIMessage):
+        return str(response.content)
+    return _message_text(response)
+
+
 BASE_ANALYSIS_PROMPT = """\
 {analyzer_prompt}
 
@@ -434,7 +452,7 @@ class LLMAnalyzerBase:
 
     response_schema: type | None = LLMAnalysisResult
 
-    def __init__(self, base_prompt: str, model: str):
+    def __init__(self, base_prompt: str, model: str, *, node: str = "llm_analyzer"):
         self.base_prompt = base_prompt
         self.model = model
         self._input_budget = get_max_input_tokens(model)
@@ -442,6 +460,22 @@ class LLMAnalyzerBase:
         self._structured_llm = (
             self._llm.with_structured_output(self.response_schema) if self.response_schema else None
         )
+        self._usage_collector = new_inference_usage_collector(
+            node=node,
+            request_kind="structured_output" if self.response_schema else "chat_completion",
+            model=model,
+            chat_model=self._llm,
+        )
+
+    @property
+    def inference_usage(self) -> list[dict[str, object]]:
+        """Provider-reported usage captured for this analyzer instance."""
+        return list(self._usage_collector.snapshot())
+
+    @property
+    def response_received(self) -> bool:
+        """Whether any analyzer call received a provider response."""
+        return self._usage_collector.response_received
 
     # -- Batching -----------------------------------------------------------
 
@@ -530,6 +564,48 @@ class LLMAnalyzerBase:
 
     # -- Run loop -----------------------------------------------------------
 
+    def _invoke_batch(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
+        """Invoke and parse one batch synchronously."""
+        logger.debug(
+            "LLM call for %s (tokens~%d, findings=%d)",
+            batch.file_label,
+            estimate_tokens(prompt),
+            len(batch.findings),
+        )
+        if self._structured_llm:
+            try:
+                response = _invoke_with_usage(self._structured_llm, prompt, self._usage_collector)
+            except ValidationError as exc:
+                raise _StructuredResponseValidationError from exc
+        else:
+            response = _raw_response_text(
+                _invoke_with_usage(self._llm, prompt, self._usage_collector)
+            )
+        logger.debug("LLM response for %s", batch.file_label)
+        return batch, self.parse_response(response, batch)
+
+    async def _ainvoke_batch(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
+        """Invoke and parse one batch asynchronously."""
+        logger.debug(
+            "LLM call for %s (tokens~%d, findings=%d)",
+            batch.file_label,
+            estimate_tokens(prompt),
+            len(batch.findings),
+        )
+        if self._structured_llm:
+            try:
+                response = await _ainvoke_with_usage(
+                    self._structured_llm, prompt, self._usage_collector
+                )
+            except ValidationError as exc:
+                raise _StructuredResponseValidationError from exc
+        else:
+            response = _raw_response_text(
+                await _ainvoke_with_usage(self._llm, prompt, self._usage_collector)
+            )
+        logger.debug("LLM response for %s", batch.file_label)
+        return batch, self.parse_response(response, batch)
+
     def run_batches(
         self,
         batches: list[Batch],
@@ -555,18 +631,24 @@ class LLMAnalyzerBase:
         for batch in batches:
             try:
                 prompt = self.build_prompt(batch, **kwargs)
-                logger.debug(
-                    "LLM call for %s (tokens~%d, findings=%d)",
+                try:
+                    result = self._invoke_batch(batch, prompt)
+                except _StructuredResponseValidationError:
+                    logger.warning(
+                        "LLM structured response validation failed for %s; retrying once",
+                        batch.file_label,
+                    )
+                    result = self._invoke_batch(batch, prompt)
+                outcome.successful.append(result)
+            except _StructuredResponseValidationError:
+                logger.warning(
+                    "LLM structured response validation failed for %s after %d attempts",
                     batch.file_label,
-                    estimate_tokens(prompt),
-                    len(batch.findings),
+                    STRUCTURED_RESPONSE_MAX_ATTEMPTS,
                 )
-                if self._structured_llm:
-                    response = self._structured_llm.invoke(prompt)
-                else:
-                    response = _message_text(self._llm.invoke(prompt))
-                logger.debug("LLM response for %s", batch.file_label)
-                outcome.successful.append((batch, self.parse_response(response, batch)))
+                outcome.failures.append(
+                    BatchFailure(batch=batch, error_class=ValidationError.__name__)
+                )
             except (ValueError, NotImplementedError):
                 raise
             except Exception as exc:
@@ -595,10 +677,12 @@ class LLMAnalyzerBase:
         Failures are isolated per batch: a transient error (timeout, 429,
         oversized-chunk 400, ...) costs only its own batch, which is logged
         and omitted from the result, so one bad call cannot cancel the rest
-        of the fan-out.  Callers can detect partial results by comparing the
-        returned batches against the submitted ones.  ``ValueError`` and
-        ``NotImplementedError`` signal misconfiguration rather than infra
-        trouble and keep propagating.
+        of the fan-out.  Malformed structured responses (Pydantic
+        ``ValidationError``) are retried once and then isolated to their batch.
+        Callers can detect partial results by comparing the returned batches
+        against the submitted ones.  Other ``ValueError`` instances and
+        ``NotImplementedError`` signal misconfiguration rather than infra trouble
+        and keep propagating.
 
         The return type mirrors :meth:`run_batches`.
         """
@@ -623,22 +707,28 @@ class LLMAnalyzerBase:
         async def _process(batch: Batch) -> tuple[Batch, list]:
             async with sem:
                 prompt = self.build_prompt(batch, **kwargs)
-                logger.debug(
-                    "LLM call for %s (tokens~%d, findings=%d)",
-                    batch.file_label,
-                    estimate_tokens(prompt),
-                    len(batch.findings),
-                )
-                if self._structured_llm:
-                    response = await self._structured_llm.ainvoke(prompt)
-                else:
-                    response = _message_text(await self._llm.ainvoke(prompt))
-                logger.debug("LLM response for %s", batch.file_label)
-                return (batch, self.parse_response(response, batch))
+                try:
+                    return await self._ainvoke_batch(batch, prompt)
+                except _StructuredResponseValidationError:
+                    logger.warning(
+                        "LLM structured response validation failed for %s; retrying once",
+                        batch.file_label,
+                    )
+                    return await self._ainvoke_batch(batch, prompt)
 
         results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
         outcome = BatchExecutionResult()
         for batch, result in zip(batches, results, strict=True):
+            if isinstance(result, _StructuredResponseValidationError):
+                logger.warning(
+                    "LLM structured response validation failed for %s after %d attempts",
+                    batch.file_label,
+                    STRUCTURED_RESPONSE_MAX_ATTEMPTS,
+                )
+                outcome.failures.append(
+                    BatchFailure(batch=batch, error_class=ValidationError.__name__)
+                )
+                continue
             if isinstance(result, (ValueError, NotImplementedError)):
                 raise result
             if isinstance(result, BaseException):
