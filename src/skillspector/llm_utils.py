@@ -178,6 +178,10 @@ class _AgentCLIMessage:
         self.content = content
 
 
+class StructuredOutputParseError(ValueError):
+    """Raised when a structured-output response does not contain a JSON object."""
+
+
 def _extract_json_object(raw: str) -> dict:
     """Extract a single JSON object from a CLI model's text response.
 
@@ -206,7 +210,9 @@ def _extract_json_object(raw: str) -> dict:
                 return obj
         except json.JSONDecodeError:
             pass
-    raise ValueError(f"could not extract a JSON object from CLI response: {raw[:200]!r}")
+    raise StructuredOutputParseError(
+        f"could not extract a JSON object from CLI response: {raw[:200]!r}"
+    )
 
 
 class _StructuredAgentCLIModel:

@@ -40,7 +40,7 @@ from skillspector.llm_analyzer_base import (
     number_lines,
     resolve_max_concurrency,
 )
-from skillspector.llm_utils import AgentCLIChatModel
+from skillspector.llm_utils import AgentCLIChatModel, StructuredOutputParseError
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import (
     LLMMetaAnalyzer,
@@ -475,6 +475,36 @@ class TestRunBatches:
         assert analyzer._structured_llm.invoke.call_count == 2
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_structured_parse_error_recovers_on_retry(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[
+                StructuredOutputParseError("could not extract JSON"),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+
+        outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.invoke.call_count == 2
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    def test_cli_structured_parse_error_recovers_on_retry(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        provider = MagicMock()
+        provider.complete.side_effect = ["not JSON", '{"findings": []}']
+        analyzer._llm = AgentCLIChatModel(provider, self.MODEL, 1024)
+        analyzer._structured_llm = analyzer._llm.with_structured_output(LLMAnalysisResult)
+
+        outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert provider.complete.call_count == 2
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     def test_structured_validation_error_isolated_after_retry(self) -> None:
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
         analyzer._structured_llm.invoke = MagicMock(
@@ -589,6 +619,22 @@ class TestARunBatches:
         batch = Batch(file_path="a.py", content="code")
 
         outcome = await analyzer.arun_batches_detailed([batch])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.ainvoke.call_count == 2
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    async def test_structured_parse_error_recovers_on_retry(self) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[
+                StructuredOutputParseError("could not extract JSON"),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+
+        outcome = await analyzer.arun_batches_detailed([Batch(file_path="a.py", content="code")])
 
         assert [item[0].file_path for item in outcome.successful] == ["a.py"]
         assert outcome.failures == []

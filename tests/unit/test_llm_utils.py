@@ -35,6 +35,7 @@ from skillspector import llm_utils
 from skillspector.inference_usage import InferenceUsageCollector
 from skillspector.llm_utils import (
     AgentCLIChatModel,
+    StructuredOutputParseError,
     _ainvoke_with_usage,
     _extract_json_object,
     _invoke_with_usage,
@@ -521,8 +522,8 @@ class TestExtractJsonObject:
     def test_prose_wrapped_json(self) -> None:
         assert _extract_json_object('Here you go:\n{"a": 1}\nDone.') == {"a": 1}
 
-    def test_garbage_raises(self) -> None:
-        with pytest.raises(ValueError):
+    def test_garbage_raises_structured_output_parse_error(self) -> None:
+        with pytest.raises(StructuredOutputParseError):
             _extract_json_object("not json")
 
 

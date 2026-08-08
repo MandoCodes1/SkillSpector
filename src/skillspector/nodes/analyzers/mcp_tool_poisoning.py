@@ -18,19 +18,21 @@
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import re
 import unicodedata
+from typing import cast
 
-from skillspector.inference_usage import InferenceUsageCollector, InferenceUsageRecord
+from pydantic import BaseModel, Field, field_validator
+
+from skillspector.inference_usage import InferenceUsageRecord
 from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     analyzer_status_event,
     ledger_event,
 )
-from skillspector.llm_utils import chat_completion, new_inference_usage_collector
+from skillspector.llm_analyzer_base import Batch, LLMAnalyzerBase
 from skillspector.models import Finding
 from skillspector.providers import get_active_provider
 from skillspector.state import (
@@ -690,6 +692,44 @@ _TP4_EXECUTABLE_TYPES = frozenset(
 )
 
 
+class _TP4AnalysisResult(BaseModel):
+    """Validated response from the description-behavior mismatch check."""
+
+    is_mismatch: bool
+    confidence: float = 0.0
+    declared_purpose_summary: str = ""
+    actual_behavior_summary: str = ""
+    mismatched_capabilities: list[str] = Field(default_factory=list)
+    explanation: str = ""
+
+    @field_validator("confidence")
+    @classmethod
+    def _validate_confidence(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("confidence must be between 0.0 and 1.0")
+        return value
+
+
+class _TP4Analyzer(LLMAnalyzerBase):
+    """Run TP4 through the shared structured-output analyzer lifecycle."""
+
+    response_schema = _TP4AnalysisResult
+
+    def __init__(self, model: str) -> None:
+        super().__init__(base_prompt="", model=model, node=ANALYZER_ID)
+
+    def build_prompt(self, batch: Batch, **_kwargs: object) -> str:
+        """Use TP4's purpose-built prompt without the generic file wrapper."""
+        return batch.content
+
+    def parse_response(  # type: ignore[override]  # TP4 returns its typed assessment.
+        self, response: object, _batch: Batch
+    ) -> list[_TP4AnalysisResult]:
+        if isinstance(response, _TP4AnalysisResult):
+            return [response]
+        raise NotImplementedError("TP4 requires a structured assessment response")
+
+
 def _check_tp4(
     state: SkillspectorState,
 ) -> tuple[
@@ -707,7 +747,7 @@ def _check_tp4(
     emitted only when the provider response supplied it.
     """
     attempted = False
-    usage_collector: InferenceUsageCollector | None = None
+    analyzer: _TP4Analyzer | None = None
     try:
         manifest: dict = state.get("manifest") or {}
         description = manifest.get("description")
@@ -740,11 +780,7 @@ def _check_tp4(
 
         model_config: dict = state.get("model_config") or {}
         model = model_config.get(ANALYZER_ID) or model_config.get("default")
-        usage_collector = new_inference_usage_collector(
-            node=ANALYZER_ID,
-            request_kind="chat_completion",
-            model=model or get_active_provider().resolve_model(),
-        )
+        model = model or get_active_provider().resolve_model()
 
         prompt = f"""You are a security auditor. Your task: determine whether a skill's declared
 description accurately represents what its code actually does.
@@ -773,52 +809,42 @@ Do NOT flag:
 - Utility code that supports the declared purpose (logging, error handling)
 - Over-declared permissions (covered by a separate analyzer)
 
-Respond in JSON matching this exact schema:
-{{
-  "is_mismatch": true/false,
-  "confidence": 0.0-1.0,
-  "declared_purpose_summary": "one-sentence summary of what the description claims",
-  "actual_behavior_summary": "one-sentence summary of what the code actually does",
-  "mismatched_capabilities": ["list of capabilities in code but not in description"],
-  "explanation": "why this is or is not a mismatch"
-}}"""
+Return the assessment using the provided structured output schema."""
 
+        analyzer = _TP4Analyzer(model)
         attempted = True
-        response = chat_completion(
-            prompt,
-            model=model,
-            usage_collector=usage_collector,
-            node=ANALYZER_ID,
-        )
-
-        # Parse JSON — handle optional ```json code blocks
-        json_text = response.strip()
-        if json_text.startswith("```"):
-            # Strip opening fence (```json or ```)
-            first_newline = json_text.find("\n")
-            if first_newline != -1:
-                json_text = json_text[first_newline + 1 :]
-            # Strip closing fence
-            if json_text.rstrip().endswith("```"):
-                json_text = json_text.rstrip()[:-3].rstrip()
-
-        result = json.loads(json_text)
+        outcome = analyzer.run_batches_detailed([Batch(file_path="SKILL.md", content=prompt)])
+        if outcome.failures:
+            failure = outcome.failures[0]
+            return (
+                [],
+                llm_call_record(
+                    ANALYZER_ID,
+                    ok=False,
+                    error=f"TP4 LLM batch failed: {failure.error_class}",
+                ),
+                failure.error_class,
+                cast(list[InferenceUsageRecord], analyzer.inference_usage),
+            )
+        result = outcome.successful[0][1][0]
+        if not isinstance(result, _TP4AnalysisResult):
+            raise RuntimeError("TP4 returned an unexpected structured response type")
         ok_record = llm_call_record(ANALYZER_ID, ok=True)
 
-        if not result.get("is_mismatch"):
-            return [], ok_record, None, usage_collector.snapshot()
+        if not result.is_mismatch:
+            return [], ok_record, None, cast(list[InferenceUsageRecord], analyzer.inference_usage)
 
-        confidence = float(result.get("confidence", 0.0))
+        confidence = result.confidence
         if confidence < 0.5:
-            return [], ok_record, None, usage_collector.snapshot()
+            return [], ok_record, None, cast(list[InferenceUsageRecord], analyzer.inference_usage)
 
         severity = "HIGH" if confidence >= 0.7 else "MEDIUM"
 
-        mismatched = result.get("mismatched_capabilities") or []
+        mismatched = result.mismatched_capabilities
         mismatched_str = ", ".join(mismatched) if mismatched else "unspecified"
-        explanation = result.get("explanation", "")
-        declared = result.get("declared_purpose_summary", description[:80])
-        actual = result.get("actual_behavior_summary", "")
+        explanation = result.explanation
+        declared = result.declared_purpose_summary or description[:80]
+        actual = result.actual_behavior_summary
 
         return (
             [
@@ -842,7 +868,7 @@ Respond in JSON matching this exact schema:
             ],
             ok_record,
             None,
-            usage_collector.snapshot(),
+            cast(list[InferenceUsageRecord], analyzer.inference_usage),
         )
 
     except Exception as exc:
@@ -854,7 +880,9 @@ Respond in JSON matching this exact schema:
                 [],
                 llm_call_record(ANALYZER_ID, ok=False, error=str(exc)),
                 type(exc).__name__,
-                usage_collector.snapshot() if usage_collector is not None else [],
+                cast(list[InferenceUsageRecord], analyzer.inference_usage)
+                if analyzer is not None
+                else [],
             )
         return [], None, None, []
 

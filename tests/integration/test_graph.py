@@ -168,10 +168,26 @@ def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.M
     def boom(*_a: object, **_k: object) -> object:
         raise RuntimeError("simulated LLM transport failure")
 
-    # Fail both LLM transports: get_chat_model (semantic analyzers + meta) and
-    # chat_completion (mcp_tool_poisoning TP4).
+    class FailingTP4Analyzer:
+        """Simulate an attempted TP4 request failing after analyzer setup."""
+
+        @property
+        def inference_usage(self) -> list[object]:
+            return []
+
+        def __init__(self, _model: str) -> None:
+            pass
+
+        def run_batches_detailed(self, _batches: object) -> object:
+            raise RuntimeError("simulated LLM transport failure")
+
+    # Semantic analyzers and meta_analyzer fail while constructing their shared
+    # transport. TP4's analyzer construction is deliberately not an attempted
+    # LLM call, so fail it at batch execution to assert its ledger projection.
     monkeypatch.setattr("skillspector.llm_analyzer_base.get_chat_model", boom)
-    monkeypatch.setattr("skillspector.nodes.analyzers.mcp_tool_poisoning.chat_completion", boom)
+    monkeypatch.setattr(
+        "skillspector.nodes.analyzers.mcp_tool_poisoning._TP4Analyzer", FailingTP4Analyzer
+    )
 
     result = graph.invoke({"skill_path": str(tmp_path), "use_llm": True, "output_format": "json"})
 
@@ -186,6 +202,7 @@ def test_graph_surfaces_degraded_llm_stage(tmp_path: Path, monkeypatch: pytest.M
         "semantic_developer_intent",
         "semantic_quality_policy",
         "meta_analyzer",
+        "mcp_tool_poisoning",
     } <= nodes
 
     meta = json.loads(result["report_body"])["metadata"]

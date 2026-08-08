@@ -45,6 +45,7 @@ from skillspector.inspection_ledger import (
     ledger_event,
 )
 from skillspector.llm_utils import (
+    StructuredOutputParseError,
     _AgentCLIMessage,
     _ainvoke_with_usage,
     _invoke_with_usage,
@@ -575,7 +576,7 @@ class LLMAnalyzerBase:
         if self._structured_llm:
             try:
                 response = _invoke_with_usage(self._structured_llm, prompt, self._usage_collector)
-            except ValidationError as exc:
+            except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError from exc
         else:
             response = _raw_response_text(
@@ -597,7 +598,7 @@ class LLMAnalyzerBase:
                 response = await _ainvoke_with_usage(
                     self._structured_llm, prompt, self._usage_collector
                 )
-            except ValidationError as exc:
+            except (StructuredOutputParseError, ValidationError) as exc:
                 raise _StructuredResponseValidationError from exc
         else:
             response = _raw_response_text(
@@ -678,7 +679,8 @@ class LLMAnalyzerBase:
         oversized-chunk 400, ...) costs only its own batch, which is logged
         and omitted from the result, so one bad call cannot cancel the rest
         of the fan-out.  Malformed structured responses (Pydantic
-        ``ValidationError``) are retried once and then isolated to their batch.
+        ``ValidationError`` or CLI JSON parse failures) are retried once and
+        then isolated to their batch.
         Callers can detect partial results by comparing the returned batches
         against the submitted ones.  Other ``ValueError`` instances and
         ``NotImplementedError`` signal misconfiguration rather than infra trouble

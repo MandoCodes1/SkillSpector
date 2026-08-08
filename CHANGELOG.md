@@ -1,3 +1,7 @@
+### 2.8.2 (Friday, August 07, 2026)
+### Features/Bug Fixes
+* fix(mcp): retry malformed TP4 responses
+---
 ### 2.8.1 (Thursday, August 06, 2026)
 ### Features/Bug Fixes
 * fix(llm): isolate malformed structured responses per batch
