@@ -564,7 +564,7 @@ def _meta_ledger_response(
                 path=batch.file_path,
                 start_line=batch.start_line if batch.end_line is not None else None,
                 end_line=batch.end_line,
-                reason=LedgerReason.LLM_BATCH_FAILED,
+                reason=failure.reason,
                 input_finding_ids=input_ids,
                 emitted_finding_ids=input_ids,
                 error_class=failure.error_class,

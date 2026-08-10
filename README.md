@@ -377,7 +377,7 @@ SkillSpector detects **68 vulnerability patterns** across 17 categories:
 | ID | Pattern | Severity | Description |
 |----|---------|----------|-------------|
 | E1 | External Transmission | MEDIUM | Sending data to external URLs |
-| E2 | Env Variable Harvesting | HIGH | Collecting API keys and secrets |
+| E2 | Env Variable Harvesting | HIGH | Enumerating, copying, or searching environment data to collect secrets |
 | E3 | File System Enumeration | MEDIUM | Scanning directories for sensitive files |
 | E4 | Context Leakage | HIGH | Transmitting conversation context externally |
 
@@ -652,8 +652,8 @@ The top-level shape is (this example shows a full LLM-backed scan; with `--no-ll
       {
         "node": "semantic_security_discovery",
         "request_kind": "structured_output",
-        "provider": "anthropic",
-        "model": "claude-opus-4-6",
+        "provider": "nv_inference",
+        "model": "azure/anthropic/claude-opus-4-6",
         "model_source": "provider_response",
         "usage_source": "provider_response",
         "prompt_tokens": 1000,

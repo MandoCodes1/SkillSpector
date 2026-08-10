@@ -1,3 +1,13 @@
+### 2.9.1 (Monday, August 10, 2026)
+### Features/Bug Fixes
+* fix(llm): add bounded connection retries
+---
+### 2.9.0 (Monday, August 10, 2026)
+### Features/Bug Fixes
+* fix(e2): allow targeted environment credential reads
+* fix: remediate nSpect High vulnerabilities
+* fix(yara): require local destructive autonomy evidence
+---
 ### 2.8.2 (Friday, August 07, 2026)
 ### Features/Bug Fixes
 * fix(mcp): retry malformed TP4 responses

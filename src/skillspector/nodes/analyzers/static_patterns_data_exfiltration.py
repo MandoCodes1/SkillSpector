@@ -59,11 +59,6 @@ E1_PATTERNS = [
 ]
 E2_PYTHON_FALLBACK_PATTERNS = [
     (r"for\s+\w+\s*,\s*\w+\s+in\s+os\s*\.\s*environ\s*\.\s*items\s*\(\s*\)", 0.7),
-    (
-        r"os\s*\.\s*environ\s*\[\s*['\"][^'\"]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)[^'\"]*['\"]\s*\]",
-        0.8,
-    ),
-    (r"os\s*\.\s*environ\s*\.\s*get\s*\([^)]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)", 0.7),
     (r"os\s*\.\s*environ\s*\.\s*copy\s*\(\s*\)", 0.6),
     (r"dict\s*\(\s*os\s*\.\s*environ\s*\)", 0.6),
     (r"\{\s*\*\*\s*os\s*\.\s*environ\s*\}", 0.6),
@@ -87,7 +82,6 @@ _ENVIRONMENT_MAPPING_METHOD_CONFIDENCE = {
 }
 _ENVIRONMENT_COLLECTION_CALLS = frozenset({"dict", "list", "tuple", "set", "frozenset"})
 _ENVIRONMENT_COPY_CALLS = frozenset({"copy.copy", "copy.deepcopy"})
-_SENSITIVE_ENV_KEY_PATTERN = re.compile(r"(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)", re.IGNORECASE)
 E3_PATTERNS = [
     (r"glob\s*\.\s*glob\s*\([^)]*(?:\.env|\.ssh|\.aws|\.config|credentials)", 0.8),
     (r"os\s*\.\s*walk\s*\([^)]*(?:home|~|/Users|/home)", 0.6),
@@ -156,15 +150,6 @@ def _is_os_environ_reference(node: ast.expr, aliases: dict[str, str]) -> bool:
     return _resolve_expression_name(node, aliases) == "os.environ"
 
 
-def _is_sensitive_environment_key(node: ast.expr) -> bool:
-    """Return whether a literal environment key looks credential-like."""
-    return (
-        isinstance(node, ast.Constant)
-        and isinstance(node.value, str)
-        and _SENSITIVE_ENV_KEY_PATTERN.search(node.value) is not None
-    )
-
-
 def _has_direct_environ_argument(call: ast.Call, aliases: dict[str, str]) -> bool:
     """Return whether a call receives ``os.environ`` directly, not via a lookup."""
     return any(_is_os_environ_reference(arg, aliases) for arg in call.args) or any(
@@ -198,9 +183,10 @@ def _analyze_python_environment_reads(
     """Detect materializing or enumerating the complete ``os.environ`` mapping.
 
     A full mapping copy or enumeration is an environment-harvesting signal, unlike a
-    single-key lookup or passing ``os.environ`` through to a child process. AST parsing
-    makes the check insensitive to formatting and lets it resolve ``os`` / ``environ``
-    import aliases.
+    targeted single-key lookup or passing ``os.environ`` through to a child process.
+    Credential flows to network and execution sinks remain covered by the behavioral
+    taint analyzer. AST parsing makes this check insensitive to formatting and lets it
+    resolve ``os`` / ``environ`` import aliases.
 
     ``None`` means the source could not be parsed, so callers can retain the regex
     fallback for malformed Python files.  Standalone callers parse through the
@@ -242,19 +228,6 @@ def _analyze_python_environment_reads(
     for ast_node in ast.walk(tree):
         if isinstance(ast_node, ast.Call):
             call_name = resolve_call_name(ast_node, aliases)
-            if call_name == "os.environ.get":
-                key = (
-                    ast_node.args[0]
-                    if ast_node.args
-                    else next(
-                        (keyword.value for keyword in ast_node.keywords if keyword.arg == "key"),
-                        None,
-                    )
-                )
-                if key is not None and _is_sensitive_environment_key(key):
-                    emit(ast_node, 0.7)
-                continue
-
             if call_name is not None:
                 method = call_name.rpartition(".")[2]
                 if (
@@ -278,12 +251,6 @@ def _analyze_python_environment_reads(
                 ast_node, aliases
             ):
                 emit(ast_node, 0.6)
-
-        elif isinstance(ast_node, ast.Subscript):
-            if _is_os_environ_reference(ast_node.value, aliases) and _is_sensitive_environment_key(
-                ast_node.slice
-            ):
-                emit(ast_node, 0.8)
 
         elif isinstance(ast_node, ast.Dict):
             if any(

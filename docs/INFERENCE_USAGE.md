@@ -27,8 +27,8 @@ Each successfully observed provider response contributes one entry to
       {
         "node": "semantic_security_discovery",
         "request_kind": "structured_output",
-        "provider": "anthropic",
-        "model": "claude-opus-4-6",
+        "provider": "nv_inference",
+        "model": "azure/anthropic/claude-opus-4-6",
         "model_source": "provider_response",
         "usage_source": "provider_response",
         "prompt_tokens": 1000,

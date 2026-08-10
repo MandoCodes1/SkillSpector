@@ -48,6 +48,8 @@ class LedgerReason(StrEnum):
     EVAL_DATASET = "eval_dataset"
     SYNTAX_ERROR = "syntax_error"
     LLM_BATCH_FAILED = "llm_batch_failed"
+    LLM_STRUCTURED_RESPONSE_INVALID = "llm_structured_response_invalid"
+    LLM_CONNECTION_RETRIES_EXHAUSTED = "llm_connection_retries_exhausted"
     ANALYZER_RUNTIME_ERROR = "analyzer_runtime_error"
     UNACCOUNTED_WORK = "unaccounted_work"
     FINDING_ACCOUNTING_ERROR = "finding_accounting_error"
@@ -75,6 +77,10 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     ),
     LedgerReason.SYNTAX_ERROR: "Python source could not be parsed.",
     LedgerReason.LLM_BATCH_FAILED: "LLM analysis failed for this file range.",
+    LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
+        "LLM returned a malformed structured response after retry."
+    ),
+    LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: ("LLM connection failed after bounded retries."),
     LedgerReason.ANALYZER_RUNTIME_ERROR: ("Analyzer failed after beginning applicable work."),
     LedgerReason.UNACCOUNTED_WORK: ("Planned inspection work has no unique terminal outcome."),
     LedgerReason.FINDING_ACCOUNTING_ERROR: (

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from skillspector.inspection_ledger import finalize_ledger
+from skillspector.inspection_ledger import LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import Batch, BatchExecutionResult, BatchFailure
 from skillspector.models import Finding
 from skillspector.nodes.meta_analyzer import (
@@ -201,6 +201,27 @@ class TestMetaLedgerResponse:
             }
             for event in events
         ]
+
+    def test_failed_batch_preserves_safe_failure_reason(self) -> None:
+        failed = _lineage_finding("failed", "failed.py", 3)
+        failed_batch = Batch(file_path="failed.py", content="failed", findings=[failed])
+
+        events, _ = _meta_ledger_response(
+            [failed_batch],
+            BatchExecutionResult(
+                failures=[
+                    BatchFailure(
+                        batch=failed_batch,
+                        error_class="APIConnectionError",
+                        reason=LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED,
+                    )
+                ]
+            ),
+            [failed],
+        )
+
+        assert events[0]["reason_code"] == LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+        assert events[0]["message"] == "LLM connection failed after bounded retries."
 
     def test_overlapping_batches_do_not_reaccount_completed_finding(self) -> None:
         shared = _lineage_finding("shared", "complete.py", 1)

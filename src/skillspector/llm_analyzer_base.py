@@ -29,11 +29,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
+from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import BaseMessage
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from skillspector.inspection_ledger import (
@@ -60,10 +63,31 @@ logger = get_logger(__name__)
 
 DEFAULT_MAX_LLM_CONCURRENCY = 10
 STRUCTURED_RESPONSE_MAX_ATTEMPTS = 2
+API_CONNECTION_MAX_RETRIES = 3
+API_CONNECTION_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
+LLM_BATCH_MAX_ATTEMPTS = STRUCTURED_RESPONSE_MAX_ATTEMPTS + API_CONNECTION_MAX_RETRIES
 
 
 class _StructuredResponseValidationError(Exception):
     """Signal that provider output failed structured-response validation."""
+
+
+def _is_retryable_api_connection_error(exc: BaseException) -> bool:
+    """Return whether *exc* is the narrowly supported transient provider failure."""
+    return type(exc).__name__ == "APIConnectionError"
+
+
+def _uses_native_connection_retries(chat_model: object) -> bool:
+    """Set the common native retry budget and report whether it is available."""
+    if isinstance(chat_model, ChatOpenAI):
+        for client in (chat_model.root_client, chat_model.root_async_client):
+            if client is not None:
+                client.max_retries = API_CONNECTION_MAX_RETRIES
+        return True
+    if isinstance(chat_model, ChatAnthropic):
+        chat_model.max_retries = API_CONNECTION_MAX_RETRIES
+        return True
+    return False
 
 
 def resolve_max_concurrency() -> int:
@@ -204,6 +228,7 @@ class BatchFailure:
 
     batch: Batch
     error_class: str
+    reason: LedgerReason = LedgerReason.LLM_BATCH_FAILED
 
 
 @dataclass
@@ -298,7 +323,7 @@ def ledger_events_for_batches(
                         path=path,
                         start_line=start_line,
                         end_line=end_line,
-                        reason=LedgerReason.LLM_BATCH_FAILED,
+                        reason=failure.reason,
                         error_class=failure.error_class,
                     )
                 )
@@ -458,6 +483,7 @@ class LLMAnalyzerBase:
         self.model = model
         self._input_budget = get_max_input_tokens(model)
         self._llm = get_chat_model(model=model)
+        self._uses_native_connection_retries = _uses_native_connection_retries(self._llm)
         self._structured_llm = (
             self._llm.with_structured_output(self.response_schema) if self.response_schema else None
         )
@@ -585,6 +611,45 @@ class LLMAnalyzerBase:
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
 
+    def _invoke_batch_with_retries(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
+        """Run one batch with bounded retries for malformed output and connection failures."""
+        structured_retries = 0
+        connection_retries = 0
+        for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
+            try:
+                return self._invoke_batch(batch, prompt)
+            except _StructuredResponseValidationError:
+                if (
+                    structured_retries >= STRUCTURED_RESPONSE_MAX_ATTEMPTS - 1
+                    or attempt == LLM_BATCH_MAX_ATTEMPTS
+                ):
+                    raise
+                structured_retries += 1
+                logger.warning(
+                    "LLM structured response validation failed for %s; retrying once",
+                    batch.file_label,
+                )
+            except Exception as exc:
+                if (
+                    not _is_retryable_api_connection_error(exc)
+                    or self._uses_native_connection_retries
+                    or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
+                    or attempt == LLM_BATCH_MAX_ATTEMPTS
+                ):
+                    raise
+                delay = API_CONNECTION_RETRY_DELAYS_SECONDS[connection_retries]
+                connection_retries += 1
+                logger.warning(
+                    "LLM connection failed for %s; retrying in %.2fs (%d/%d)",
+                    batch.file_label,
+                    delay,
+                    connection_retries,
+                    API_CONNECTION_MAX_RETRIES,
+                )
+                time.sleep(delay)
+
+        raise AssertionError("bounded retry loop must return or raise")
+
     async def _ainvoke_batch(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
         """Invoke and parse one batch asynchronously."""
         logger.debug(
@@ -606,6 +671,45 @@ class LLMAnalyzerBase:
             )
         logger.debug("LLM response for %s", batch.file_label)
         return batch, self.parse_response(response, batch)
+
+    async def _ainvoke_batch_with_retries(self, batch: Batch, prompt: str) -> tuple[Batch, list]:
+        """Asynchronously run one batch with bounded malformed-output and connection retries."""
+        structured_retries = 0
+        connection_retries = 0
+        for attempt in range(1, LLM_BATCH_MAX_ATTEMPTS + 1):
+            try:
+                return await self._ainvoke_batch(batch, prompt)
+            except _StructuredResponseValidationError:
+                if (
+                    structured_retries >= STRUCTURED_RESPONSE_MAX_ATTEMPTS - 1
+                    or attempt == LLM_BATCH_MAX_ATTEMPTS
+                ):
+                    raise
+                structured_retries += 1
+                logger.warning(
+                    "LLM structured response validation failed for %s; retrying once",
+                    batch.file_label,
+                )
+            except Exception as exc:
+                if (
+                    not _is_retryable_api_connection_error(exc)
+                    or self._uses_native_connection_retries
+                    or connection_retries >= len(API_CONNECTION_RETRY_DELAYS_SECONDS)
+                    or attempt == LLM_BATCH_MAX_ATTEMPTS
+                ):
+                    raise
+                delay = API_CONNECTION_RETRY_DELAYS_SECONDS[connection_retries]
+                connection_retries += 1
+                logger.warning(
+                    "LLM connection failed for %s; retrying in %.2fs (%d/%d)",
+                    batch.file_label,
+                    delay,
+                    connection_retries,
+                    API_CONNECTION_MAX_RETRIES,
+                )
+                await asyncio.sleep(delay)
+
+        raise AssertionError("bounded retry loop must return or raise")
 
     def run_batches(
         self,
@@ -632,14 +736,7 @@ class LLMAnalyzerBase:
         for batch in batches:
             try:
                 prompt = self.build_prompt(batch, **kwargs)
-                try:
-                    result = self._invoke_batch(batch, prompt)
-                except _StructuredResponseValidationError:
-                    logger.warning(
-                        "LLM structured response validation failed for %s; retrying once",
-                        batch.file_label,
-                    )
-                    result = self._invoke_batch(batch, prompt)
+                result = self._invoke_batch_with_retries(batch, prompt)
                 outcome.successful.append(result)
             except _StructuredResponseValidationError:
                 logger.warning(
@@ -648,13 +745,27 @@ class LLMAnalyzerBase:
                     STRUCTURED_RESPONSE_MAX_ATTEMPTS,
                 )
                 outcome.failures.append(
-                    BatchFailure(batch=batch, error_class=ValidationError.__name__)
+                    BatchFailure(
+                        batch=batch,
+                        error_class=ValidationError.__name__,
+                        reason=LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+                    )
                 )
             except (ValueError, NotImplementedError):
                 raise
             except Exception as exc:
                 logger.warning("LLM batch failed for %s: %s", batch.file_label, exc)
-                outcome.failures.append(BatchFailure(batch=batch, error_class=type(exc).__name__))
+                outcome.failures.append(
+                    BatchFailure(
+                        batch=batch,
+                        error_class=type(exc).__name__,
+                        reason=(
+                            LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+                            if _is_retryable_api_connection_error(exc)
+                            else LedgerReason.LLM_BATCH_FAILED
+                        ),
+                    )
+                )
         return outcome
 
     async def arun_batches(
@@ -675,12 +786,17 @@ class LLMAnalyzerBase:
         so users on rate-limited providers can serialize the fan-out; an
         explicit argument still wins.
 
-        Failures are isolated per batch: a transient error (timeout, 429,
-        oversized-chunk 400, ...) costs only its own batch, which is logged
-        and omitted from the result, so one bad call cannot cancel the rest
-        of the fan-out.  Malformed structured responses (Pydantic
-        ``ValidationError`` or CLI JSON parse failures) are retried once and
-        then isolated to their batch.
+        Failures are isolated per batch: a provider ``APIConnectionError``
+        receives three bounded exponential-backoff retries (500ms, then 1s,
+        then 2s) when the chat model has no native retry support. OpenAI and
+        Anthropic chat models use their native three-retry policy instead;
+        native retry timing remains provider-managed. Unrecovered errors cost
+        only their own batch and are omitted from the result.
+        Malformed structured responses (Pydantic ``ValidationError`` or CLI
+        JSON parse failures) are retried once and then isolated to their batch.
+        A batch makes at most five outer chat-model invocations even when both
+        retry policies apply; native provider retries can make additional HTTP
+        requests within one invocation.
         Callers can detect partial results by comparing the returned batches
         against the submitted ones.  Other ``ValueError`` instances and
         ``NotImplementedError`` signal misconfiguration rather than infra trouble
@@ -709,14 +825,7 @@ class LLMAnalyzerBase:
         async def _process(batch: Batch) -> tuple[Batch, list]:
             async with sem:
                 prompt = self.build_prompt(batch, **kwargs)
-                try:
-                    return await self._ainvoke_batch(batch, prompt)
-                except _StructuredResponseValidationError:
-                    logger.warning(
-                        "LLM structured response validation failed for %s; retrying once",
-                        batch.file_label,
-                    )
-                    return await self._ainvoke_batch(batch, prompt)
+                return await self._ainvoke_batch_with_retries(batch, prompt)
 
         results = await asyncio.gather(*[_process(b) for b in batches], return_exceptions=True)
         outcome = BatchExecutionResult()
@@ -728,7 +837,11 @@ class LLMAnalyzerBase:
                     STRUCTURED_RESPONSE_MAX_ATTEMPTS,
                 )
                 outcome.failures.append(
-                    BatchFailure(batch=batch, error_class=ValidationError.__name__)
+                    BatchFailure(
+                        batch=batch,
+                        error_class=ValidationError.__name__,
+                        reason=LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID,
+                    )
                 )
                 continue
             if isinstance(result, (ValueError, NotImplementedError)):
@@ -736,7 +849,15 @@ class LLMAnalyzerBase:
             if isinstance(result, BaseException):
                 logger.warning("LLM batch failed for %s: %s", batch.file_label, result)
                 outcome.failures.append(
-                    BatchFailure(batch=batch, error_class=type(result).__name__)
+                    BatchFailure(
+                        batch=batch,
+                        error_class=type(result).__name__,
+                        reason=(
+                            LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED
+                            if _is_retryable_api_connection_error(result)
+                            else LedgerReason.LLM_BATCH_FAILED
+                        ),
+                    )
                 )
                 continue
             outcome.successful.append(result)

@@ -200,7 +200,7 @@ class TestRunStaticPatternsDataExfiltration:
         assert e1[0].severity == "MEDIUM"
 
     def test_e2_env_harvesting_produces_finding(self):
-        """os.environ access for secrets yields E2, HIGH severity."""
+        """Enumerating os.environ for secrets yields E2, HIGH severity."""
         state = {
             "components": ["script.py"],
             "file_cache": {

@@ -155,18 +155,31 @@ for key, val in os.environ.items():
         [
             'os.environ.get("OPENAI_API_KEY")',
             'os.environ.get(key="OPENAI_API_KEY")',
+            'os.environ["NVCI_TOKEN"]',
         ],
     )
-    def test_e2_env_get_secret(self, expression: str) -> None:
-        """Detection of specific secret access."""
+    def test_e2_targeted_secret_read_is_not_harvesting(self, expression: str) -> None:
+        """Reading one explicitly named credential is not environment harvesting."""
         content = f"import os\napi_key = {expression}\n"
         findings = data_exfiltration_module.analyze(content, "script.py", "python")
-        assert len(findings) >= 1
-        assert any(f.rule_id == "E2" for f in findings)
+
+        assert not any(f.rule_id == "E2" for f in findings)
+
+    def test_e2_comment_describing_targeted_secret_read_is_not_harvesting(self) -> None:
+        """A comment that mentions os.environ.get cannot trigger the E2 fallback regex."""
+        content = (
+            "import os\n"
+            '# nvci-cli also reads os.environ.get("NVCI_TOKEN") from the environment\n'
+            'token = os.environ.get("NVCI_TOKEN")\n'
+        )
+
+        findings = data_exfiltration_module.analyze(content, "script.py", "python")
+
+        assert not any(f.rule_id == "E2" for f in findings)
 
     def test_e2_unparseable_python_uses_regex_fallback(self) -> None:
-        """Malformed Python preserves the pre-AST E2 regex coverage."""
-        content = "import os\nsecret = os.environ.get('API_KEY')\ndef broken(\n"
+        """Malformed Python preserves bulk-environment E2 regex coverage."""
+        content = "import os\nsecrets = os.environ.copy()\ndef broken(\n"
 
         findings = data_exfiltration_module.analyze(content, "script.py", "python")
 
