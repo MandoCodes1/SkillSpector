@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
@@ -294,6 +295,66 @@ class TestDefaultBuildPrompt:
 
 
 # ---------------------------------------------------------------------------
+# LLMAnalyzerBase structured-output configuration
+# ---------------------------------------------------------------------------
+
+
+class TestStructuredOutputConfiguration:
+    MODEL = "azure/anthropic/claude-sonnet-4-6"
+
+    def test_chat_openai_pydantic_schema_serializes_as_strict_json_schema(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payloads: list[dict] = []
+
+        def capture_request(request: httpx.Request) -> httpx.Response:
+            payloads.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": self.MODEL,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": '{"findings": []}',
+                                "refusal": None,
+                            },
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+                request=request,
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(capture_request))
+        llm = ChatOpenAI(
+            model=self.MODEL,
+            api_key="test",
+            base_url="https://inference-api.nvidia.com/v1",
+            http_client=client,
+        )
+        monkeypatch.setattr(MOCK_PATCH_TARGET, lambda **_kwargs: llm)
+
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        response = analyzer._structured_llm.invoke("test")
+
+        assert response == LLMAnalysisResult(findings=[])
+        response_format = payloads[0]["response_format"]["json_schema"]
+        assert response_format["strict"] is True
+        assert response_format["schema"]["additionalProperties"] is False
+
+
+# ---------------------------------------------------------------------------
 # LLMAnalyzerBase.parse_response (default — returns Finding objects)
 # ---------------------------------------------------------------------------
 
@@ -503,7 +564,8 @@ class TestRunBatches:
         ]
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_structured_validation_error_recovers_on_retry(self) -> None:
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_structured_validation_error_recovers_on_retry(self, sleep: MagicMock) -> None:
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
         analyzer._structured_llm.invoke = MagicMock(
             side_effect=[
@@ -518,12 +580,40 @@ class TestRunBatches:
         assert [item[0].file_path for item in outcome.successful] == ["a.py"]
         assert outcome.failures == []
         assert analyzer._structured_llm.invoke.call_count == 2
+        sleep.assert_called_once_with(0.5)
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_structured_parse_error_recovers_on_retry(self) -> None:
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_structured_validation_error_recovers_on_third_retry(self, sleep: MagicMock) -> None:
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
         analyzer._structured_llm.invoke = MagicMock(
             side_effect=[
+                _structured_response_validation_error(),
+                _structured_response_validation_error(),
+                _structured_response_validation_error(),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+
+        outcome = analyzer.run_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.invoke.call_count == 4
+        assert sleep.call_args_list == [
+            ((0.5,), {}),
+            ((1.0,), {}),
+            ((2.0,), {}),
+        ]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_structured_parse_error_recovers_on_third_retry(self, sleep: MagicMock) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.invoke = MagicMock(
+            side_effect=[
+                StructuredOutputParseError("could not extract JSON"),
+                StructuredOutputParseError("could not extract JSON"),
                 StructuredOutputParseError("could not extract JSON"),
                 LLMAnalysisResult(findings=[]),
             ]
@@ -533,10 +623,16 @@ class TestRunBatches:
 
         assert [item[0].file_path for item in outcome.successful] == ["a.py"]
         assert outcome.failures == []
-        assert analyzer._structured_llm.invoke.call_count == 2
+        assert analyzer._structured_llm.invoke.call_count == 4
+        assert sleep.call_args_list == [
+            ((0.5,), {}),
+            ((1.0,), {}),
+            ((2.0,), {}),
+        ]
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_cli_structured_parse_error_recovers_on_retry(self) -> None:
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_cli_structured_parse_error_recovers_on_retry(self, sleep: MagicMock) -> None:
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
         provider = MagicMock()
         provider.complete.side_effect = ["not JSON", '{"findings": []}']
@@ -548,12 +644,18 @@ class TestRunBatches:
         assert [item[0].file_path for item in outcome.successful] == ["a.py"]
         assert outcome.failures == []
         assert provider.complete.call_count == 2
+        sleep.assert_called_once_with(0.5)
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    def test_structured_validation_error_isolated_after_retry(self) -> None:
+    @patch("skillspector.llm_analyzer_base.time.sleep")
+    def test_structured_validation_error_isolated_after_three_retries(
+        self, sleep: MagicMock
+    ) -> None:
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
         analyzer._structured_llm.invoke = MagicMock(
             side_effect=[
+                _structured_response_validation_error(),
+                _structured_response_validation_error(),
                 _structured_response_validation_error(),
                 _structured_response_validation_error(),
                 LLMAnalysisResult(findings=[]),
@@ -570,7 +672,12 @@ class TestRunBatches:
         assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
             ("malformed.py", "ValidationError")
         ]
-        assert analyzer._structured_llm.invoke.call_count == 3
+        assert analyzer._structured_llm.invoke.call_count == 5
+        assert sleep.call_args_list == [
+            ((0.5,), {}),
+            ((1.0,), {}),
+            ((2.0,), {}),
+        ]
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.time.sleep")
@@ -641,6 +748,7 @@ class TestRunBatches:
         assert outcome.failures == []
         assert analyzer._structured_llm.invoke.call_count == 5
         assert sleep.call_args_list == [
+            ((0.5,), {}),
             ((0.5,), {}),
             ((1.0,), {}),
             ((2.0,), {}),
@@ -727,7 +835,8 @@ class TestARunBatches:
         assert outcome.failures[0].error_class == "TimeoutError"
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    async def test_structured_validation_error_recovers_on_retry(self) -> None:
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_structured_validation_error_recovers_on_retry(self, sleep: AsyncMock) -> None:
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
         analyzer._structured_llm.ainvoke = AsyncMock(
             side_effect=[
@@ -742,12 +851,42 @@ class TestARunBatches:
         assert [item[0].file_path for item in outcome.successful] == ["a.py"]
         assert outcome.failures == []
         assert analyzer._structured_llm.ainvoke.call_count == 2
+        sleep.assert_awaited_once_with(0.5)
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    async def test_structured_parse_error_recovers_on_retry(self) -> None:
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_structured_validation_error_recovers_on_third_retry(
+        self, sleep: AsyncMock
+    ) -> None:
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
         analyzer._structured_llm.ainvoke = AsyncMock(
             side_effect=[
+                _structured_response_validation_error(),
+                _structured_response_validation_error(),
+                _structured_response_validation_error(),
+                LLMAnalysisResult(findings=[]),
+            ]
+        )
+
+        outcome = await analyzer.arun_batches_detailed([Batch(file_path="a.py", content="code")])
+
+        assert [item[0].file_path for item in outcome.successful] == ["a.py"]
+        assert outcome.failures == []
+        assert analyzer._structured_llm.ainvoke.call_count == 4
+        assert sleep.await_args_list == [
+            ((0.5,), {}),
+            ((1.0,), {}),
+            ((2.0,), {}),
+        ]
+
+    @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_structured_parse_error_recovers_on_third_retry(self, sleep: AsyncMock) -> None:
+        analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
+        analyzer._structured_llm.ainvoke = AsyncMock(
+            side_effect=[
+                StructuredOutputParseError("could not extract JSON"),
+                StructuredOutputParseError("could not extract JSON"),
                 StructuredOutputParseError("could not extract JSON"),
                 LLMAnalysisResult(findings=[]),
             ]
@@ -757,13 +896,23 @@ class TestARunBatches:
 
         assert [item[0].file_path for item in outcome.successful] == ["a.py"]
         assert outcome.failures == []
-        assert analyzer._structured_llm.ainvoke.call_count == 2
+        assert analyzer._structured_llm.ainvoke.call_count == 4
+        assert sleep.await_args_list == [
+            ((0.5,), {}),
+            ((1.0,), {}),
+            ((2.0,), {}),
+        ]
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
-    async def test_structured_validation_error_isolated_after_retry(self) -> None:
+    @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
+    async def test_structured_validation_error_isolated_after_three_retries(
+        self, sleep: AsyncMock
+    ) -> None:
         analyzer = LLMAnalyzerBase(base_prompt="test", model=self.MODEL)
         analyzer._structured_llm.ainvoke = AsyncMock(
             side_effect=[
+                _structured_response_validation_error(),
+                _structured_response_validation_error(),
                 _structured_response_validation_error(),
                 _structured_response_validation_error(),
                 LLMAnalysisResult(findings=[]),
@@ -780,7 +929,12 @@ class TestARunBatches:
         assert [(failure.batch.file_path, failure.error_class) for failure in outcome.failures] == [
             ("malformed.py", "ValidationError")
         ]
-        assert analyzer._structured_llm.ainvoke.call_count == 3
+        assert analyzer._structured_llm.ainvoke.call_count == 5
+        assert sleep.await_args_list == [
+            ((0.5,), {}),
+            ((1.0,), {}),
+            ((2.0,), {}),
+        ]
 
     @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
     @patch("skillspector.llm_analyzer_base.asyncio.sleep", new_callable=AsyncMock)
@@ -874,6 +1028,7 @@ class TestARunBatches:
         assert outcome.failures == []
         assert analyzer._structured_llm.ainvoke.call_count == 5
         assert sleep.await_args_list == [
+            ((0.5,), {}),
             ((0.5,), {}),
             ((1.0,), {}),
             ((2.0,), {}),
@@ -1136,7 +1291,10 @@ class TestLedgerEventsForBatches:
         )
 
         assert events[0]["reason_code"] == LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
-        assert events[0]["message"] == "LLM returned a malformed structured response after retry."
+        assert (
+            events[0]["message"]
+            == "LLM returned a malformed structured response after bounded retries."
+        )
 
         completeness, _ = finalize_ledger(
             {
@@ -1151,7 +1309,7 @@ class TestLedgerEventsForBatches:
             LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
         )
         assert completeness["ledger_exceptions"][0]["message"] == (
-            "LLM returned a malformed structured response after retry."
+            "LLM returned a malformed structured response after bounded retries."
         )
 
     def test_successful_unchunked_retry_has_one_terminal_outcome(self) -> None:

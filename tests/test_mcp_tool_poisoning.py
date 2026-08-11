@@ -709,18 +709,21 @@ class TestTP4Fallbacks:
 
     def test_persistently_malformed_response_returns_empty(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)
+        monkeypatch.setattr("skillspector.llm_analyzer_base.time.sleep", lambda _delay: None)
         structured_llm = _mock_tp4_structured_llm(
             monkeypatch,
-            [{}, {}],
+            [{}, {}, {}, {}],
         )
         result = node(state)
         tp4 = [f for f in result["findings"] if f.rule_id == "TP4"]
         assert len(tp4) == 0
-        assert structured_llm.calls == 2
+        assert structured_llm.calls == 4
         assert result["inspection_ledger"][1]["error_class"] == "ValidationError"
 
     def test_malformed_response_is_retried(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)
+        sleep = MagicMock()
+        monkeypatch.setattr("skillspector.llm_analyzer_base.time.sleep", sleep)
         structured_llm = _mock_tp4_structured_llm(
             monkeypatch,
             [{}, {"is_mismatch": False}],
@@ -729,11 +732,14 @@ class TestTP4Fallbacks:
         result = node(state)
 
         assert structured_llm.calls == 2
+        sleep.assert_called_once_with(0.5)
         assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
         assert result["analyzer_status_events"][0]["status"] == "completed"
 
     def test_cli_parse_error_is_retried(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)
+        sleep = MagicMock()
+        monkeypatch.setattr("skillspector.llm_analyzer_base.time.sleep", sleep)
         provider = MagicMock()
         provider.complete.side_effect = ["not JSON", '{"is_mismatch": false}']
         monkeypatch.setattr(
@@ -744,10 +750,13 @@ class TestTP4Fallbacks:
         result = node(state)
 
         assert provider.complete.call_count == 2
+        sleep.assert_called_once_with(0.5)
         assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
 
     def test_out_of_range_confidence_is_retried(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)
+        sleep = MagicMock()
+        monkeypatch.setattr("skillspector.llm_analyzer_base.time.sleep", sleep)
         structured_llm = _mock_tp4_structured_llm(
             monkeypatch,
             [{"is_mismatch": True, "confidence": 1.7}, {"is_mismatch": False}],
@@ -756,6 +765,7 @@ class TestTP4Fallbacks:
         result = node(state)
 
         assert structured_llm.calls == 2
+        sleep.assert_called_once_with(0.5)
         assert [finding for finding in result["findings"] if finding.rule_id == "TP4"] == []
         assert result["llm_call_log"] == [{"node": "mcp_tool_poisoning", "ok": True, "error": None}]
 

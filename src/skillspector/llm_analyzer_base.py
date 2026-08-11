@@ -62,9 +62,11 @@ from skillspector.models import Finding
 logger = get_logger(__name__)
 
 DEFAULT_MAX_LLM_CONCURRENCY = 10
-STRUCTURED_RESPONSE_MAX_ATTEMPTS = 2
 API_CONNECTION_MAX_RETRIES = 3
 API_CONNECTION_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
+STRUCTURED_RESPONSE_MAX_RETRIES = 3
+STRUCTURED_RESPONSE_MAX_ATTEMPTS = STRUCTURED_RESPONSE_MAX_RETRIES + 1
+STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS = API_CONNECTION_RETRY_DELAYS_SECONDS
 LLM_BATCH_MAX_ATTEMPTS = STRUCTURED_RESPONSE_MAX_ATTEMPTS + API_CONNECTION_MAX_RETRIES
 
 
@@ -624,11 +626,16 @@ class LLMAnalyzerBase:
                     or attempt == LLM_BATCH_MAX_ATTEMPTS
                 ):
                     raise
+                delay = STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS[structured_retries]
                 structured_retries += 1
                 logger.warning(
-                    "LLM structured response validation failed for %s; retrying once",
+                    "LLM structured response validation failed for %s; retrying in %.2fs (%d/%d)",
                     batch.file_label,
+                    delay,
+                    structured_retries,
+                    STRUCTURED_RESPONSE_MAX_RETRIES,
                 )
+                time.sleep(delay)
             except Exception as exc:
                 if (
                     not _is_retryable_api_connection_error(exc)
@@ -685,11 +692,16 @@ class LLMAnalyzerBase:
                     or attempt == LLM_BATCH_MAX_ATTEMPTS
                 ):
                     raise
+                delay = STRUCTURED_RESPONSE_RETRY_DELAYS_SECONDS[structured_retries]
                 structured_retries += 1
                 logger.warning(
-                    "LLM structured response validation failed for %s; retrying once",
+                    "LLM structured response validation failed for %s; retrying in %.2fs (%d/%d)",
                     batch.file_label,
+                    delay,
+                    structured_retries,
+                    STRUCTURED_RESPONSE_MAX_RETRIES,
                 )
+                await asyncio.sleep(delay)
             except Exception as exc:
                 if (
                     not _is_retryable_api_connection_error(exc)
@@ -793,8 +805,9 @@ class LLMAnalyzerBase:
         native retry timing remains provider-managed. Unrecovered errors cost
         only their own batch and are omitted from the result.
         Malformed structured responses (Pydantic ``ValidationError`` or CLI
-        JSON parse failures) are retried once and then isolated to their batch.
-        A batch makes at most five outer chat-model invocations even when both
+        JSON parse failures) receive three bounded exponential-backoff retries
+        and are then isolated to their batch. A batch makes at most seven outer
+        chat-model invocations even when both
         retry policies apply; native provider retries can make additional HTTP
         requests within one invocation.
         Callers can detect partial results by comparing the returned batches

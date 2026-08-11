@@ -78,7 +78,7 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
     LedgerReason.SYNTAX_ERROR: "Python source could not be parsed.",
     LedgerReason.LLM_BATCH_FAILED: "LLM analysis failed for this file range.",
     LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID: (
-        "LLM returned a malformed structured response after retry."
+        "LLM returned a malformed structured response after bounded retries."
     ),
     LedgerReason.LLM_CONNECTION_RETRIES_EXHAUSTED: ("LLM connection failed after bounded retries."),
     LedgerReason.ANALYZER_RUNTIME_ERROR: ("Analyzer failed after beginning applicable work."),

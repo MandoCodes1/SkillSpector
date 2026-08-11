@@ -1,3 +1,7 @@
+### 2.9.2 (Monday, August 10, 2026)
+### Features/Bug Fixes
+* fix(llm): retry malformed structured responses
+---
 ### 2.9.1 (Monday, August 10, 2026)
 ### Features/Bug Fixes
 * fix(llm): add bounded connection retries
