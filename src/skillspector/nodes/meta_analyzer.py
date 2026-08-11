@@ -34,8 +34,10 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     analyzer_status_event,
+    analyzer_status_for_events,
     inspection_work_id,
     ledger_event,
+    outcome_for_llm_batch_failure,
 )
 from skillspector.llm_analyzer_base import (
     Batch,
@@ -559,7 +561,7 @@ def _meta_ledger_response(
         events.append(
             ledger_event(
                 analyzer_id="meta_analyzer",
-                outcome=LedgerOutcome.FAILED,
+                outcome=outcome_for_llm_batch_failure(failure.reason),
                 phase="meta",
                 path=batch.file_path,
                 start_line=batch.start_line if batch.end_line is not None else None,
@@ -570,24 +572,9 @@ def _meta_ledger_response(
                 error_class=failure.error_class,
             )
         )
-    status = analyzer_status_event(
-        analyzer_id="meta_analyzer",
-        status=(
-            "failed"
-            if any(event["outcome"] is LedgerOutcome.FAILED for event in events)
-            else "completed"
-        ),
-        planned_work=[
-            {
-                "work_id": event["work_id"],
-                "path": event["path"],
-                "start_line": event["start_line"],
-                "end_line": event["end_line"],
-            }
-            for event in events
-        ],
-    )
-    return events, status
+    if not events:
+        return events, analyzer_status_event(analyzer_id="meta_analyzer", status="completed")
+    return events, analyzer_status_for_events("meta_analyzer", events)
 
 
 def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:

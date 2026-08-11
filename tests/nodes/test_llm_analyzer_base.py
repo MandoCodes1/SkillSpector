@@ -27,7 +27,7 @@ from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 from pydantic import ValidationError
 
-from skillspector.inspection_ledger import LedgerReason, finalize_ledger
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import (
     API_CONNECTION_MAX_RETRIES,
     DEFAULT_MAX_LLM_CONCURRENCY,
@@ -1290,6 +1290,8 @@ class TestLedgerEventsForBatches:
             ),
         )
 
+        assert events[0]["outcome"] is LedgerOutcome.SKIPPED
+        assert status["status"] == "degraded"
         assert events[0]["reason_code"] == LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
         assert (
             events[0]["message"]
@@ -1311,6 +1313,9 @@ class TestLedgerEventsForBatches:
         assert completeness["ledger_exceptions"][0]["message"] == (
             "LLM returned a malformed structured response after bounded retries."
         )
+        assert completeness["ledger_exceptions"][0]["fatal"] is False
+        assert completeness["execution_successful"] is True
+        assert completeness["is_complete"] is False
 
     def test_successful_unchunked_retry_has_one_terminal_outcome(self) -> None:
         """A retry does not create duplicate work IDs or fatal unaccounted work."""

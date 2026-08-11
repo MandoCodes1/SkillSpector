@@ -26,6 +26,7 @@ import pytest
 import yaml
 from pydantic import BaseModel
 
+from skillspector.inspection_ledger import LedgerOutcome, LedgerReason
 from skillspector.llm_utils import AgentCLIChatModel
 from skillspector.nodes.analyzers import mcp_tool_poisoning
 
@@ -718,7 +719,12 @@ class TestTP4Fallbacks:
         tp4 = [f for f in result["findings"] if f.rule_id == "TP4"]
         assert len(tp4) == 0
         assert structured_llm.calls == 4
+        assert result["inspection_ledger"][1]["outcome"] is LedgerOutcome.SKIPPED
         assert result["inspection_ledger"][1]["error_class"] == "ValidationError"
+        assert result["inspection_ledger"][1]["reason_code"] is (
+            LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        )
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
 
     def test_malformed_response_is_retried(self, monkeypatch: pytest.MonkeyPatch):
         state = _make_state("mcp_mismatched_skill", use_llm=True)

@@ -30,7 +30,9 @@ from skillspector.inspection_ledger import (
     LedgerOutcome,
     LedgerReason,
     analyzer_status_event,
+    analyzer_status_for_events,
     ledger_event,
+    outcome_for_llm_batch_failure,
 )
 from skillspector.llm_analyzer_base import Batch, LLMAnalyzerBase
 from skillspector.models import Finding
@@ -736,11 +738,12 @@ def _check_tp4(
     list[Finding],
     LLMCallRecord | None,
     str | None,
+    LedgerReason | None,
     list[InferenceUsageRecord],
 ]:
     """TP4: LLM-based description-behavior mismatch detection.
 
-    Returns ``(findings, record, error_class, inference_usage)`` where
+    Returns ``(findings, record, error_class, failure_reason, inference_usage)`` where
     *record* is the LLM-call telemetry for ``llm_call_log`` — or ``None`` when
     no LLM call was attempted (no description / no executable code), so an
     intentional no-op is never counted as a degraded LLM stage. Token usage is
@@ -752,7 +755,7 @@ def _check_tp4(
         manifest: dict = state.get("manifest") or {}
         description = manifest.get("description")
         if not description or not isinstance(description, str) or not description.strip():
-            return [], None, None, []
+            return [], None, None, None, []
 
         triggers = manifest.get("triggers") or []
         permissions = manifest.get("permissions")
@@ -774,7 +777,7 @@ def _check_tp4(
                 code_parts.append(f"### {path} ({file_type})\n{content}")
 
         if not code_parts:
-            return [], None, None, []
+            return [], None, None, None, []
 
         code_contents = "\n\n".join(code_parts)
 
@@ -824,6 +827,7 @@ Return the assessment using the provided structured output schema."""
                     error=f"TP4 LLM batch failed: {failure.error_class}",
                 ),
                 failure.error_class,
+                failure.reason,
                 cast(list[InferenceUsageRecord], analyzer.inference_usage),
             )
         result = outcome.successful[0][1][0]
@@ -832,11 +836,23 @@ Return the assessment using the provided structured output schema."""
         ok_record = llm_call_record(ANALYZER_ID, ok=True)
 
         if not result.is_mismatch:
-            return [], ok_record, None, cast(list[InferenceUsageRecord], analyzer.inference_usage)
+            return (
+                [],
+                ok_record,
+                None,
+                None,
+                cast(list[InferenceUsageRecord], analyzer.inference_usage),
+            )
 
         confidence = result.confidence
         if confidence < 0.5:
-            return [], ok_record, None, cast(list[InferenceUsageRecord], analyzer.inference_usage)
+            return (
+                [],
+                ok_record,
+                None,
+                None,
+                cast(list[InferenceUsageRecord], analyzer.inference_usage),
+            )
 
         severity = "HIGH" if confidence >= 0.7 else "MEDIUM"
 
@@ -868,6 +884,7 @@ Return the assessment using the provided structured output schema."""
             ],
             ok_record,
             None,
+            None,
             cast(list[InferenceUsageRecord], analyzer.inference_usage),
         )
 
@@ -880,11 +897,12 @@ Return the assessment using the provided structured output schema."""
                 [],
                 llm_call_record(ANALYZER_ID, ok=False, error=str(exc)),
                 type(exc).__name__,
+                LedgerReason.LLM_BATCH_FAILED,
                 cast(list[InferenceUsageRecord], analyzer.inference_usage)
                 if analyzer is not None
                 else [],
             )
-        return [], None, None, []
+        return [], None, None, None, []
 
 
 # ---------------------------------------------------------------------------
@@ -946,36 +964,32 @@ def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     tp4_record: LLMCallRecord | None = None
     tp4_findings: list[Finding] = []
     tp4_error_class: str | None = None
+    tp4_failure_reason: LedgerReason | None = None
     tp4_usage: list[InferenceUsageRecord] = []
     if state.get("use_llm", True):
-        tp4_findings, tp4_record, tp4_error_class, tp4_usage = _check_tp4(state)
+        tp4_findings, tp4_record, tp4_error_class, tp4_failure_reason, tp4_usage = _check_tp4(state)
         findings.extend(tp4_findings)
 
     logger.info("%s: %d findings", ANALYZER_ID, len(findings))
     if tp4_record is not None:
+        tp4_event_outcome = (
+            LedgerOutcome.COMPLETED
+            if tp4_record["ok"]
+            else outcome_for_llm_batch_failure(tp4_failure_reason or LedgerReason.LLM_BATCH_FAILED)
+        )
         tp4_event = ledger_event(
             analyzer_id=ANALYZER_ID,
-            outcome=LedgerOutcome.COMPLETED if tp4_record["ok"] else LedgerOutcome.FAILED,
+            outcome=tp4_event_outcome,
             phase="semantic",
             path="SKILL.md",
-            reason=None if tp4_record["ok"] else LedgerReason.LLM_BATCH_FAILED,
+            reason=(
+                None if tp4_record["ok"] else tp4_failure_reason or LedgerReason.LLM_BATCH_FAILED
+            ),
             emitted_finding_ids=[finding.finding_id for finding in tp4_findings],
             error_class=tp4_error_class,
         )
         ledger.append(tp4_event)
-    status = analyzer_status_event(
-        analyzer_id=ANALYZER_ID,
-        status="failed" if tp4_record is not None and not tp4_record["ok"] else "completed",
-        planned_work=[
-            {
-                "work_id": event["work_id"],
-                "path": event["path"],
-                "start_line": event["start_line"],
-                "end_line": event["end_line"],
-            }
-            for event in ledger
-        ],
-    )
+    status = analyzer_status_for_events(ANALYZER_ID, ledger)
     result: AnalyzerNodeResponse = {
         "findings": findings,
         "inspection_ledger": ledger,

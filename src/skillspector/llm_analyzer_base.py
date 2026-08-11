@@ -44,8 +44,9 @@ from skillspector.inspection_ledger import (
     InspectionLedgerEvent,
     LedgerOutcome,
     LedgerReason,
-    analyzer_status_event,
+    analyzer_status_for_events,
     ledger_event,
+    outcome_for_llm_batch_failure,
 )
 from skillspector.llm_utils import (
     StructuredOutputParseError,
@@ -320,7 +321,7 @@ def ledger_events_for_batches(
                 events.append(
                     ledger_event(
                         analyzer_id=analyzer_id,
-                        outcome=LedgerOutcome.FAILED,
+                        outcome=outcome_for_llm_batch_failure(failure.reason),
                         phase="semantic",
                         path=path,
                         start_line=start_line,
@@ -330,24 +331,7 @@ def ledger_events_for_batches(
                     )
                 )
 
-    status = analyzer_status_event(
-        analyzer_id=analyzer_id,
-        status=(
-            "failed"
-            if any(event["outcome"] is LedgerOutcome.FAILED for event in events)
-            else "completed"
-        ),
-        planned_work=[
-            {
-                "work_id": event["work_id"],
-                "path": event["path"],
-                "start_line": event["start_line"],
-                "end_line": event["end_line"],
-            }
-            for event in events
-        ],
-    )
-    return events, status
+    return events, analyzer_status_for_events(analyzer_id, events)
 
 
 # ---------------------------------------------------------------------------

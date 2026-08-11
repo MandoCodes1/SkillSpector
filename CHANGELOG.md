@@ -1,3 +1,7 @@
+### 2.9.3 (Tuesday, August 11, 2026)
+### Features/Bug Fixes
+* fix(llm): surface invalid responses as degraded (skipped, non-fatal, incomplete)
+---
 ### 2.9.2 (Monday, August 10, 2026)
 ### Features/Bug Fixes
 * fix(llm): retry malformed structured responses

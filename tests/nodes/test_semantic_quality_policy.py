@@ -25,7 +25,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 from langchain_core.runnables import Runnable, RunnableConfig
 
-from skillspector.inspection_ledger import finalize_ledger
+from skillspector.inspection_ledger import LedgerReason, finalize_ledger
 from skillspector.llm_analyzer_base import LLMAnalysisResult, LLMFinding
 from skillspector.llm_utils import AgentCLIChatModel
 from skillspector.models import Finding
@@ -330,7 +330,7 @@ class TestErrorHandling:
         )
         assert completeness["execution_successful"] is False
 
-    def test_post_response_value_error_without_usage_uses_failed_fallback(self) -> None:
+    def test_post_response_value_error_without_usage_records_partial_coverage(self) -> None:
         provider = MagicMock()
         provider.complete.return_value = "not valid structured JSON"
         cli_model = AgentCLIChatModel(provider, "gpt-5.6-sol", 1024)
@@ -341,7 +341,11 @@ class TestErrorHandling:
         assert result["findings"] == []
         assert result["inference_usage"] == []
         assert result["inspection_ledger"]
-        assert result["analyzer_status_events"][0]["status"] == "failed"
+        assert result["inspection_ledger"][0]["outcome"] == "skipped"
+        assert result["inspection_ledger"][0]["reason_code"] == (
+            LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        )
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
 
 
 # ---------------------------------------------------------------------------

@@ -102,6 +102,15 @@ REASON_MESSAGES: Final[dict[LedgerReason, str]] = {
 }
 
 
+def outcome_for_llm_batch_failure(reason: LedgerReason) -> LedgerOutcome:
+    """Return the terminal ledger outcome for an exhausted LLM batch."""
+    return (
+        LedgerOutcome.SKIPPED
+        if reason is LedgerReason.LLM_STRUCTURED_RESPONSE_INVALID
+        else LedgerOutcome.FAILED
+    )
+
+
 class PlannedWorkTarget(TypedDict):
     """One analyzer work item expected to have a terminal ledger row."""
 
@@ -279,11 +288,12 @@ def ledger_event(
             raise ValueError("non-completed producers cannot reference findings")
     elif outcome is LedgerOutcome.COMPLETED and not set(emitted_ids).issubset(input_ids):
         raise ValueError("completed meta events must emit a subset of input findings")
-    elif outcome is LedgerOutcome.FAILED and emitted_ids != input_ids:
-        raise ValueError("failed meta events must pass every input finding through")
-    elif outcome is not LedgerOutcome.COMPLETED and outcome is not LedgerOutcome.FAILED:
+    elif outcome in (LedgerOutcome.FAILED, LedgerOutcome.SKIPPED):
+        if emitted_ids != input_ids:
+            raise ValueError("failed or skipped meta events must pass every input finding through")
+    elif outcome is not LedgerOutcome.COMPLETED:
         if input_ids or emitted_ids:
-            raise ValueError("skipped meta events cannot reference findings")
+            raise ValueError("non-completed meta events cannot reference findings")
 
     work_identity = analyzer_id or f"{record_type.value}:{phase}"
     event: InspectionLedgerEvent = {
@@ -614,7 +624,11 @@ def finalize_ledger(state: Mapping[str, object]) -> tuple[AnalysisCompleteness, 
             and not set(emitted_ids).issubset(input_ids)
         ):
             accounting_error(event.get("path"))
-        if is_meta and outcome == LedgerOutcome.FAILED and emitted_ids != input_ids:
+        if (
+            is_meta
+            and outcome in (LedgerOutcome.FAILED, LedgerOutcome.SKIPPED)
+            and emitted_ids != input_ids
+        ):
             accounting_error(event.get("path"))
         for finding_id in [*input_ids, *emitted_ids]:
             if finding_id not in findings_by_id:
