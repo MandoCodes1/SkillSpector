@@ -74,12 +74,106 @@ _EVAL_DATASET_FILES = {
     "eval/dataset.yml",
 }
 
+_LICENSE_FILE_TYPES = frozenset({"markdown", "text", "other"})
+_LICENSE_BASENAME = re.compile(r"^(?:license|licenses|copying|notice|notices)(?:[._-].*)?$")
+_LICENSE_OTHER_SUFFIXES = frozenset({".lesser"})
+
+
+def _normalize_license_line(line: str) -> str:
+    return " ".join(line.casefold().split())
+
+
+# Each range contains the complete adjacent text and the only suppressible line offset.
+_LICENSE_CANONICAL_RANGES: tuple[tuple[tuple[str, ...], int], ...] = (
+    (
+        (
+            '"source" form shall mean the preferred form for making modifications,',
+            "including but not limited to software source code, documentation",
+            "source, and configuration files.",
+        ),
+        1,
+    ),
+    (
+        (
+            "transformation or translation of a source form, including but",
+            "not limited to compiled object code, generated documentation,",
+            "and conversions to other media types.",
+        ),
+        1,
+    ),
+    (
+        (
+            'the copyright owner. For the purposes of this definition, "submitted"',
+            "means any form of electronic, verbal, or written communication sent",
+            "to the Licensor or its representatives, including but not limited to",
+            "communication on electronic mailing lists, source code control systems,",
+        ),
+        2,
+    ),
+    (
+        (
+            "result of this License or out of the use or inability to use the",
+            "Work (including but not limited to damages for loss of goodwill,",
+            "work stoppage, computer failure or malfunction, or any and all",
+        ),
+        1,
+    ),
+    (
+        (
+            'the software is provided "as is", without warranty of any kind, express or',
+            "implied, including but not limited to the warranties of merchantability,",
+            "fitness for a particular purpose and NONINFRINGEMENT. in no event shall the",
+        ),
+        1,
+    ),
+    (
+        (
+            'this software is provided by the copyright holders and contributors "as is"',
+            "and any express or implied warranties, including, but not limited to, the",
+            "implied warranties of merchantability and fitness for a particular purpose are",
+        ),
+        1,
+    ),
+)
+
 
 def _infer_file_type(path: str) -> str:
     """Infer file type from path (extension)."""
     idx = path.rfind(".")
     suffix = path[idx:].lower() if idx >= 0 else ""
     return FILE_TYPES.get(suffix, "other")
+
+
+def _is_license_basename(path: str, file_type: str) -> bool:
+    """Return whether a text-like path has a conventional legal-file basename."""
+    if file_type not in _LICENSE_FILE_TYPES:
+        return False
+    basename = path.replace("\\", "/").rsplit("/", 1)[-1]
+    if file_type == "other" and "." in basename:
+        suffix = "." + basename.rsplit(".", 1)[-1].casefold()
+        if suffix not in _LICENSE_OTHER_SUFFIXES:
+            return False
+    return _LICENSE_BASENAME.fullmatch(basename.casefold()) is not None
+
+
+def _is_license_boilerplate_line(content: str, start_line: int) -> bool:
+    """Return whether start_line occupies a registered canonical license range."""
+    lines = content.splitlines()
+    if start_line < 1 or start_line > len(lines):
+        return False
+    normalized_lines = tuple(_normalize_license_line(line) for line in lines)
+    for canonical_lines, match_offset in _LICENSE_CANONICAL_RANGES:
+        range_start = start_line - match_offset - 1
+        range_end = range_start + len(canonical_lines)
+        normalized_canonical_lines = tuple(
+            _normalize_license_line(line) for line in canonical_lines
+        )
+        if (
+            range_start >= 0
+            and normalized_lines[range_start:range_end] == normalized_canonical_lines
+        ):
+            return True
+    return False
 
 
 _BINARY_EXTENSIONS = frozenset(
@@ -345,6 +439,13 @@ def _scan_path(
         else:
             raw = module.analyze(content=content, file_path=path, file_type=file_type)
         for af in raw:
+            if (
+                af.rule_id == "EA3"
+                and _is_license_basename(path, file_type)
+                and _is_license_boilerplate_line(content, af.location.start_line)
+            ):
+                logger.debug("Filtered EA3 license boilerplate finding: %s", path)
+                continue
             if _is_env_file_reference_in_docs(af, file_type, path, content):
                 logger.debug(
                     "Filtered PE3 .env doc reference: %s in %s:%d",
