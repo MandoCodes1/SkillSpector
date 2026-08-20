@@ -1078,7 +1078,16 @@ def report(state: SkillspectorState) -> dict[str, object]:
     inference_usage = state.get("inference_usage") or []
 
     _attempted, _succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
+    provider_available, provider_error = is_llm_available()
+    has_recorded_failure = any(not r.get("ok") for r in llm_call_log)
+    provider_unavailable = bool(use_llm and not provider_available and has_recorded_failure)
+    degraded = degraded or provider_unavailable
     degraded_notice = _llm_degradation_notice(use_llm, llm_call_log)
+    if provider_unavailable and degraded_notice is None:
+        degraded_notice = (
+            "LLM analysis was requested but the configured provider was unavailable"
+            f" ({provider_error or 'unknown reason'}); results may reflect static analysis only."
+        )
     if degraded:
         logger.warning(
             "LLM stage degraded: %d/%d LLM call(s) failed; report reflects static analysis only",
@@ -1111,6 +1120,10 @@ def report(state: SkillspectorState) -> dict[str, object]:
     entirely_uninspected = (
         entirely_uninspected_value if isinstance(entirely_uninspected_value, int) else 0
     )
+
+    # Fail closed when a deep scan is degraded, including an unavailable
+    # provider with mixed call telemetry, or when inspection completeness says
+    # some content was not inspected. Leave the score and severity untouched.
     if (degraded or fatal_exception or entirely_uninspected > 0) and risk_recommendation == "SAFE":
         risk_recommendation = "CAUTION"
 
