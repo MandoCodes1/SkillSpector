@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,9 @@ from skillspector.graph import graph
 
 _ENFORCE_GAPS = os.getenv("SKILLSPECTOR_SC10_GAPS") == "enforce"
 _MAX_SERIALIZED_REPORT_CHARS = 100_000
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_FENCE_START_LINE = 5
+_FENCE_END_LINE = 8
 _SKILL = "---\nname: helper\ndescription: Formats ordinary text.\n---\n# Helper\nFormats text.\n"
 _EXECUTABLE_FENCE = (
     "# Setup\n\nRun this before using the skill:\n\n"
@@ -74,6 +78,15 @@ def _assert_partial_coverage(result: dict[str, object], location: str) -> None:
     )
 
 
+def _terminal_lines(serialized: str) -> list[str]:
+    """Return ANSI-free, whitespace-normalized terminal cells and list rows."""
+    return [
+        " ".join(_ANSI_ESCAPE.sub("", line).split())
+        for line in serialized.splitlines()
+        if line.strip()
+    ]
+
+
 @pytest.mark.parametrize("location", _COVERAGE_ATTACKS)
 @pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
 def test_executable_markdown_is_truthfully_projected_in_every_output(
@@ -115,11 +128,29 @@ def test_executable_markdown_is_truthfully_projected_in_every_output(
             == location
             for notification in invocation["toolExecutionNotifications"]
         )
+    elif output_format == "markdown":
+        lines = serialized.splitlines()
+        assert "| Recommendation | CAUTION |" in lines
+        assert "| Status | partial |" in lines
+        assert "| Coverage | 50.0% |" in lines
+        assert "| Reason / Status | Location | Details |" in lines
+        exception_row = next(
+            line for line in lines if f"`{location}:{_FENCE_START_LINE}-{_FENCE_END_LINE}`" in line
+        )
+        assert [cell.strip() for cell in exception_row.split("|")[1:3]] == [
+            "unscanned_executable_content",
+            f"`{location}:{_FENCE_START_LINE}-{_FENCE_END_LINE}`",
+        ]
     else:
-        assert "CAUTION" in serialized
-        assert "partial" in serialized.lower()
-        assert location in serialized
-        assert "unscanned_executable_content" in serialized
+        lines = _terminal_lines(serialized)
+        assert "Recommendation CAUTION" in lines
+        assert "Status partial" in lines
+        assert "Coverage 50.0%" in lines
+        exception_pattern = re.compile(
+            rf"^- unscanned_executable_content {re.escape(location)}:"
+            rf"{_FENCE_START_LINE}-{_FENCE_END_LINE}: .+$"
+        )
+        assert any(exception_pattern.fullmatch(line) for line in lines)
 
 
 def test_manifest_only_skill_remains_safe_and_complete(tmp_path: Path) -> None:

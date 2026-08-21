@@ -93,6 +93,14 @@ def _normalized_sc10(result: dict[str, object]) -> list[dict[str, object]]:
     return normalized
 
 
+def _sc10_json_issue(report: dict[str, object]) -> dict[str, object]:
+    return next(issue for issue in report["issues"] if issue["id"] == "SC10")
+
+
+def _sc10_sarif_result(report: dict[str, object]) -> dict[str, object]:
+    return next(item for item in report["runs"][0]["results"] if item["ruleId"] == "SC10")
+
+
 @pytest.mark.parametrize(("npmrc", "expected"), _DIRECT_CONFIGURATION_CASES)
 def test_noncanonical_npmrc_has_one_redacted_sc10_across_public_outputs(
     tmp_path: Path, npmrc: str, expected: dict[str, object]
@@ -110,7 +118,7 @@ def test_noncanonical_npmrc_has_one_redacted_sc10_across_public_outputs(
     }
 
     assert _normalized_sc10(results["json"]) == [expected]
-    for result in results.values():
+    for output_format, result in results.items():
         completeness = result["analysis_completeness"]
         assert isinstance(completeness, dict)
         assert result["execution_successful"] is True
@@ -120,14 +128,22 @@ def test_noncanonical_npmrc_has_one_redacted_sc10_across_public_outputs(
         serialized = result["report_body"]
         assert isinstance(serialized, str)
         assert "SC10" in serialized
-        assert expected["destination"] in serialized
         assert all(sentinel not in serialized for sentinel in _SENTINELS)
+        if output_format == "terminal":
+            assert "REDACTED" in serialized
+            assert "packages.example.invalid" in serialized
+            assert "/private" in serialized
+        elif output_format == "markdown":
+            assert expected["destination"] in serialized
 
     json_report = json.loads(results["json"]["report_body"])
-    assert any(issue["id"] == "SC10" for issue in json_report["issues"])
+    assert _sc10_json_issue(json_report)["evidence"]["destination"] == expected["destination"]
 
     sarif_report = json.loads(results["sarif"]["report_body"])
-    assert any(item["ruleId"] == "SC10" for item in sarif_report["runs"][0]["results"])
+    assert (
+        _sc10_sarif_result(sarif_report)["properties"]["evidence"]["destination"]
+        == expected["destination"]
+    )
 
 
 @pytest.mark.parametrize("npmrc", _CANONICAL_DEFAULT_CASES)
@@ -136,10 +152,27 @@ def test_canonical_npm_registry_is_safe_without_sc10(tmp_path: Path, npmrc: str)
     result = _scan(_write_skill(tmp_path, npmrc), "json")
     completeness = result["analysis_completeness"]
     assert isinstance(completeness, dict)
-    assert any(
-        status["analyzer_id"] == "dependency_sources"
-        for status in completeness["analyzer_statuses"]
+    analyzer_status = next(
+        status
+        for status in result["analyzer_status_events"]
+        if status["analyzer_id"] == "dependency_sources"
     )
+    assert analyzer_status["status"] == "completed"
+    planned_work = analyzer_status["planned_work"]
+    assert len(planned_work) == 1
+    assert planned_work[0]["path"] == ".npmrc"
+    assert planned_work[0]["start_line"] is None
+    assert planned_work[0]["end_line"] is None
+    completed_npmrc_events = [
+        event
+        for event in result["inspection_ledger"]
+        if event["record_type"] == "work_item"
+        and event["analyzer_id"] == "dependency_sources"
+        and event["path"] == ".npmrc"
+        and event["outcome"] == "completed"
+    ]
+    assert len(completed_npmrc_events) == 1
+    assert completed_npmrc_events[0]["work_id"] == planned_work[0]["work_id"]
     assert _normalized_sc10(result) == []
     assert result["risk_recommendation"] == "SAFE"
     assert result["execution_successful"] is True
