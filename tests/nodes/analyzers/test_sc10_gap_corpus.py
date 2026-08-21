@@ -44,14 +44,14 @@ PROHIBITED_FIELDS = {
 }
 
 
-def _load_rows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _load_documents() -> tuple[dict[str, Any], dict[str, Any]]:
     documents = [json.loads(path.read_text(encoding="utf-8")) for path in DATA_FILES]
-    assert all(set(document) == {"schema_version", "rows"} for document in documents)
-    assert all(document["schema_version"] == 1 for document in documents)
-    return documents[0]["rows"], documents[1]["rows"]
+    return documents[0], documents[1]
 
 
-FINDING_ROWS, CONTROL_ROWS = _load_rows()
+FINDING_DOCUMENT, CONTROL_DOCUMENT = _load_documents()
+FINDING_ROWS = FINDING_DOCUMENT["rows"]
+CONTROL_ROWS = CONTROL_DOCUMENT["rows"]
 ALL_ROWS = FINDING_ROWS + CONTROL_ROWS
 
 
@@ -117,6 +117,14 @@ def _mapping_keys(value: Any) -> set[str]:
 
 
 def test_corpus_schema_and_self_checks() -> None:
+    for document in (FINDING_DOCUMENT, CONTROL_DOCUMENT):
+        assert set(document) == {"schema_version", "expected_row_count", "rows"}
+        assert type(document["schema_version"]) is int and document["schema_version"] == 1
+        assert type(document["expected_row_count"]) is int
+        assert document["expected_row_count"] >= 1
+        assert isinstance(document["rows"], list)
+        assert len(document["rows"]) == document["expected_row_count"]
+
     assert FINDING_ROWS, "findings corpus must not be empty"
     assert CONTROL_ROWS, "controls corpus must not be empty"
 
@@ -129,23 +137,34 @@ def test_corpus_schema_and_self_checks() -> None:
         )
         assert set(row) == allowed_fields
         assert not (_mapping_keys(row) & PROHIBITED_FIELDS)
-        assert row["status"] in STATUS_VALUES
-        assert row["lands_in"] in OWNER_VALUES
-        assert row["expected_outcome"] in OUTCOME_VALUES
+        assert isinstance(row["id"], str) and row["id"]
+        assert isinstance(row["status"], str) and row["status"] in STATUS_VALUES
+        assert isinstance(row["lands_in"], str) and row["lands_in"] in OWNER_VALUES
+        assert (
+            isinstance(row["expected_outcome"], str) and row["expected_outcome"] in OUTCOME_VALUES
+        )
         assert isinstance(row["files"], dict) and len(row["files"]) == 1
         path, content = next(iter(row["files"].items()))
         assert isinstance(path, str) and path
         assert isinstance(content, str)
+        physical_line_count = len(content.splitlines())
+        assert physical_line_count >= 1
         file_inputs.append((path, content))
         assert isinstance(row["expected_sc10"], list)
         for expected in row["expected_sc10"]:
+            assert isinstance(expected, dict)
             assert set(expected) == FINDING_FIELDS or set(expected) == FINDING_FIELDS | {"end_line"}
+            for field in FINDING_FIELDS - {"start_line"}:
+                assert isinstance(expected[field], str) and expected[field]
             assert expected["severity"] == "HIGH"
             assert expected["destination_status"] in {"resolved", "unresolved"}
-            assert isinstance(expected["start_line"], int) and expected["start_line"] >= 1
+            assert type(expected["start_line"]) is int
+            assert 1 <= expected["start_line"] <= physical_line_count
+            assert expected["file"] == path
             if "end_line" in expected:
-                assert isinstance(expected["end_line"], int)
+                assert type(expected["end_line"]) is int
                 assert expected["end_line"] > expected["start_line"]
+                assert expected["end_line"] <= physical_line_count
         if row["expected_outcome"] == "finding":
             assert row["expected_sc10"]
             assert "expected_limitation" not in row
@@ -154,15 +173,23 @@ def test_corpus_schema_and_self_checks() -> None:
             assert "expected_limitation" not in row
         else:
             assert row["expected_sc10"] == []
+            assert isinstance(row["expected_limitation"], dict)
             assert set(row["expected_limitation"]) == {"reason", "path", "range"}
-            assert set(row["expected_limitation"]["range"]) == {"start_line", "end_line"}
+            assert isinstance(row["expected_limitation"]["reason"], str)
+            assert row["expected_limitation"]["reason"]
             assert row["expected_limitation"]["reason"] == "unscanned_executable_content"
+            assert isinstance(row["expected_limitation"]["path"], str)
+            assert row["expected_limitation"]["path"]
             assert row["expected_limitation"]["path"] == path
             limitation_range = row["expected_limitation"]["range"]
+            assert isinstance(limitation_range, dict)
+            assert set(limitation_range) == {"start_line", "end_line"}
+            assert type(limitation_range["start_line"]) is int
+            assert type(limitation_range["end_line"]) is int
             assert 1 <= limitation_range["start_line"] <= limitation_range["end_line"]
+            assert limitation_range["end_line"] <= physical_line_count
 
     assert len(file_inputs) == len(set(file_inputs))
-    assert len(ALL_ROWS) == len(FINDING_ROWS) + len(CONTROL_ROWS)
 
 
 @pytest.mark.parametrize("row", BEHAVIOR_PARAMETERS)

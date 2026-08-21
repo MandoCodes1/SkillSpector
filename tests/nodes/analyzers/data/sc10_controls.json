@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "expected_row_count": 28,
   "rows": [
     {
       "id": "control-pip-global-index",
@@ -442,6 +443,17 @@
           "destination_status": "resolved",
           "file": ".cargo/config.toml",
           "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "cargo",
+          "surface": "Cargo source registry",
+          "operation": "add",
+          "scope": "mirror",
+          "destination": "sparse+https://packages.example.invalid/index/",
+          "destination_status": "resolved",
+          "file": ".cargo/config.toml",
+          "start_line": 5
         }
       ]
     },
@@ -464,6 +476,17 @@
           "destination_status": "resolved",
           "file": ".cargo/config",
           "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "cargo",
+          "surface": "Cargo source registry",
+          "operation": "add",
+          "scope": "mirror",
+          "destination": "sparse+https://packages.example.invalid/index/",
+          "destination_status": "resolved",
+          "file": ".cargo/config",
+          "start_line": 5
         }
       ]
     },

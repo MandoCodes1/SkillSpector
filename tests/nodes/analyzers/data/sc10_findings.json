@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "expected_row_count": 20,
   "rows": [
     {
       "id": "pipconf-colon-delimiter",
@@ -337,6 +338,17 @@
           "destination_status": "resolved",
           "file": ".cargo/config.toml",
           "start_line": 2
+        },
+        {
+          "severity": "HIGH",
+          "ecosystem": "cargo",
+          "surface": "Cargo registry index",
+          "operation": "add",
+          "scope": "mirror",
+          "destination": "sparse+https://packages.example.invalid/index/",
+          "destination_status": "resolved",
+          "file": ".cargo/config.toml",
+          "start_line": 5
         }
       ]
     },
