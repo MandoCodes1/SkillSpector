@@ -138,6 +138,10 @@ def _build_sarif_properties(finding: Finding) -> dict[str, object] | None:
         "tags": finding_dict["tags"],
         "evidence": finding_dict["evidence"],
     }
+    if finding.source_url:
+        metadata["sourceUrl"] = finding.source_url
+    if finding.transitive_depth:
+        metadata["transitiveDepth"] = finding.transitive_depth
     cleaned = {key: value for key, value in metadata.items() if value is not None}
     return cleaned or None
 
@@ -644,6 +648,8 @@ def _format_terminal(
             console.print(f"  {icon}: {f.rule_id} - {f.message[:60]}...")
             end = f"–{f.end_line}" if f.end_line and f.end_line != f.start_line else ""
             console.print(f"    [dim]Location:[/dim] {f.file}:{f.start_line}{end}")
+            if f.source_url:
+                console.print(f"    [dim]Source:[/dim] {f.source_url} (depth {f.transitive_depth})")
             console.print(f"    [dim]Confidence:[/dim] {f.confidence:.0%}")
             if f.remediation:
                 console.print(f"    [dim]Remediation:[/dim] {(f.remediation or '')[:150]}...")
@@ -734,6 +740,9 @@ def _build_metadata(
     use_llm: bool,
     llm_call_log: Sequence[Mapping[str, object]] | None = None,
     inference_usage: Sequence[Mapping[str, object]] | None = None,
+    transitive_targets_scanned: int | None = None,
+    transitive_bytes_scanned: int | None = None,
+    transitive_truncation_reasons: Sequence[str] | None = None,
 ) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
     llm_call_log = llm_call_log or []
@@ -773,6 +782,13 @@ def _build_metadata(
         )
     elif use_llm and not llm_available:
         meta["llm_error"] = llm_error
+    if transitive_targets_scanned is not None:
+        meta["transitive_targets_scanned"] = transitive_targets_scanned
+    if transitive_bytes_scanned is not None:
+        meta["transitive_bytes_scanned"] = transitive_bytes_scanned
+    if transitive_truncation_reasons:
+        meta["transitive_truncated"] = True
+        meta["transitive_truncation_reasons"] = list(transitive_truncation_reasons)
     return meta
 
 
@@ -791,6 +807,9 @@ def _format_json(
     analysis_completeness: Mapping[str, object] | None = None,
     suppressed: list[SuppressedFinding] | None = None,
     execution_successful: bool = True,
+    transitive_targets_scanned: int | None = None,
+    transitive_bytes_scanned: int | None = None,
+    transitive_truncation_reasons: Sequence[str] | None = None,
     structured_summaries: list[dict[str, object]] | None = None,
 ) -> str:
     """Generate JSON report string."""
@@ -815,6 +834,7 @@ def _format_json(
                 "lines": c.get("lines"),
                 "executable": c.get("executable"),
                 "size_bytes": c.get("size_bytes"),
+                "source_url": c.get("source_url"),
             }
             for c in component_metadata
         ],
@@ -827,6 +847,9 @@ def _format_json(
             use_llm,
             llm_call_log,
             inference_usage,
+            transitive_targets_scanned,
+            transitive_bytes_scanned,
+            transitive_truncation_reasons,
         ),
         "execution_successful": execution_successful,
     }
@@ -980,6 +1003,9 @@ def _format_markdown(
             lines.append(f"### {emoji} {sev}: {f.rule_id}\n")
             end = f"–{f.end_line}" if f.end_line and f.end_line != f.start_line else ""
             lines.append(f"**Location:** `{f.file}:{f.start_line}{end}`  ")
+            if f.source_url:
+                lines.append(f"**Source:** `{f.source_url}`  ")
+                lines.append(f"**Transitive depth:** {f.transitive_depth}  ")
             lines.append(f"**Confidence:** {f.confidence:.0%}  ")
             lines.append("")
             lines.append(f"**Message:** {f.message}")
@@ -1076,6 +1102,21 @@ def report(state: SkillspectorState) -> dict[str, object]:
     use_llm = state.get("use_llm", True)
     llm_call_log = state.get("llm_call_log") or []
     inference_usage = state.get("inference_usage") or []
+    transitive_targets_scanned = state.get("transitive_targets_scanned")
+    transitive_bytes_scanned = state.get("transitive_bytes_scanned")
+    transitive_truncation_reasons = [
+        str(reason)
+        for reason in state.get("transitive_truncation_reasons", [])
+        if isinstance(reason, str)
+    ]
+    if transitive_truncation_reasons:
+        analysis_completeness = dict(analysis_completeness)
+        limitations = list(analysis_completeness.get("limitations") or [])
+        limitations.append(
+            "Transitive traversal truncated: " + "; ".join(transitive_truncation_reasons)
+        )
+        analysis_completeness["limitations"] = limitations
+        analysis_completeness["is_complete"] = False
 
     _attempted, _succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
     provider_available, provider_error = is_llm_available()
@@ -1120,11 +1161,12 @@ def report(state: SkillspectorState) -> dict[str, object]:
     entirely_uninspected = (
         entirely_uninspected_value if isinstance(entirely_uninspected_value, int) else 0
     )
-
-    # Fail closed when a deep scan is degraded, including an unavailable
-    # provider with mixed call telemetry, or when inspection completeness says
-    # some content was not inspected. Leave the score and severity untouched.
-    if (degraded or fatal_exception or entirely_uninspected > 0) and risk_recommendation == "SAFE":
+    # Fail closed for any incomplete/degraded scan while preserving the honest
+    # score and severity. Transitive traversal limits are an additional source
+    # of incomplete coverage.
+    if (
+        degraded or fatal_exception or entirely_uninspected > 0 or transitive_truncation_reasons
+    ) and risk_recommendation == "SAFE":
         risk_recommendation = "CAUTION"
 
     sarif_report = _build_sarif(
@@ -1169,6 +1211,15 @@ def report(state: SkillspectorState) -> dict[str, object]:
             analysis_completeness=analysis_completeness,
             suppressed=suppressed,
             execution_successful=execution_successful,
+            transitive_targets_scanned=(
+                int(transitive_targets_scanned)
+                if isinstance(transitive_targets_scanned, int)
+                else None
+            ),
+            transitive_bytes_scanned=(
+                int(transitive_bytes_scanned) if isinstance(transitive_bytes_scanned, int) else None
+            ),
+            transitive_truncation_reasons=transitive_truncation_reasons,
             structured_summaries=structured_summaries,
         )
     elif output_format == "markdown":
@@ -1205,6 +1256,11 @@ def report(state: SkillspectorState) -> dict[str, object]:
         "risk_recommendation": risk_recommendation,
         "report_body": report_body,
         "filtered_findings": selected_findings,
+        "active_findings": active_findings,
         "suppressed_findings": suppressed,
         "execution_successful": execution_successful,
+        "transitive_targets_scanned": transitive_targets_scanned,
+        "transitive_bytes_scanned": transitive_bytes_scanned,
+        "transitive_truncated": bool(transitive_truncation_reasons),
+        "transitive_truncation_reasons": transitive_truncation_reasons,
     }

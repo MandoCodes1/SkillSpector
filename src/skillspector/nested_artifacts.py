@@ -89,17 +89,20 @@ class NestedInspectionResult:
     metadata: list[dict[str, object]] = field(default_factory=list)
     outer_metadata: dict[str, dict[str, object]] = field(default_factory=dict)
     ledger_events: list[InspectionLedgerEvent] = field(default_factory=list)
+    uncompressed_bytes: int = 0
 
 
 @dataclass
 class _Budget:
     started_at: float
     clock: Callable[[], float]
+    max_uncompressed_bytes: int = ARCHIVE_MAX_UNCOMPRESSED_BYTES
+    max_seconds: float = ARCHIVE_MAX_SECONDS
     members: int = 0
     uncompressed_bytes: int = 0
 
     def expired(self) -> bool:
-        return self.clock() - self.started_at > ARCHIVE_MAX_SECONDS
+        return self.clock() - self.started_at > self.max_seconds
 
 
 def _is_zip_signature(data: bytes) -> bool:
@@ -425,7 +428,7 @@ def _inspect_zip_bytes(
                     limit_bytes=compressed * ARCHIVE_MAX_COMPRESSION_RATIO,
                 )
                 continue
-            if budget.uncompressed_bytes + info.file_size > ARCHIVE_MAX_UNCOMPRESSED_BYTES:
+            if budget.uncompressed_bytes + info.file_size > budget.max_uncompressed_bytes:
                 _add_unreadable_component(
                     result,
                     virtual_path=virtual_path,
@@ -441,7 +444,7 @@ def _inspect_zip_bytes(
                     path=virtual_path,
                     reason=LedgerReason.ARCHIVE_SIZE_LIMIT,
                     observed_bytes=budget.uncompressed_bytes + info.file_size,
-                    limit_bytes=ARCHIVE_MAX_UNCOMPRESSED_BYTES,
+                    limit_bytes=budget.max_uncompressed_bytes,
                 )
                 continue
             if info.file_size > MAX_FILE_BYTES:
@@ -549,7 +552,7 @@ def _inspect_zip_bytes(
                 )
                 _exception(result, path=virtual_path, reason=LedgerReason.ARCHIVE_TIME_LIMIT)
                 return
-            if budget.uncompressed_bytes + len(member_data) > ARCHIVE_MAX_UNCOMPRESSED_BYTES:
+            if budget.uncompressed_bytes + len(member_data) > budget.max_uncompressed_bytes:
                 _add_unreadable_component(
                     result,
                     virtual_path=virtual_path,
@@ -565,7 +568,7 @@ def _inspect_zip_bytes(
                     path=virtual_path,
                     reason=LedgerReason.ARCHIVE_SIZE_LIMIT,
                     observed_bytes=budget.uncompressed_bytes + len(member_data),
-                    limit_bytes=ARCHIVE_MAX_UNCOMPRESSED_BYTES,
+                    limit_bytes=budget.max_uncompressed_bytes,
                 )
                 return
             if len(member_data) > compressed * ARCHIVE_MAX_COMPRESSION_RATIO:
@@ -647,9 +650,23 @@ def inspect_nested_artifacts(
     components: list[str],
     *,
     clock: Callable[[], float] = time.monotonic,
+    max_uncompressed_bytes: int | None = None,
+    max_seconds: float | None = None,
 ) -> NestedInspectionResult:
     """Inspect ZIP-compatible filesystem components under cumulative bounds."""
     result = NestedInspectionResult()
+    byte_limit = ARCHIVE_MAX_UNCOMPRESSED_BYTES
+    if max_uncompressed_bytes is not None:
+        byte_limit = min(byte_limit, max(0, max_uncompressed_bytes))
+    time_limit = ARCHIVE_MAX_SECONDS
+    if max_seconds is not None:
+        time_limit = min(time_limit, max(0.0, max_seconds))
+    budget = _Budget(
+        started_at=clock(),
+        clock=clock,
+        max_uncompressed_bytes=byte_limit,
+        max_seconds=time_limit,
+    )
     for path in components:
         full_path = skill_dir / path
         expected_type = _expected_container_type(path)
@@ -725,7 +742,6 @@ def inspect_nested_artifacts(
             hidden=hidden,
             disguised=expected_type is None,
         )
-        budget = _Budget(started_at=clock(), clock=clock)
         _inspect_zip_bytes(
             data,
             outer_path=path,
@@ -740,4 +756,5 @@ def inspect_nested_artifacts(
         )
 
     result.components = list(dict.fromkeys(result.components))
+    result.uncompressed_bytes = budget.uncompressed_bytes
     return result

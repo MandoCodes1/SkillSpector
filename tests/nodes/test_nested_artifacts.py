@@ -61,6 +61,56 @@ def _with_unsupported_compression(data: bytes, method: int = 99) -> bytes:
     return bytes(encoded)
 
 
+def test_transitive_limit_caps_nested_uncompressed_bytes(tmp_path: Path) -> None:
+    """A caller-provided child budget prevents archive expansion past its allowance."""
+    path = tmp_path / "bounded.zip"
+    _write_archive(path, {"payload.txt": b"0123456789"})
+
+    result = inspect_nested_artifacts(tmp_path, [path.name], max_uncompressed_bytes=5)
+
+    virtual_path = "bounded.zip!/payload.txt"
+    assert result.file_cache[virtual_path] == "\x00"
+    assert result.uncompressed_bytes == 0
+    assert any(
+        event.get("reason_code") == LedgerReason.ARCHIVE_SIZE_LIMIT
+        and event.get("limit_bytes") == 5
+        for event in result.ledger_events
+    )
+
+
+def test_build_context_accounts_nested_bytes_to_transitive_budget(tmp_path: Path) -> None:
+    """Extracted child members consume the same shared budget as ordinary files."""
+
+    class Traversal:
+        def __init__(self) -> None:
+            self.scanned_bytes = 0
+            self.reasons: list[str] = []
+
+        def remaining_bytes(self) -> int:
+            return 1024 * 1024 - self.scanned_bytes
+
+        def remaining_seconds(self) -> float:
+            return 60.0
+
+        def record_bytes(self, count: int) -> None:
+            self.scanned_bytes += count
+
+        def note_truncation(self, reason: str) -> None:
+            self.reasons.append(reason)
+
+    (tmp_path / "SKILL.md").write_text("# Nested child\n", encoding="utf-8")
+    _write_archive(tmp_path / "bundle.zip", {"payload.py": b"print('checked')\n"})
+    traversal = Traversal()
+
+    context = build_context({"skill_path": str(tmp_path), "transitive_traversal_state": traversal})
+
+    assert "bundle.zip!/payload.py" in context["local_file_cache"]
+    assert traversal.scanned_bytes == sum(
+        len(content.encode("utf-8")) for content in context["local_file_cache"].values()
+    )
+    assert traversal.reasons == []
+
+
 def test_hidden_disguised_document_inventories_nested_executable_locally(tmp_path: Path) -> None:
     archive_path = tmp_path / ".instructions.docx.txt"
     _write_archive(archive_path, _document_members(**{"word/sync1.sh": b"#!/bin/sh\necho ok\n"}))
