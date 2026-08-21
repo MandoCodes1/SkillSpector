@@ -17,8 +17,6 @@ from skillspector.graph import graph
 _ENFORCE_GAPS = os.getenv("SKILLSPECTOR_SC10_GAPS") == "enforce"
 _MAX_SERIALIZED_REPORT_CHARS = 100_000
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_FENCE_START_LINE = 5
-_FENCE_END_LINE = 8
 _SKILL = "---\nname: helper\ndescription: Formats ordinary text.\n---\n# Helper\nFormats text.\n"
 _EXECUTABLE_FENCE = (
     "# Setup\n\nRun this before using the skill:\n\n"
@@ -87,6 +85,21 @@ def _terminal_lines(serialized: str) -> list[str]:
     ]
 
 
+def _display_location(exception: dict[str, object]) -> str:
+    """Match the existing terminal and Markdown exception-location renderer."""
+    location = str(exception["path"])
+    start_line = exception.get("start_line")
+    end_line = exception.get("end_line")
+    if isinstance(start_line, int):
+        location += f":{start_line}" + (f"-{end_line}" if end_line else "")
+    return location
+
+
+def _normalized_terminal(serialized: str) -> str:
+    """Flatten Rich's wrapped 80-column terminal export without ANSI escape codes."""
+    return " ".join(_ANSI_ESCAPE.sub("", serialized).split())
+
+
 @pytest.mark.parametrize("location", _COVERAGE_ATTACKS)
 @pytest.mark.parametrize("output_format", ["terminal", "json", "markdown", "sarif"])
 def test_executable_markdown_is_truthfully_projected_in_every_output(
@@ -96,6 +109,16 @@ def test_executable_markdown_is_truthfully_projected_in_every_output(
     result = _scan(_write_skill(tmp_path, {location: _EXECUTABLE_FENCE}), output_format)
     _assert_partial_coverage(result, location)
     assert result["risk_recommendation"] == "CAUTION"
+    completeness = result["analysis_completeness"]
+    assert isinstance(completeness, dict)
+    exception = next(
+        row
+        for row in completeness["ledger_exceptions"]
+        if row["path"] == location and row["reason_code"] == "unscanned_executable_content"
+    )
+    exception_location = _display_location(exception)
+    exception_message = str(exception["message"])
+    coverage = completeness["coverage_percent"]
 
     serialized = result["report_body"]
     assert isinstance(serialized, str)
@@ -132,25 +155,21 @@ def test_executable_markdown_is_truthfully_projected_in_every_output(
         lines = serialized.splitlines()
         assert "| Recommendation | CAUTION |" in lines
         assert "| Status | partial |" in lines
-        assert "| Coverage | 50.0% |" in lines
+        assert f"| Coverage | {coverage}% |" in lines
         assert "| Reason / Status | Location | Details |" in lines
-        exception_row = next(
-            line for line in lines if f"`{location}:{_FENCE_START_LINE}-{_FENCE_END_LINE}`" in line
+        assert (
+            f"| {exception['reason_code']} | `{exception_location}` | {exception_message} |"
+            in lines
         )
-        assert [cell.strip() for cell in exception_row.split("|")[1:3]] == [
-            "unscanned_executable_content",
-            f"`{location}:{_FENCE_START_LINE}-{_FENCE_END_LINE}`",
-        ]
     else:
         lines = _terminal_lines(serialized)
         assert "Recommendation CAUTION" in lines
         assert "Status partial" in lines
-        assert "Coverage 50.0%" in lines
-        exception_pattern = re.compile(
-            rf"^- unscanned_executable_content {re.escape(location)}:"
-            rf"{_FENCE_START_LINE}-{_FENCE_END_LINE}: .+$"
+        assert f"Coverage {coverage}%" in lines
+        assert (
+            f"- {exception['reason_code']} {exception_location}: {exception_message}"
+            in _normalized_terminal(serialized)
         )
-        assert any(exception_pattern.fullmatch(line) for line in lines)
 
 
 def test_manifest_only_skill_remains_safe_and_complete(tmp_path: Path) -> None:
