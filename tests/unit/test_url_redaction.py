@@ -94,6 +94,47 @@ def test_ssh_git_and_scp_like_forms_remove_userinfo_fragments_and_secret_queries
 
 
 @pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "https://user:ipv6-secret@[2001:db8::1]:8443/private",
+            "https://REDACTED@[2001:db8::1]:8443/private",
+        ),
+        (
+            "http://user:http-secret@packages.example.invalid:8080/simple",
+            "http://REDACTED@packages.example.invalid:8080/simple",
+        ),
+        (
+            "git://user:git-scheme-secret@git.example.invalid/org/repo.git",
+            "git://REDACTED@git.example.invalid/org/repo.git",
+        ),
+    ],
+)
+def test_valid_ipv6_http_and_git_urls_preserve_safe_authority_and_path(
+    raw: str,
+    expected: str,
+) -> None:
+    api = _api()
+
+    assert api.redact_url(raw) == expected
+
+
+def test_cargo_sparse_url_preserves_safe_scheme_host_and_path() -> None:
+    api = _api()
+    raw = "sparse+https://user:sparse-secret@packages.example.invalid/index/"
+
+    assert api.redact_url(raw) == ("sparse+https://REDACTED@packages.example.invalid/index/")
+
+
+def test_email_followed_by_colon_prose_is_not_treated_as_scp_git_syntax() -> None:
+    api = _api()
+    text = "Contact dev@example.invalid:today or dev@example.invalid: today."
+
+    assert api.redact_url("dev@example.invalid:today") == "dev@example.invalid:today"
+    assert api.redact_text(text) == text
+
+
+@pytest.mark.parametrize(
     "raw",
     [
         "https://user:malformed-secret@[broken.example.invalid/repo",
@@ -172,6 +213,18 @@ def test_embedded_urls_are_redacted_without_changing_surrounding_free_text() -> 
         "for the build, then continue."
     )
     assert sentinel not in redacted
+
+
+def test_embedded_url_fragment_is_removed_without_swallowing_trailing_prose_punctuation() -> None:
+    api = _api()
+    text = (
+        "Fetch (https://user:punctuation-secret@packages.example.invalid/private"
+        "#fragment-secret), then continue."
+    )
+
+    assert api.redact_text(text) == (
+        "Fetch (https://REDACTED@packages.example.invalid/private), then continue."
+    )
 
 
 def test_ordinary_no_match_text_is_byte_for_byte_unchanged() -> None:
@@ -257,7 +310,7 @@ def test_nested_redaction_fails_closed_at_depth_and_item_bounds() -> None:
     assert depth_secret not in repr(depth_bounded)
     assert item_secret not in repr(item_bounded)
     assert api.REDACTED_VALUE in repr(depth_bounded)
-    assert api.REDACTED_VALUE in repr(item_bounded)
+    assert item_bounded == {"first": "safe", "second": api.REDACTED_VALUE}
 
 
 def test_recursive_value_exact_depth_and_node_bounds_succeed_but_one_over_is_redacted() -> None:

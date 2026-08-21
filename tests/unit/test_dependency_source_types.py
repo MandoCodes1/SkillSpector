@@ -425,6 +425,44 @@ def test_failed_scan_charge_does_not_mutate_target_or_related_counters() -> None
     assert {resource: budget.used(resource) for resource in before} == before
 
 
+def test_source_change_reservation_charges_change_and_finding_capacity_atomically() -> None:
+    api = _api()
+    budget = api.DependencyWorkBudget()
+    assert budget.charge_emitted_changes(9_999) is None
+    assert budget.charge_finding_output_records(9_999) is None
+
+    assert budget.reserve_source_changes() is None
+
+    assert budget.used(api.DependencyWorkResource.EMITTED_CHANGES) == 10_000
+    assert budget.used(api.DependencyWorkResource.FINDING_OUTPUT_RECORDS) == 10_000
+
+
+def test_source_change_reservation_mutates_neither_counter_when_finding_capacity_is_full() -> None:
+    api = _api()
+    budget = api.DependencyWorkBudget()
+    assert budget.charge_emitted_changes(9_999) is None
+    assert budget.charge_finding_output_records(10_000) is None
+
+    exhaustion = budget.reserve_source_changes()
+
+    assert exhaustion.resource is api.DependencyWorkResource.FINDING_OUTPUT_RECORDS
+    assert budget.used(api.DependencyWorkResource.EMITTED_CHANGES) == 9_999
+    assert budget.used(api.DependencyWorkResource.FINDING_OUTPUT_RECORDS) == 10_000
+
+
+def test_source_change_reservation_mutates_neither_counter_when_change_capacity_is_full() -> None:
+    api = _api()
+    budget = api.DependencyWorkBudget()
+    assert budget.charge_emitted_changes(10_000) is None
+    assert budget.charge_finding_output_records(9_999) is None
+
+    exhaustion = budget.reserve_source_changes()
+
+    assert exhaustion.resource is api.DependencyWorkResource.EMITTED_CHANGES
+    assert budget.used(api.DependencyWorkResource.EMITTED_CHANGES) == 10_000
+    assert budget.used(api.DependencyWorkResource.FINDING_OUTPUT_RECORDS) == 9_999
+
+
 def test_finding_capacity_starts_from_existing_public_output_record_footprint() -> None:
     api = _api()
     existing = Finding(
@@ -485,6 +523,23 @@ def test_full_existing_ledger_has_no_fabricated_truncation_slot() -> None:
     assert exhaustion.resource is api.DependencyWorkResource.LEDGER_EVENTS
     assert (exhaustion.observed, exhaustion.limit) == (10_001, 10_000)
     assert budget.used(api.DependencyWorkResource.LEDGER_EVENTS) == 10_000
+
+
+@pytest.mark.parametrize(
+    ("finding_records", "ledger_events"),
+    [(10_001, 0), (0, 10_001)],
+)
+def test_preexisting_output_counts_above_global_ceiling_are_rejected(
+    finding_records: int,
+    ledger_events: int,
+) -> None:
+    api = _api()
+
+    with pytest.raises(ValueError):
+        api.DependencyWorkBudget(
+            existing_finding_output_records=finding_records,
+            existing_ledger_events=ledger_events,
+        )
 
 
 @pytest.mark.parametrize(
