@@ -40,7 +40,11 @@ class DependencyEcosystem(StrEnum):
     """Code-owned dependency ecosystems implemented by source parsers."""
 
     NPM = "npm"
+    YARN = "yarn"
     PIP = "pip"
+    POETRY = "poetry"
+    PDM = "pdm"
+    UV = "uv"
     CARGO = "cargo"
     MAVEN = "maven"
     GRADLE = "gradle"

@@ -107,6 +107,10 @@ def test_exact_value_redaction_preserves_its_fixed_placeholder() -> None:
         "https%3A%2F%2Fuser%3Asecret%40packages.example.invalid%2Fprivate",
         "https://user:secret@packages.example.invalid/private?next=https://evil.invalid/x",
         "https://packages.example.invalid/private?next=user@evil.invalid:org/repo.git",
+        "https://packages.example.invalid/private?next=marker@evil.invalid:repo",
+        "https://packages.example.invalid/private#next=marker@evil.invalid:repo",
+        "https://packages.example.invalid/private?next=marker%40evil.invalid:repo",
+        "https://packages.example.invalid/private#next=marker%40evil.invalid:repo",
         "credential-marker%40host.invalid:repo",
         "https://one.invalid/x,https://two.invalid/y",
         "https://first:secret@second@packages.example.invalid/private",
@@ -285,22 +289,39 @@ def test_internal_text_probe_errors_mask_the_whole_input_without_throwing() -> N
 
 
 def test_nested_values_preserve_code_owned_keys_and_container_types() -> None:
-    value = {
-        "registry_url": "https://user:https-secret@packages.example.invalid/private?token=x",
-        "details": [
-            "ssh://user:ssh-secret@git.example.invalid/org/repo.git#part",
-            ("ordinary", 7),
-        ],
-        "enabled": True,
-    }
+    value = api.CodeOwnedMapping(
+        {
+            "registry_url": "https://user:https-secret@packages.example.invalid/private?token=x",
+            "details": [
+                "ssh://user:ssh-secret@git.example.invalid/org/repo.git#part",
+                ("ordinary", 7),
+            ],
+            "enabled": True,
+        }
+    )
 
     redacted = api.redact_value(value)
 
-    assert redacted == {
-        "registry_url": "https://packages.example.invalid/REDACTED_PATH",
-        "details": ["ssh://git.example.invalid/REDACTED_PATH", ("ordinary", 7)],
-        "enabled": True,
-    }
+    assert redacted == api.CodeOwnedMapping(
+        {
+            "registry_url": "https://packages.example.invalid/REDACTED_PATH",
+            "details": ["ssh://git.example.invalid/REDACTED_PATH", ("ordinary", 7)],
+            "enabled": True,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"credential_marker": "safe"},
+        {"ordinary_field": "safe"},
+    ],
+)
+def test_plain_mappings_fail_closed_even_when_keys_have_identifier_shape(
+    value: dict[str, str],
+) -> None:
+    assert api.redact_value(value) == api.REDACTED_VALUE
 
 
 @pytest.mark.parametrize(
@@ -314,37 +335,41 @@ def test_nested_values_preserve_code_owned_keys_and_container_types() -> None:
         "a" * 256,
     ],
 )
-def test_recursive_redaction_rejects_non_code_owned_mapping_keys(key: object) -> None:
-    assert api.redact_value({key: "ordinary"}) == api.REDACTED_VALUE
+def test_wrapped_mapping_rejects_invalid_or_oversized_keys(key: object) -> None:
+    assert api.redact_value(api.CodeOwnedMapping({key: "ordinary"})) == api.REDACTED_VALUE
 
 
 def test_mapping_keys_share_the_aggregate_character_budget_with_values() -> None:
-    value = {"field": "x"}
+    value = api.CodeOwnedMapping({"field": "x"})
 
     assert api.redact_value(value, max_text_characters=6) == value
     assert api.redact_value(value, max_text_characters=5) == api.REDACTED_VALUE
 
 
 def test_recursive_text_character_and_candidate_budgets_are_aggregate() -> None:
-    benign = {"first": "abcd", "second": "efgh"}
-    candidates = {
-        "first": "https://user:first-secret@one.invalid/x",
-        "second": "https://user:second-secret@two.invalid/y",
-    }
+    benign = api.CodeOwnedMapping({"first": "abcd", "second": "efgh"})
+    candidates = api.CodeOwnedMapping(
+        {
+            "first": "https://user:first-secret@one.invalid/x",
+            "second": "https://user:second-secret@two.invalid/y",
+        }
+    )
 
     assert api.redact_value(benign, max_text_characters=19) == benign
     assert api.redact_value(benign, max_text_characters=18) == api.REDACTED_VALUE
     assert api.redact_value(candidates, max_text_candidates=1) == api.REDACTED_VALUE
     exact = api.redact_value(candidates, max_text_candidates=2)
-    assert exact == {
-        "first": "https://one.invalid/REDACTED_PATH",
-        "second": "https://two.invalid/REDACTED_PATH",
-    }
+    assert exact == api.CodeOwnedMapping(
+        {
+            "first": "https://one.invalid/REDACTED_PATH",
+            "second": "https://two.invalid/REDACTED_PATH",
+        }
+    )
 
 
 def test_recursive_depth_and_node_bounds_are_exact_and_fail_closed_one_over() -> None:
-    depth_value = {"outer": {"leaf": "ordinary"}}
-    node_value = {"leaf": "ordinary"}
+    depth_value = api.CodeOwnedMapping({"outer": api.CodeOwnedMapping({"leaf": "ordinary"})})
+    node_value = api.CodeOwnedMapping({"leaf": "ordinary"})
 
     assert api.redact_value(depth_value, max_depth=2) == depth_value
     assert api.redact_value(depth_value, max_depth=1) == api.REDACTED_VALUE
@@ -396,10 +421,12 @@ def test_string_redactors_are_deterministic_and_idempotent(function_name: str) -
 
 
 def test_recursive_value_redaction_is_idempotent() -> None:
-    value = {
-        "url": "https://user:secret@packages.example.invalid/repo?token=x",
-        "items": ("plain",),
-    }
+    value = api.CodeOwnedMapping(
+        {
+            "url": "https://user:secret@packages.example.invalid/repo?token=x",
+            "items": ("plain",),
+        }
+    )
 
     first = api.redact_value(value)
 

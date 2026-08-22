@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from ipaddress import IPv6Address
@@ -43,6 +43,30 @@ _PAIRED_CLOSERS: Final = {
 }
 _SENTENCE_PUNCTUATION: Final = frozenset(".,")
 _SCHEME_RELATIVE_TOKEN = re.compile(r"(?:^|\s)[\(\[\{<\"'`]?//")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class CodeOwnedMapping(Mapping[object, object]):
+    """Immutable provenance marker for mappings assembled by trusted caller code."""
+
+    _entries: tuple[tuple[object, object], ...]
+
+    def __init__(self, values: Mapping[object, object]) -> None:
+        if not isinstance(values, Mapping):
+            raise ValueError("code-owned mapping values must be a mapping")
+        object.__setattr__(self, "_entries", tuple(values.items()))
+
+    def __getitem__(self, key: object) -> object:
+        for candidate, value in self._entries:
+            if candidate == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[object]:
+        return (key for key, _value in self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
 
 
 def _valid_bound(value: object) -> bool:
@@ -184,7 +208,7 @@ def _has_nested_scp_marker(value: str, authority_start: int) -> bool:
     if colon < 0:
         return False
     path = suffix[colon + 1 :].split("?", 1)[0].split("#", 1)[0]
-    return "/" in path or ".git" in path.casefold()
+    return bool(path)
 
 
 def _redact_hierarchical(value: str, *, scheme_relative: bool) -> str:
@@ -435,15 +459,15 @@ class _ValueWalk:
             return text_result.value
         if value is None or isinstance(value, (bool, int, float)):
             return value
-        if isinstance(value, (Mapping, list, tuple)):
+        if isinstance(value, (CodeOwnedMapping, list, tuple)):
             identity = id(value)
             if identity in self.active or len(value) > self.remaining_nodes:
                 raise _AggregateRedactionExhaustedError
             self.active.add(identity)
             try:
-                if isinstance(value, Mapping):
-                    mapping_result: dict[str, object] = {}
-                    for key, nested in value.items():
+                if isinstance(value, CodeOwnedMapping):
+                    mapping_result: dict[object, object] = {}
+                    for key, nested in value._entries:
                         if (
                             not isinstance(key, str)
                             or len(key) > MAX_REDACTION_MAPPING_KEY_CHARACTERS
@@ -454,11 +478,13 @@ class _ValueWalk:
                             raise _AggregateRedactionExhaustedError
                         self.remaining_text_characters -= len(key)
                         mapping_result[key] = self.visit(nested, depth + 1)
-                    return mapping_result
+                    return CodeOwnedMapping(mapping_result)
                 items = [self.visit(nested, depth + 1) for nested in value]
                 return tuple(items) if isinstance(value, tuple) else items
             finally:
                 self.active.remove(identity)
+        if isinstance(value, Mapping):
+            raise _AggregateRedactionExhaustedError
         return REDACTED_VALUE
 
 

@@ -142,6 +142,26 @@ def test_source_change_accepts_only_redacted_resolved_destinations() -> None:
 
 
 @pytest.mark.parametrize(
+    ("value", "member_name"),
+    [
+        ("yarn", "YARN"),
+        ("poetry", "POETRY"),
+        ("pdm", "PDM"),
+        ("uv", "UV"),
+    ],
+)
+def test_dependency_ecosystem_has_fixed_pr2_parser_categories(
+    value: str,
+    member_name: str,
+) -> None:
+    api = _api()
+
+    member = getattr(api.DependencyEcosystem, member_name)
+
+    assert api.DependencyEcosystem(value) is member
+
+
+@pytest.mark.parametrize(
     "raw_destination",
     [
         "token=type-boundary-secret",
