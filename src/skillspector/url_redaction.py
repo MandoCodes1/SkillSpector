@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded, local-only credential redaction for dependency-source evidence."""
+"""Small, bounded credential-redaction boundary for dependency-source evidence."""
 
 from __future__ import annotations
 
@@ -9,60 +9,26 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from io import StringIO
 from ipaddress import IPv6Address
 from typing import Final
-from urllib.parse import SplitResult, unquote_plus, urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 REDACTED_URL: Final = "[REDACTED_URL]"
 REDACTED_REMAINDER: Final = "[REDACTED_REMAINDER]"
 REDACTED_VALUE: Final = "[REDACTED_VALUE]"
+REDACTED_PATH: Final = "REDACTED_PATH"
 
-# Match the repository's bounded visible-artifact ceiling so provider-bound
-# content is not silently shortened before the caller can account for it.
 MAX_REDACTION_CHARACTERS: Final = 16 * 1024 * 1024
 MAX_REDACTION_CANDIDATES: Final = 1_024
 MAX_REDACTION_DEPTH: Final = 16
 MAX_REDACTION_NODES: Final = 10_000
 
-_CREDENTIAL_WORDS: Final = frozenset(
-    {
-        "auth",
-        "authentication",
-        "authorization",
-        "credential",
-        "credentials",
-        "key",
-        "keys",
-        "pass",
-        "password",
-        "passwd",
-        "passphrase",
-        "secret",
-        "secrets",
-        "sig",
-        "signature",
-        "signatures",
-        "token",
-        "tokens",
-    }
-)
-_MAX_RAW_QUERY_KEY_CHARACTERS: Final = 3 * 256
-_MAX_DECODED_QUERY_KEY_CHARACTERS: Final = 256
 _CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
-_UNSAFE_URI_CHARACTER = re.compile(r'[<>"`]')
-_BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
-_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
-_ENCODED_UNSAFE_AUTHORITY_CHARACTER = re.compile(
-    r"%(?:0[0-9A-Fa-f]|1[0-9A-Fa-f]|20|23|2[fF]|3[aAfF]|40|5[bBcCdD]|7[fF])"
-)
-_ENCODED_AT_SIGN = re.compile(r"%40", re.IGNORECASE)
 _SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*$")
-_SCP_URL = re.compile(
-    r"^(?P<user>[^@/:\\\s]+)@"
-    r"(?P<host>\[[^\]\s]+\]|[^@/:\\\s]+):"
-    r"(?P<path>.+)$"
-)
+_HIERARCHICAL_MARKER = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+_SAFE_PATH = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@/-]*$")
+_SAFE_SCP_PATH = re.compile(r"^[A-Za-z0-9._~!$&'()*+,;=:@/-]+$")
+_SCP_URL = re.compile(r"^(?P<user>[^@\s]+)@(?P<host>\[[^\]\s]+\]|[^@/:\\\s]+):(?P<path>.+)$")
 _PROSE_OPENERS: Final = frozenset("([{<\"'`")
 _PAIRED_CLOSERS: Final = {
     ")": "(",
@@ -74,110 +40,25 @@ _PAIRED_CLOSERS: Final = {
     "`": "`",
 }
 _SENTENCE_PUNCTUATION: Final = frozenset(".,")
-_SCHEME_RELATIVE_TOKEN_START = re.compile(r"(?:^|\s)[\(\[\{<\"'`]?//")
+_SCHEME_RELATIVE_TOKEN = re.compile(r"(?:^|\s)[\(\[\{<\"'`]?//")
 
 
 def _valid_bound(value: object) -> bool:
     return type(value) is int and value >= 0
 
 
-def _has_ambiguous_percent_escape(value: str) -> bool:
-    return _BAD_PERCENT_ESCAPE.search(value) is not None
-
-
-def _query_key_is_sensitive(raw_key: str) -> bool:
-    if len(raw_key) > _MAX_RAW_QUERY_KEY_CHARACTERS:
-        raise ValueError("query key exceeds its bound")
-    try:
-        decoded = unquote_plus(raw_key, encoding="utf-8", errors="strict")
-    except (UnicodeDecodeError, ValueError):
-        raise ValueError("query key is ambiguous") from None
-    if (
-        len(decoded) > _MAX_DECODED_QUERY_KEY_CHARACTERS
-        or _CONTROL_CHARACTER.search(decoded)
-        or _PERCENT_ESCAPE.search(decoded)
-    ):
-        raise ValueError("query key is ambiguous")
-    folded = decoded.casefold()
-    return any(term in folded for term in _CREDENTIAL_WORDS)
-
-
-def _query_has_sensitive_key(raw_query: str) -> bool:
-    cursor = 0
-    for delimiter in re.finditer(r"[&;]", raw_query):
-        raw_key, separator, _ = raw_query[cursor : delimiter.start()].partition("=")
-        try:
-            if separator and _query_key_is_sensitive(raw_key):
-                return True
-        except ValueError:
-            return True
-        cursor = delimiter.end()
-    raw_key, separator, _ = raw_query[cursor:].partition("=")
-    try:
-        return bool(separator and _query_key_is_sensitive(raw_key))
-    except ValueError:
-        return True
-
-
-def _query_has_nested_reference(raw_query: str) -> bool:
-    cursor = 0
-    for delimiter in re.finditer(r"[&;]", raw_query):
-        raw_part = raw_query[cursor : delimiter.start()]
-        raw_key, separator, raw_value = raw_part.partition("=")
-        candidate = raw_value if separator else raw_key
-        if candidate.startswith("//") or _has_ambiguous_interior_double_slash(candidate):
-            return True
-        cursor = delimiter.end()
-    raw_key, separator, raw_value = raw_query[cursor:].partition("=")
-    candidate = raw_value if separator else raw_key
-    return candidate.startswith("//") or _has_ambiguous_interior_double_slash(candidate)
-
-
-def _double_slash_tail_has_credential_shape(
-    value: str,
-    marker: int,
-    raw_query: str,
-) -> bool:
-    suffix = value[marker + 2 :]
-    return bool(
-        "@" in suffix
-        or "#" in suffix
-        or _ENCODED_AT_SIGN.search(suffix)
-        or (raw_query and _query_has_sensitive_key(raw_query))
-    )
-
-
-def _has_ambiguous_interior_double_slash(value: str) -> bool:
-    marker = value.find("//")
-    if marker <= 0 or "://" in value:
+def _valid_dns_host(host: str) -> bool:
+    if not host or len(host) > 253 or not host.isascii():
         return False
-    _, separator, raw_query = value.partition("?")
-    return _double_slash_tail_has_credential_shape(
-        value,
-        marker,
-        raw_query if separator else "",
+    labels = host.split(".")
+    return all(
+        label
+        and len(label) <= 63
+        and label[0].isalnum()
+        and label[-1].isalnum()
+        and all(character.isalnum() or character == "-" for character in label)
+        for label in labels
     )
-
-
-def _redact_query(raw_query: str) -> str:
-    if not raw_query:
-        return raw_query
-    output = StringIO()
-    cursor = 0
-    for delimiter in re.finditer(r"[&;]", raw_query):
-        raw_part = raw_query[cursor : delimiter.start()]
-        raw_key, separator, _raw_value = raw_part.partition("=")
-        if separator and _query_key_is_sensitive(raw_key):
-            raw_part = f"{raw_key}=REDACTED"
-        output.write(raw_part)
-        output.write(delimiter.group())
-        cursor = delimiter.end()
-    raw_part = raw_query[cursor:]
-    raw_key, separator, _raw_value = raw_part.partition("=")
-    output.write(
-        f"{raw_key}=REDACTED" if separator and _query_key_is_sensitive(raw_key) else raw_part
-    )
-    return output.getvalue()
 
 
 def _valid_bracketed_ipv6(host: str) -> bool:
@@ -190,251 +71,183 @@ def _valid_bracketed_ipv6(host: str) -> bool:
     return True
 
 
-def _valid_host_port(host_port: str) -> bool:
-    if not host_port or _ENCODED_UNSAFE_AUTHORITY_CHARACTER.search(host_port):
-        return False
-    if host_port.startswith("["):
-        close = host_port.find("]")
-        if close < 0 or host_port.find("]", close + 1) >= 0:
-            return False
-        if not _valid_bracketed_ipv6(host_port[: close + 1]):
-            return False
-        suffix = host_port[close + 1 :]
-        if not suffix:
-            return True
-        return suffix.startswith(":") and len(suffix) > 1 and suffix[1:].isdigit()
-    if "[" in host_port or "]" in host_port or host_port.count(":") > 1:
-        return False
-    host, separator, port = host_port.partition(":")
-    if not host:
-        return False
-    return not separator or bool(port and port.isdigit())
-
-
-def _validated_safe_authority(parsed: SplitResult, authority: str) -> str | None:
+def _safe_authority(parsed: SplitResult) -> str | None:
+    authority = parsed.netloc
     if (
         not authority
-        or authority.count("@") > 1
+        or not authority.isascii()
         or "\\" in authority
         or _CONTROL_CHARACTER.search(authority)
         or any(character.isspace() for character in authority)
-        or _ENCODED_UNSAFE_AUTHORITY_CHARACTER.search(authority)
+        or authority.count("@") > 1
     ):
         return None
-    host_port = authority.rsplit("@", 1)[-1]
-    if not _valid_host_port(host_port):
-        return None
+
+    if "@" in authority:
+        userinfo, host_port = authority.rsplit("@", 1)
+        if not userinfo:
+            return None
+    else:
+        host_port = authority
+
     try:
         hostname = parsed.hostname
-        _ = parsed.port
+        port = parsed.port
     except (UnicodeError, ValueError):
         return None
-    if not hostname:
+    if hostname is None:
         return None
-    return f"REDACTED@{host_port}" if "@" in authority else host_port
 
-
-def _redact_standard_url(value: str) -> str:
-    try:
-        parsed = urlsplit(value)
-    except (UnicodeError, ValueError):
-        return REDACTED_URL
-    if not _SCHEME.fullmatch(parsed.scheme) or not parsed.netloc:
-        return REDACTED_URL
-    if _query_has_nested_reference(parsed.query):
-        return REDACTED_URL
-    interior_marker = parsed.path.find("//")
-    if interior_marker >= 0:
-        if parsed.fragment or _double_slash_tail_has_credential_shape(
-            parsed.path,
-            interior_marker,
-            "",
-        ):
-            return REDACTED_URL
-    safe_authority = _validated_safe_authority(parsed, parsed.netloc)
-    if safe_authority is None:
-        return REDACTED_URL
-    safe_query = _redact_query(parsed.query)
-    without_fragment = value.split("#", 1)[0]
-    had_query_delimiter = "?" in without_fragment
-    suffix = f"?{safe_query}" if had_query_delimiter else ""
-    return f"{parsed.scheme}://{safe_authority}{parsed.path}{suffix}"
-
-
-def _validated_scheme_relative_reference(
-    value: str,
-) -> tuple[SplitResult, str] | None:
-    if (
-        len(value) <= 2
-        or _CONTROL_CHARACTER.search(value)
-        or any(character.isspace() for character in value)
-        or _UNSAFE_URI_CHARACTER.search(value)
-        or _has_ambiguous_percent_escape(value)
-    ):
-        return None
-    try:
-        parsed = urlsplit(value)
-    except (UnicodeError, ValueError):
-        return None
-    if parsed.scheme or not parsed.netloc or "#" in value:
-        return None
-    safe_authority = _validated_safe_authority(parsed, parsed.netloc)
-    if safe_authority is None or not any(
-        character.isalnum() for character in (parsed.hostname or "")
-    ):
-        return None
-    return parsed, safe_authority
-
-
-def _redact_scheme_relative_reference(value: str) -> str:
-    validated = _validated_scheme_relative_reference(value)
-    if validated is None:
-        return REDACTED_URL
-    parsed, safe_authority = validated
-    if safe_authority != parsed.netloc:
-        return REDACTED_URL
-    if (
-        _query_has_sensitive_key(parsed.query)
-        or _query_has_nested_reference(parsed.query)
-        or "://" in parsed.path
-        or "://" in parsed.query
-        or "//" in parsed.path
-        or _looks_like_scp_git(parsed.path)
-        or _looks_like_scp_git(parsed.query)
-    ):
-        return REDACTED_URL
-    return value
-
-
-def _valid_scp_host(host: str) -> bool:
-    if (
-        not host
-        or "\\" in host
-        or _CONTROL_CHARACTER.search(host)
-        or any(character.isspace() for character in host)
-        or _ENCODED_UNSAFE_AUTHORITY_CHARACTER.search(host)
-    ):
-        return False
-    if host.startswith("[") or host.endswith("]"):
-        return _valid_bracketed_ipv6(host)
-    return "[" not in host and "]" not in host and ":" not in host
-
-
-def _redact_scp_url(value: str) -> str:
-    without_fragment = value.split("#", 1)[0]
-    match = _SCP_URL.fullmatch(without_fragment)
-    if (
-        match is None
-        or without_fragment.count("@") != 1
-        or not _valid_scp_host(match.group("host"))
-    ):
-        return REDACTED_URL
-    raw_path, query_separator, raw_query = match.group("path").partition("?")
-    if not raw_path:
-        return REDACTED_URL
-    safe_query = _redact_query(raw_query) if query_separator else ""
-    suffix = f"?{safe_query}" if query_separator else ""
-    return f"REDACTED@{match.group('host')}:{raw_path}{suffix}"
-
-
-def _scp_discovery_path(candidate: str) -> str | None:
-    at_sign = candidate.find("@")
-    if at_sign < 0 or at_sign + 1 >= len(candidate):
-        return None
-    host_start = at_sign + 1
-    if candidate[host_start] == "[":
-        close = candidate.find("]", host_start + 1)
-        if close < 0 or close + 1 >= len(candidate) or candidate[close + 1] != ":":
+    if host_port.startswith("["):
+        close = host_port.find("]")
+        if close < 0 or not _valid_bracketed_ipv6(host_port[: close + 1]):
             return None
-        separator = close + 1
+        suffix = host_port[close + 1 :]
+        if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
+            return None
     else:
-        separator = candidate.find(":", host_start)
-        if separator < 0:
+        if host_port.count(":") > 1:
             return None
-    return candidate[separator + 1 :].split("?", 1)[0]
+        raw_host, separator, raw_port = host_port.partition(":")
+        if not _valid_dns_host(raw_host):
+            return None
+        if separator and not raw_port.isdigit():
+            return None
+    if port is not None and not 0 <= port <= 65_535:
+        return None
+    return host_port
+
+
+def _safe_path(path: str) -> str | None:
+    if not path:
+        return ""
+    if path == "/":
+        return "/"
+    if not _SAFE_PATH.fullmatch(path) or "//" in path:
+        return None
+    return f"/{REDACTED_PATH}"
+
+
+def _marker_count(value: str) -> int:
+    if value == "//":
+        return 0
+    hierarchical = list(_HIERARCHICAL_MARKER.finditer(value))
+    count = len(hierarchical)
+    if value.startswith("//"):
+        count += 1
+    if _has_encoded_url_marker(value):
+        count += 1
+
+    if hierarchical or value.startswith("//"):
+        raw_slashes = value.count("//")
+        structural_slashes = len(hierarchical) + (1 if value.startswith("//") else 0)
+        count += max(0, raw_slashes - structural_slashes)
+        if _has_nested_scp_marker(value, hierarchical[0].end() if hierarchical else 2):
+            count += 1
+    elif _looks_like_scp_git(value):
+        count += max(1, value.count("@"))
+    return count
+
+
+def _has_encoded_url_marker(value: str) -> bool:
+    return "%" in value and "%2f%2f" in value.casefold()
+
+
+def _has_nested_scp_marker(value: str, authority_start: int) -> bool:
+    boundary = len(value)
+    for delimiter in "/?#":
+        position = value.find(delimiter, authority_start)
+        if position >= 0:
+            boundary = min(boundary, position)
+    suffix = value[boundary:]
+    at_sign = suffix.find("@")
+    if at_sign < 0:
+        return False
+    colon = suffix.find(":", at_sign + 1)
+    if colon < 0:
+        return False
+    path = suffix[colon + 1 :].split("?", 1)[0].split("#", 1)[0]
+    return "/" in path or ".git" in path.casefold()
+
+
+def _redact_hierarchical(value: str, *, scheme_relative: bool) -> str:
+    try:
+        parsed = urlsplit(value)
+    except (UnicodeError, ValueError):
+        return REDACTED_URL
+    if scheme_relative:
+        if parsed.scheme:
+            return REDACTED_URL
+        prefix = "//"
+    else:
+        if not _SCHEME.fullmatch(parsed.scheme):
+            return REDACTED_URL
+        prefix = f"{parsed.scheme}://"
+    authority = _safe_authority(parsed)
+    path = _safe_path(parsed.path)
+    if authority is None or path is None:
+        return REDACTED_URL
+    return f"{prefix}{authority}{path}"
 
 
 def _looks_like_scp_git(value: str) -> bool:
-    candidates = (value.split("#", 1)[0], value.replace("#", ""))
-    for candidate in candidates:
-        path = _scp_discovery_path(candidate)
-        if path is None:
-            continue
-        if "/" in path or ".git" in path.casefold():
-            return True
-    return False
+    base = re.split(r"[?#]", value, maxsplit=1)[0]
+    match = _SCP_URL.fullmatch(base)
+    if match is None:
+        return False
+    path = match.group("path")
+    return "/" in path or ".git" in path.casefold()
 
 
-def _hierarchical_suffix_after_authority(value: str) -> str:
-    marker = value.find("://")
-    if marker < 0:
-        return ""
-    suffix_start = len(value)
-    for delimiter in "/?#":
-        position = value.find(delimiter, marker + 3)
-        if position >= 0:
-            suffix_start = min(suffix_start, position)
-    return value[suffix_start:]
-
-
-def _detach_trailing_prose_punctuation(
-    value: str,
-    opener: str | None,
-) -> tuple[str, str]:
-    split_at = len(value)
-    while split_at > 0 and value[split_at - 1] in _SENTENCE_PUNCTUATION:
-        split_at -= 1
-    if split_at > 0 and opener is not None:
-        closer = value[split_at - 1]
-        if _PAIRED_CLOSERS.get(closer) == opener:
-            split_at -= 1
-    return value[:split_at], value[split_at:]
+def _redact_scp(value: str) -> str:
+    base = re.split(r"[?#]", value, maxsplit=1)[0]
+    match = _SCP_URL.fullmatch(base)
+    if match is None or value.count("@") != 1:
+        return REDACTED_URL
+    host = match.group("host")
+    if not (_valid_bracketed_ipv6(host) if host.startswith("[") else _valid_dns_host(host)):
+        return REDACTED_URL
+    path = match.group("path")
+    if not _SAFE_SCP_PATH.fullmatch(path) or "//" in path:
+        return REDACTED_URL
+    return f"REDACTED@{host}:{REDACTED_PATH}"
 
 
 def redact_url(value: str, *, max_characters: int = MAX_REDACTION_CHARACTERS) -> str:
-    """Return one URL-like value with credentials removed, or a fixed placeholder."""
+    """Sanitize one exact URL candidate or fail closed with a fixed placeholder."""
     if not isinstance(value, str) or not _valid_bound(max_characters):
         return REDACTED_URL
     if len(value) > max_characters:
         return REDACTED_URL
-    if value.startswith("//"):
-        try:
-            return _redact_scheme_relative_reference(value)
-        except Exception:
-            return REDACTED_URL
-    if _has_ambiguous_interior_double_slash(value):
+
+    try:
+        markers = _marker_count(value)
+    except Exception:
         return REDACTED_URL
-    is_hierarchical_uri = "://" in value
-    suspicious = is_hierarchical_uri or _looks_like_scp_git(value)
-    if not suspicious:
+    if markers == 0:
         return value
-    if is_hierarchical_uri:
-        first_marker = value.find("://")
-        if value.find("://", first_marker + 3) >= 0 or _looks_like_scp_git(
-            _hierarchical_suffix_after_authority(value)
-        ):
-            return REDACTED_URL
-    elif "#" in value and not _looks_like_scp_git(value.split("#", 1)[0]):
-        return REDACTED_URL
     if (
-        _CONTROL_CHARACTER.search(value)
-        or _UNSAFE_URI_CHARACTER.search(value)
-        or _has_ambiguous_percent_escape(value)
+        markers != 1
+        or "%" in value
+        or _CONTROL_CHARACTER.search(value)
+        or any(character.isspace() for character in value)
     ):
         return REDACTED_URL
     try:
-        if is_hierarchical_uri:
-            return _redact_standard_url(value)
-        return _redact_scp_url(value)
-    except (UnicodeError, ValueError):
+        if value.startswith("//"):
+            return _redact_hierarchical(value, scheme_relative=True)
+        marker = _HIERARCHICAL_MARKER.match(value)
+        if marker is not None:
+            return _redact_hierarchical(value, scheme_relative=False)
+        if _looks_like_scp_git(value):
+            return _redact_scp(value)
         return REDACTED_URL
     except Exception:
-        # Evidence redaction is a security boundary: unexpected parser errors fail closed.
         return REDACTED_URL
 
 
 class TextRedactionIncompleteReason(StrEnum):
-    """Content-free reason that one bounded text redaction did not complete."""
+    """Content-free reason that bounded text redaction did not complete."""
 
     CHARACTER_LIMIT = "character_limit"
     CANDIDATE_LIMIT = "candidate_limit"
@@ -444,7 +257,7 @@ class TextRedactionIncompleteReason(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class TextRedactionResult:
-    """Sanitized text plus truthful bounded completion and usage metadata."""
+    """Sanitized text plus truthful completion and candidate-usage metadata."""
 
     value: str
     complete: bool
@@ -456,7 +269,6 @@ class TextRedactionResult:
             not isinstance(self.value, str)
             or type(self.complete) is not bool
             or not _valid_bound(self.candidates)
-            or self.candidates > MAX_REDACTION_CHARACTERS
             or (
                 self.reason is not None
                 and not isinstance(self.reason, TextRedactionIncompleteReason)
@@ -466,189 +278,63 @@ class TextRedactionResult:
             raise ValueError("invalid text redaction result")
 
 
-@dataclass(frozen=True, slots=True)
-class _TokenRedactionResult:
-    value: str
-    candidates: int
-    complete: bool
-
-
-def _simple_token_parts(token: str) -> tuple[str, str, str, str]:
+def _token_parts(token: str) -> tuple[str, str, str, str]:
     split_at = len(token)
-    while split_at > 0 and token[split_at - 1] in _SENTENCE_PUNCTUATION:
+    while split_at and token[split_at - 1] in _SENTENCE_PUNCTUATION:
         split_at -= 1
     punctuation = token[split_at:]
     core = token[:split_at]
     if len(core) >= 2 and core[0] in _PROSE_OPENERS:
-        opener = core[0]
         closer = core[-1]
-        if _PAIRED_CLOSERS.get(closer) == opener:
-            return opener, core[1:-1], closer, punctuation
+        if _PAIRED_CLOSERS.get(closer) == core[0]:
+            return core[0], core[1:-1], closer, punctuation
     return "", core, "", punctuation
 
 
-def _scp_signals_in_token(token: str, first_marker: int) -> int:
-    if "@" not in token or ":" not in token:
-        return 0
-    if first_marker < 0:
-        return token.count("@") if _looks_like_scp_git(token) else 0
-
-    signals = 0
-    at_before = token.find("@", 0, first_marker)
-    if at_before >= 0:
-        separator = token.find(":", at_before + 1, first_marker)
-        assignment = token.find("=", at_before + 1, first_marker)
-        if separator >= 0 and assignment < 0:
-            signals += token[:first_marker].count("@")
-
-    suffix_start = len(token)
-    for delimiter in "/?#":
-        position = token.find(delimiter, first_marker + 3)
-        if position >= 0:
-            suffix_start = min(suffix_start, position)
-    suffix = token[suffix_start:]
-    if _looks_like_scp_git(suffix):
-        signals += suffix.count("@")
-    return signals
-
-
-def _simple_redact_token(token: str, *, max_candidates: int) -> _TokenRedactionResult:
-    opener, candidate, closer, punctuation = _simple_token_parts(token)
-    if candidate.startswith("//"):
-        signals = 1
-    elif _has_ambiguous_interior_double_slash(candidate):
-        signals = 1
-    else:
-        first_marker = token.find("://")
-        signals = token.count("://") + _scp_signals_in_token(token, first_marker)
-    if signals == 0:
-        return _TokenRedactionResult(token, 0, True)
-    if signals > max_candidates:
-        return _TokenRedactionResult(
-            REDACTED_REMAINDER,
-            max_candidates,
-            False,
-        )
-
-    sanitized = redact_url(candidate, max_characters=len(candidate))
-    if sanitized == REDACTED_URL:
-        return _TokenRedactionResult(f"{REDACTED_URL}{punctuation}", signals, True)
-    return _TokenRedactionResult(
-        f"{opener}{sanitized}{closer}{punctuation}",
-        signals,
-        True,
+def _might_contain_candidate(value: str) -> bool:
+    return bool(
+        "://" in value
+        or _has_encoded_url_marker(value)
+        or ("//" in value and _SCHEME_RELATIVE_TOKEN.search(value))
+        or ("@" in value and ":" in value)
     )
 
 
-def _next_token_has_credential_shape(value: str, start: int) -> bool:
-    index = start
-    while index < len(value) and value[index].isspace():
-        index += 1
-    token_start = index
-    while index < len(value) and not value[index].isspace():
-        index += 1
-    token = value[token_start:index]
-    if not token:
-        return False
-    at_sign = token.find("@")
-    colon = token.find(":")
-    if at_sign >= 0 and (
-        0 <= colon < at_sign
-        or "=" in token[:at_sign]
-        or any(delimiter in token[at_sign + 1 :] for delimiter in "/?#:[]")
-    ):
-        return True
-    encoded_at_sign = _ENCODED_AT_SIGN.search(token)
-    if encoded_at_sign is not None:
-        encoded_user = token[: encoded_at_sign.start()].casefold()
-        encoded_suffix = token[encoded_at_sign.end() :].casefold()
-        if (
-            ":" in encoded_user
-            or "%3a" in encoded_user
-            or "=" in encoded_user
-            or "%3d" in encoded_user
-            or any(delimiter in encoded_suffix for delimiter in "/?#:[]")
-            or any(delimiter in encoded_suffix for delimiter in ("%3a", "%5b", "%5d"))
-        ):
-            return True
-    if "#" in token:
-        return True
-    _, separator, raw_query = token.partition("?")
-    return bool(separator and _query_has_sensitive_key(raw_query))
-
-
-def _redact_text_with_usage(value: str, *, max_candidates: int) -> TextRedactionResult:
-    result = StringIO()
+def _redact_text(value: str, *, max_candidates: int) -> TextRedactionResult:
+    pieces: list[str] = []
     cursor = 0
-    index = 0
     candidates = 0
     try:
-        while index < len(value):
-            while index < len(value) and value[index].isspace():
-                index += 1
-            token_start = index
-            while index < len(value) and not value[index].isspace():
-                index += 1
-            if token_start == index:
+        for match in re.finditer(r"\S+", value):
+            token = match.group()
+            opener, candidate, closer, punctuation = _token_parts(token)
+            signals = _marker_count(candidate)
+            if signals == 0:
                 continue
-            result.write(value[cursor:token_start])
-            token_value = value[token_start:index]
-            _, bare_candidate, _, _ = _simple_token_parts(token_value)
-            incomplete_relative_attempt = bare_candidate.startswith("//") and (
-                _validated_scheme_relative_reference(bare_candidate) is None
-            )
-            ambiguous_continuation = incomplete_relative_attempt and (
-                _next_token_has_credential_shape(value, index)
-            )
-            if bare_candidate == "//" and not ambiguous_continuation:
-                result.write(token_value)
-                cursor = index
-                continue
-            if incomplete_relative_attempt and ambiguous_continuation:
-                if candidates >= max_candidates:
-                    result.write(REDACTED_REMAINDER)
-                    return TextRedactionResult(
-                        value=result.getvalue(),
-                        complete=False,
-                        candidates=candidates,
-                        reason=TextRedactionIncompleteReason.CANDIDATE_LIMIT,
-                    )
-                result.write(REDACTED_URL)
+            if signals > max_candidates - candidates:
                 return TextRedactionResult(
-                    value=result.getvalue(),
-                    complete=True,
-                    candidates=candidates + 1,
-                    reason=None,
+                    REDACTED_REMAINDER,
+                    False,
+                    candidates,
+                    TextRedactionIncompleteReason.CANDIDATE_LIMIT,
                 )
-            token = _simple_redact_token(
-                token_value,
-                max_candidates=max_candidates - candidates,
-            )
-            result.write(token.value)
-            if not token.complete:
-                return TextRedactionResult(
-                    value=result.getvalue(),
-                    complete=False,
-                    candidates=candidates + token.candidates,
-                    reason=TextRedactionIncompleteReason.CANDIDATE_LIMIT,
-                )
-            candidates += token.candidates
-            cursor = index
+            pieces.append(value[cursor : match.start()])
+            sanitized = redact_url(candidate, max_characters=len(candidate))
+            if sanitized == REDACTED_URL:
+                pieces.append(f"{REDACTED_URL}{punctuation}")
+            else:
+                pieces.append(f"{opener}{sanitized}{closer}{punctuation}")
+            cursor = match.end()
+            candidates += signals
+        pieces.append(value[cursor:])
+        return TextRedactionResult("".join(pieces), True, candidates, None)
     except Exception:
-        result.write(REDACTED_REMAINDER)
         return TextRedactionResult(
-            value=result.getvalue(),
-            complete=False,
-            candidates=candidates,
-            reason=TextRedactionIncompleteReason.INTERNAL_ERROR,
+            REDACTED_REMAINDER,
+            False,
+            0,
+            TextRedactionIncompleteReason.INTERNAL_ERROR,
         )
-    result.write(value[cursor:])
-    return TextRedactionResult(
-        value=result.getvalue(),
-        complete=True,
-        candidates=candidates,
-        reason=None,
-    )
 
 
 def redact_text_result(
@@ -657,49 +343,36 @@ def redact_text_result(
     max_characters: int = MAX_REDACTION_CHARACTERS,
     max_candidates: int = MAX_REDACTION_CANDIDATES,
 ) -> TextRedactionResult:
-    """Return sanitized text with content-free bounded completion metadata."""
-    if not isinstance(value, str):
+    """Return bounded sanitized text with content-free completion metadata."""
+    if (
+        not isinstance(value, str)
+        or not _valid_bound(max_characters)
+        or not _valid_bound(max_candidates)
+    ):
         return TextRedactionResult(
-            value=REDACTED_REMAINDER,
-            complete=False,
-            candidates=0,
-            reason=TextRedactionIncompleteReason.INVALID_INPUT,
-        )
-    if value == REDACTED_REMAINDER:
-        return TextRedactionResult(value=value, complete=True, candidates=0, reason=None)
-    if not _valid_bound(max_characters) or not _valid_bound(max_candidates):
-        return TextRedactionResult(
-            value=REDACTED_REMAINDER,
-            complete=False,
-            candidates=0,
-            reason=TextRedactionIncompleteReason.INVALID_INPUT,
+            REDACTED_REMAINDER,
+            False,
+            0,
+            TextRedactionIncompleteReason.INVALID_INPUT,
         )
     if len(value) > max_characters:
         return TextRedactionResult(
-            value=REDACTED_REMAINDER,
-            complete=False,
-            candidates=0,
-            reason=TextRedactionIncompleteReason.CHARACTER_LIMIT,
+            REDACTED_REMAINDER,
+            False,
+            0,
+            TextRedactionIncompleteReason.CHARACTER_LIMIT,
         )
-    has_scheme_relative_attempt = (
-        "//" in value and _SCHEME_RELATIVE_TOKEN_START.search(value) is not None
-    )
-    might_have_ambiguous_interior = "//" in value and (
-        any(signal in value for signal in "@#?") or _ENCODED_AT_SIGN.search(value) is not None
-    )
-    if (
-        "://" not in value
-        and not has_scheme_relative_attempt
-        and not might_have_ambiguous_interior
-        and ("@" not in value or ":" not in value)
-    ):
+    try:
+        if not _might_contain_candidate(value):
+            return TextRedactionResult(value, True, 0, None)
+        return _redact_text(value, max_candidates=max_candidates)
+    except Exception:
         return TextRedactionResult(
-            value=value,
-            complete=True,
-            candidates=0,
-            reason=None,
+            REDACTED_REMAINDER,
+            False,
+            0,
+            TextRedactionIncompleteReason.INTERNAL_ERROR,
         )
-    return _redact_text_with_usage(value, max_candidates=max_candidates)
 
 
 def redact_text(
@@ -708,7 +381,7 @@ def redact_text(
     max_characters: int = MAX_REDACTION_CHARACTERS,
     max_candidates: int = MAX_REDACTION_CANDIDATES,
 ) -> str:
-    """Redact bounded URL candidates while preserving ordinary text exactly."""
+    """Return the sanitized value from :func:`redact_text_result`."""
     return redact_text_result(
         value,
         max_characters=max_characters,
@@ -717,7 +390,7 @@ def redact_text(
 
 
 class _AggregateRedactionExhaustedError(Exception):
-    """Internal control flow for one exhausted recursive redaction budget."""
+    """Internal control flow for any recursive redaction failure."""
 
 
 @dataclass(slots=True)
@@ -750,19 +423,14 @@ class _ValueWalk:
             return value
         if isinstance(value, (Mapping, list, tuple)):
             identity = id(value)
-            if identity in self.active:
-                return REDACTED_VALUE
-            if len(value) > self.remaining_nodes:
+            if identity in self.active or len(value) > self.remaining_nodes:
                 raise _AggregateRedactionExhaustedError
             self.active.add(identity)
             try:
                 if isinstance(value, Mapping):
-                    result_mapping: dict[object, object] = {}
-                    for key, nested in value.items():
-                        result_mapping[key] = self.visit(nested, depth + 1)
-                    return result_mapping
-                result_items = [self.visit(nested, depth + 1) for nested in value]
-                return tuple(result_items) if isinstance(value, tuple) else result_items
+                    return {key: self.visit(nested, depth + 1) for key, nested in value.items()}
+                items = [self.visit(nested, depth + 1) for nested in value]
+                return tuple(items) if isinstance(value, tuple) else items
             finally:
                 self.active.remove(identity)
         return REDACTED_VALUE
@@ -776,9 +444,11 @@ def redact_value(
     max_text_characters: int = MAX_REDACTION_CHARACTERS,
     max_text_candidates: int = MAX_REDACTION_CANDIDATES,
 ) -> object:
-    """Recursively sanitize evidence values under aggregate explicit ceilings."""
-    bounds = (max_depth, max_nodes, max_text_characters, max_text_candidates)
-    if not all(_valid_bound(bound) for bound in bounds):
+    """Recursively sanitize evidence values under one aggregate bounded walk."""
+    if not all(
+        _valid_bound(bound)
+        for bound in (max_depth, max_nodes, max_text_characters, max_text_candidates)
+    ):
         return REDACTED_VALUE
     try:
         return _ValueWalk(

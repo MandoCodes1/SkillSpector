@@ -36,6 +36,54 @@ class DestinationStatus(StrEnum):
     UNRESOLVED = "unresolved"
 
 
+class DependencyEcosystem(StrEnum):
+    """Code-owned dependency ecosystems implemented by source parsers."""
+
+    NPM = "npm"
+    PIP = "pip"
+    CARGO = "cargo"
+    MAVEN = "maven"
+    GRADLE = "gradle"
+    NUGET = "nuget"
+    RUBYGEMS = "rubygems"
+    GO = "go"
+    GENERIC = "generic"
+
+
+class DependencySourceSurface(StrEnum):
+    """Coarse code-owned surface where a dependency source was declared."""
+
+    SOURCE = "source"
+    REPOSITORY = "repository"
+    MIRROR = "mirror"
+    COMMAND = "command"
+    INVOCATION = "invocation"
+    ENVIRONMENT = "environment"
+    GENERATED_CONFIG = "generated-config"
+
+
+class DependencySourceOperation(StrEnum):
+    """Code-owned semantic operation represented by a source change."""
+
+    ADD = "add"
+    REPLACE = "replace"
+    REMOVE = "remove"
+    SET = "set"
+    USE = "use"
+
+
+class DependencySourceScope(StrEnum):
+    """Coarse code-owned scope category, never a raw package or section name."""
+
+    GLOBAL = "global"
+    SCOPED = "scoped"
+    PROJECT = "project"
+    COMMAND = "command"
+    INVOCATION = "invocation"
+    ENVIRONMENT = "environment"
+    GENERATED_CONFIG = "generated-config"
+
+
 class DependencySourceLimitationReason(StrEnum):
     """Safe local reason codes mapped to ledger reasons only at integration time."""
 
@@ -87,16 +135,6 @@ def _normalize_relative_posix_path(path: object) -> str:
     return normalized
 
 
-def _require_nonempty_semantic(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value.strip() or len(value) > 256:
-        raise ValueError(f"{name} must be a bounded non-empty semantic value")
-    if any(ord(character) < 32 or ord(character) == 127 for character in value):
-        raise ValueError(f"{name} must not contain control characters")
-    if redact_text(value) != value:
-        raise ValueError(f"{name} must not contain credential-bearing text")
-    return value
-
-
 @dataclass(frozen=True, slots=True)
 class SourceSpan:
     """A source range using canonical UTF-8 byte and one-based line coordinates."""
@@ -123,17 +161,26 @@ class SourceSpan:
 class SourceChange:
     """One sanitized, command-independent dependency-source semantic change."""
 
-    ecosystem: str
-    surface: str
-    operation: str
-    scope: str
+    ecosystem: DependencyEcosystem
+    surface: DependencySourceSurface
+    operation: DependencySourceOperation
+    scope: DependencySourceScope
     destination: str
     destination_status: DestinationStatus
     span: SourceSpan
 
     def __post_init__(self) -> None:
-        for name in ("ecosystem", "surface", "operation", "scope"):
-            _require_nonempty_semantic(getattr(self, name), name)
+        for name, enum_type in (
+            ("ecosystem", DependencyEcosystem),
+            ("surface", DependencySourceSurface),
+            ("operation", DependencySourceOperation),
+            ("scope", DependencySourceScope),
+        ):
+            try:
+                normalized = enum_type(getattr(self, name))
+            except (TypeError, ValueError):
+                raise ValueError(f"{name} is not a code-owned semantic") from None
+            object.__setattr__(self, name, normalized)
         try:
             status = DestinationStatus(self.destination_status)
         except (TypeError, ValueError):
@@ -258,10 +305,10 @@ class DependencySourceAnalysis:
 def finding_from_source_change(change: SourceChange) -> Finding:
     """Convert one sanitized semantic change at the sole public finding boundary."""
     evidence: dict[str, object] = {
-        "ecosystem": change.ecosystem,
-        "surface": change.surface,
-        "operation": change.operation,
-        "scope": change.scope,
+        "ecosystem": change.ecosystem.value,
+        "surface": change.surface.value,
+        "operation": change.operation.value,
+        "scope": change.scope.value,
         "destination": change.destination,
         "destination_status": change.destination_status.value,
     }
@@ -274,9 +321,9 @@ def finding_from_source_change(change: SourceChange) -> Finding:
         start_line=change.span.start_line,
         end_line=change.span.end_line,
         category="supply-chain",
-        finding=f"{change.operation} source: {change.destination}",
+        finding=f"{change.operation.value} source: {change.destination}",
         remediation="Review the configured dependency source before installing dependencies.",
-        tags=["dependency-source", change.ecosystem],
+        tags=["dependency-source", change.ecosystem.value],
         matched_text=change.destination,
         evidence=evidence,
     )

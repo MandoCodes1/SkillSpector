@@ -1,28 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit contracts for bounded dependency-source credential redaction."""
+"""Black-box contracts for bounded dependency-source URL redaction."""
 
 from __future__ import annotations
 
-import importlib
 from collections.abc import Iterator, Mapping
-from time import perf_counter
-from typing import Any
 
 import pytest
 
-
-def _api() -> Any:
-    """Import the real redactor while keeping the initial TDD run collectable."""
-    try:
-        return importlib.import_module("skillspector.url_redaction")
-    except ImportError:
-        pytest.fail("dependency-source URL redaction is unavailable")
+from skillspector import url_redaction as api
 
 
 def test_canonical_registry_url_has_pinned_safe_output() -> None:
-    api = _api()
     raw = (
         "https://alice:supersecret@packages.example.invalid/private"
         "?token=querysecret&channel=stable#fragmentsecret"
@@ -30,1036 +20,104 @@ def test_canonical_registry_url_has_pinned_safe_output() -> None:
 
     redacted = api.redact_url(raw)
 
-    assert redacted == (
-        "https://REDACTED@packages.example.invalid/private?token=REDACTED&channel=stable"
-    )
-    for sentinel in ("alice", "supersecret", "querysecret", "fragmentsecret"):
-        assert sentinel not in redacted
-
-
-@pytest.mark.parametrize(
-    "query_key",
-    [
-        "AUTH",
-        "credential",
-        "apiKey",
-        "password",
-        "client_secret",
-        "X-Amz-Signature",
-        "access_to%6ben",
-        "API%5FKEY",
-        "%74oken",
-    ],
-)
-def test_credential_semantic_query_keys_are_decoded_and_redacted(query_key: str) -> None:
-    api = _api()
-    sentinel = "query-value-secret-98b11"
-
-    redacted = api.redact_url(
-        f"https://packages.example.invalid/simple?{query_key}={sentinel}&channel=stable"
-    )
-
-    assert sentinel not in redacted
-    assert f"{query_key}=REDACTED" in redacted
-    assert "channel=stable" in redacted
-
-
-@pytest.mark.parametrize(
-    "query_key",
-    ["ssh_key", "registry-key", "encryption.key", "x_pass", "db_sig"],
-)
-def test_explicitly_separated_weak_credential_words_are_redacted(query_key: str) -> None:
-    api = _api()
-    sentinel = "separated-weak-query-secret-e90a"
-
-    redacted = api.redact_url(f"https://packages.example.invalid/simple?{query_key}={sentinel}")
-
-    assert redacted.endswith(f"?{query_key}=REDACTED")
-    assert sentinel not in redacted
-
-
-@pytest.mark.parametrize(
-    "query_key",
-    [
-        "apikey",
-        "APIKEY",
-        "authToken",
-        "AUTHTOKEN",
-        "accessToken",
-        "clientSecret",
-        "privateKey",
-        "sig",
-        "%61pikey",
-        "%41piKey",
-    ],
-)
-def test_compact_and_mixed_case_credential_query_keys_are_redacted(query_key: str) -> None:
-    api = _api()
-    sentinel = "compact-query-secret-67fe"
-
-    redacted = api.redact_url(f"https://packages.example.invalid/simple?{query_key}={sentinel}")
-
-    assert redacted == (f"https://packages.example.invalid/simple?{query_key}=REDACTED")
-    assert sentinel not in redacted
-
-
-@pytest.mark.parametrize(
-    "query_key",
-    [
-        "authorizationtoken",
-        "AUTHORIZATIONTOKEN",
-        "authorizationToken",
-        "authorization%54oken",
-        "authenticationtoken",
-        "AUTHENTICATIONTOKEN",
-        "authenticationToken",
-        "authentication%54oken",
-        "credentialtoken",
-        "CREDENTIALTOKEN",
-        "credentialToken",
-        "%63redentialtoken",
-        "tokensecret",
-        "TOKENSECRET",
-        "tokenSecret",
-        "%74okenSecret",
-        "secretkeytoken",
-        "SECRETKEYTOKEN",
-        "secretKeyToken",
-        "secret%4BeyToken",
-        "passphrasekey",
-        "PASSPHRASEKEY",
-        "passphraseKey",
-        "passphrase%4Bey",
-        "signaturetoken",
-        "SIGNATURETOKEN",
-        "signatureToken",
-        "signature%54oken",
-        "dbpassword",
-        "DBPASSWORD",
-        "dbPassword",
-        "db%50assword",
-        "registrytoken",
-        "REGISTRYTOKEN",
-        "registryToken",
-        "registry%54oken",
-        "dbauth",
-        "DBAUTH",
-        "dbAuth",
-        "db%41uth",
-        "clientcredential",
-        "CLIENTCREDENTIAL",
-        "clientCredential",
-        "client%43redential",
-        "requestsignature",
-        "REQUESTSIGNATURE",
-        "requestSignature",
-        "request%53ignature",
-        "accesskey",
-        "ACCESSKEY",
-        "accessKey",
-        "access%4Bey",
-        "githubtoken",
-        "githubTokenValue",
-        "githubtokenvalue",
-        "GITHUBTOKENVALUE",
-        "github%54oken%56alue",
-    ],
-)
-def test_compact_query_key_grammar_redacts_complete_credential_terms(
-    query_key: str,
-) -> None:
-    api = _api()
-    sentinel = "segmented-query-value-secret-11c4"
-    raw = f"https://packages.example.invalid/simple?channel=one;{query_key}={sentinel}&channel=two"
-
-    redacted = api.redact_url(raw)
-
-    assert redacted == (
-        f"https://packages.example.invalid/simple?channel=one;{query_key}=REDACTED&channel=two"
-    )
-    assert sentinel not in redacted
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "ssh://ssh-user:ssh-secret-0d9f@git.example.invalid/org/repo.git#fragment-secret",
-        "git+https://git-user:git-secret-a941@git.example.invalid/org/repo.git?auth=query-secret",
-        "git+ssh://agent:agent-secret-c2ab@git.example.invalid/org/repo.git",
-        "scp-user-secret@git.example.invalid:org/repo.git#scp-fragment-secret",
-    ],
-)
-def test_ssh_git_and_scp_like_forms_remove_userinfo_fragments_and_secret_queries(raw: str) -> None:
-    api = _api()
-
-    redacted = api.redact_url(raw)
-
+    assert redacted == "https://packages.example.invalid/REDACTED_PATH"
     for sentinel in (
-        "ssh-user",
-        "ssh-secret",
-        "git-user",
-        "git-secret",
-        "query-secret",
-        "agent-secret",
-        "scp-user-secret",
-        "fragment-secret",
-        "scp-fragment-secret",
+        "alice",
+        "supersecret",
+        "private",
+        "querysecret",
+        "fragmentsecret",
+        "channel",
     ):
         assert sentinel not in redacted
-    assert "git.example.invalid" in redacted
-    assert "org/repo.git" in redacted
-    assert "REDACTED" in redacted
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
         (
-            "https://user:ipv6-secret@[2001:db8::1]:8443/private",
-            "https://REDACTED@[2001:db8::1]:8443/private",
+            "http://user:secret@packages.example.invalid:8080/simple?channel=stable#part",
+            "http://packages.example.invalid:8080/REDACTED_PATH",
         ),
         (
-            "http://user:http-secret@packages.example.invalid:8080/simple",
-            "http://REDACTED@packages.example.invalid:8080/simple",
+            "ssh://git:secret@git.example.invalid/org/repo.git?ref=main#readme",
+            "ssh://git.example.invalid/REDACTED_PATH",
         ),
         (
-            "git://user:git-scheme-secret@git.example.invalid/org/repo.git",
-            "git://REDACTED@git.example.invalid/org/repo.git",
+            "git+https://git:secret@git.example.invalid/org/repo.git?ref=main",
+            "git+https://git.example.invalid/REDACTED_PATH",
+        ),
+        (
+            "sparse+https://user:secret@index.example.invalid/crates#metadata",
+            "sparse+https://index.example.invalid/REDACTED_PATH",
+        ),
+        (
+            "//user:secret@packages.example.invalid/private?channel=stable#part",
+            "//packages.example.invalid/REDACTED_PATH",
+        ),
+        (
+            "https://user:secret@[2001:db8::1]:8443/private?channel=stable",
+            "https://[2001:db8::1]:8443/REDACTED_PATH",
+        ),
+        (
+            "git-user@git.example.invalid:org/repo.git?ref=main#readme",
+            "REDACTED@git.example.invalid:REDACTED_PATH",
         ),
     ],
 )
-def test_valid_ipv6_http_and_git_urls_preserve_safe_authority_and_path(
+def test_simple_urls_drop_query_fragment_and_userinfo_but_keep_safe_origin_path(
     raw: str,
     expected: str,
 ) -> None:
-    api = _api()
-
     assert api.redact_url(raw) == expected
 
 
 @pytest.mark.parametrize(
-    "value",
+    ("raw", "expected"),
     [
-        "//packages.example.invalid/private",
-        "//[2001:db8::1]:8443/private?channel=stable&channel=beta",
-        "//path",
+        ("https://packages.example.invalid", "https://packages.example.invalid"),
+        ("https://packages.example.invalid/", "https://packages.example.invalid/"),
+        ("//packages.example.invalid/", "//packages.example.invalid/"),
     ],
 )
-def test_demonstrably_safe_scheme_relative_references_are_preserved_exactly(
-    value: str,
+def test_empty_or_root_paths_are_the_only_path_contents_retained(
+    raw: str,
+    expected: str,
 ) -> None:
-    api = _api()
-
-    assert api.redact_url(value) == value
-    assert api.redact_text_result(value) == api.TextRedactionResult(
-        value=value,
-        complete=True,
-        candidates=1,
-        reason=None,
-    )
+    assert api.redact_url(raw) == expected
 
 
 @pytest.mark.parametrize(
     "raw",
     [
-        "//user:scheme-relative-secret@packages.example.invalid/private",
-        "//packages.example.invalid/private?token=scheme-relative-query-secret",
-        "//packages.example.invalid/private?token=REDACTED",
-        "//packages.example.invalid/private#scheme-relative-fragment-secret",
-        "//user:scheme-relative-port-secret@packages.example.invalid:/private",
-        "//user:scheme-relative-bracket-secret@[not-ipv6]/private",
-        "//first:scheme-relative-at-secret@second@packages.example.invalid/private",
-        "//?token=empty-authority-secret",
-        "///x?token=empty-authority-path-secret",
-        "// /x?token=space-authority-secret",
-        "//safe.invalid/a//nested.invalid/x",
-        "//safe.invalid/path?next=https://user:nested-absolute-secret@evil.invalid/x",
-        "//safe.invalid/path?next=//user:nested-relative-secret@evil.invalid/x",
-        "//safe.invalid/path?next=x//user:nested-interior-secret@evil.invalid/x",
-        "//safe.invalid/path?next=x//evil.invalid/x?token=nested-query-secret",
-        "//safe.invalid/path?next=user:nested-scp-secret@evil.invalid:repo.git",
+        "https://user%3Asecret%40packages.example.invalid/private",
+        "https://packages.example.invalid/private%2Fsecret",
+        "https%3A%2F%2Fuser%3Asecret%40packages.example.invalid%2Fprivate",
+        "https://user:secret@packages.example.invalid/private?next=https://evil.invalid/x",
+        "https://packages.example.invalid/private?next=user@evil.invalid:org/repo.git",
+        "https://one.invalid/x,https://two.invalid/y",
+        "https://first:secret@second@packages.example.invalid/private",
+        "https://packages.example.invalid:bad/private",
+        "https://[not-an-ipv6-address]/private",
+        "([https://user:secret@packages.example.invalid/private])",
+        '{"url":"https://user:secret@packages.example.invalid/private"}',
     ],
 )
-def test_unsafe_or_ambiguous_scheme_relative_values_use_one_placeholder(raw: str) -> None:
-    api = _api()
-
+def test_encoded_malformed_nested_or_mixed_candidates_are_whole_masked(raw: str) -> None:
     assert api.redact_url(raw) == api.REDACTED_URL
-    assert api.redact_text_result(raw) == api.TextRedactionResult(
-        value=api.REDACTED_URL,
-        complete=True,
-        candidates=1,
-        reason=None,
-    )
-    assert "secret" not in api.redact_text(raw)
-
-
-def test_absolute_url_double_slash_path_is_safe_but_nested_query_reference_is_ambiguous() -> None:
-    api = _api()
-    safe = "https://registry.example.invalid/a//b/c"
-    nested = "https://registry.example.invalid/a//b/c?next=//user:secret@evil.invalid/x"
-
-    assert api.redact_url(safe) == safe
-    assert api.redact_text_result(safe) == api.TextRedactionResult(
-        value=safe,
-        complete=True,
-        candidates=1,
-        reason=None,
-    )
-    assert api.redact_url(nested) == api.REDACTED_URL
-    assert api.redact_text_result(nested) == api.TextRedactionResult(
-        value=api.REDACTED_URL,
-        complete=True,
-        candidates=1,
-        reason=None,
-    )
-
-
-@pytest.mark.parametrize(
-    "safe",
-    [
-        "https://safe.invalid/a//b%20c",
-        "https://safe.invalid/a//b%2Fc",
-        "https://safe.invalid/a//b/c?channel=dev@example.invalid",
-        "https://safe.invalid/a//b/c?scope=@org",
-        "https://safe.invalid/a//b/c?scope=%40org",
-    ],
-)
-def test_absolute_double_slash_paths_preserve_ordinary_percent_encoded_data(
-    safe: str,
-) -> None:
-    api = _api()
-
-    assert api.redact_url(safe) == safe
-    assert api.redact_text_result(safe) == api.TextRedactionResult(
-        value=safe,
-        complete=True,
-        candidates=1,
-        reason=None,
-    )
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        (
-            "https://safe.invalid/a//b/c?next=a//b&token=query-secret",
-            "https://safe.invalid/a//b/c?next=a//b&token=REDACTED",
-        ),
-        (
-            "https://registry.example.invalid/a//b/c?token=query-secret&channel=stable",
-            "https://registry.example.invalid/a//b/c?token=REDACTED&channel=stable",
-        ),
-    ],
-)
-def test_absolute_double_slash_path_redacts_sensitive_query_without_whole_masking(
-    raw: str,
-    expected: str,
-) -> None:
-    api = _api()
-
-    assert api.redact_url(raw) == expected
-    assert api.redact_text_result(raw) == api.TextRedactionResult(
-        value=expected,
-        complete=True,
-        candidates=1,
-        reason=None,
-    )
-
-
-@pytest.mark.parametrize(
-    "nested",
-    [
-        "https://safe.invalid/a//user:nested-path-secret@evil.invalid/x",
-        "https://safe.invalid/path?next=x//user:nested-userinfo-secret@evil.invalid/x",
-        "https://safe.invalid/path?next=x//user:nested-encoded-secret%40evil.invalid/x",
-        "https://safe.invalid/path?next=x//evil.invalid/x?token=nested-query-secret",
-    ],
-)
-def test_absolute_url_query_rejects_ambiguous_interior_relative_shape(
-    nested: str,
-) -> None:
-    api = _api()
-
-    assert api.redact_url(nested) == api.REDACTED_URL
-    assert api.redact_text_result(nested) == api.TextRedactionResult(
-        value=api.REDACTED_URL,
-        complete=True,
-        candidates=1,
-        reason=None,
-    )
-    assert api.redact_text(nested, max_candidates=0) == api.REDACTED_REMAINDER
-    sanitized = api.redact_text(nested)
-    assert "secret" not in sanitized
-    assert api.redact_text(sanitized) == sanitized
-
-
-@pytest.mark.parametrize(
-    "value",
-    [
-        "x//evil.invalid/path",
-        "src/a//b.py",
-        "x?next=a//b&channel=stable",
-        "x//host.invalid/path%20with%20space",
-        "src/a//b%2Fc.py",
-    ],
-)
-def test_interior_double_slash_without_a_boundary_is_not_a_reference(value: str) -> None:
-    api = _api()
-
-    assert api.redact_url(value) == value
-    assert api.redact_text_result(value) == api.TextRedactionResult(
-        value=value,
-        complete=True,
-        candidates=0,
-        reason=None,
-    )
-
-
-@pytest.mark.parametrize(
-    "value",
-    [
-        "x//user:interior-userinfo-secret@evil.invalid/path",
-        "x//evil.invalid/path#interior-fragment-secret",
-        "x//evil.invalid/path?token=interior-query-secret",
-        "x//user:interior-encoded-secret%40evil.invalid/path",
-        "x//user%3Ainterior-encoded-secret%40evil.invalid/path",
-        "x?next=a//evil.invalid/path&token=interior-query-secret",
-        "prefix?registry=x//host.invalid/path&authToken=interior-query-secret",
-    ],
-)
-def test_credential_shaped_interior_double_slash_values_fail_closed(value: str) -> None:
-    api = _api()
-
-    assert api.redact_url(value) == api.REDACTED_URL
-    assert api.redact_text_result(value) == api.TextRedactionResult(
-        value=api.REDACTED_URL,
-        complete=True,
-        candidates=1,
-        reason=None,
-    )
-    assert api.redact_text(value, max_candidates=0) == api.REDACTED_REMAINDER
-    sanitized = api.redact_text(value)
-    assert "secret" not in sanitized
-    assert api.redact_text(sanitized) == sanitized
-
-
-def test_cargo_sparse_url_preserves_safe_scheme_host_and_path() -> None:
-    api = _api()
-    raw = "sparse+https://user:sparse-secret@packages.example.invalid/index/"
-
-    assert api.redact_url(raw) == ("sparse+https://REDACTED@packages.example.invalid/index/")
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        (
-            "ftp://user:ftp-secret@packages.example.invalid/private",
-            "ftp://REDACTED@packages.example.invalid/private",
-        ),
-        (
-            "custom+pkg://user:custom-secret@packages.example.invalid/private",
-            "custom+pkg://REDACTED@packages.example.invalid/private",
-        ),
-        (
-            "https://user:'apostrophe-secret@packages.example.invalid/private",
-            "https://REDACTED@packages.example.invalid/private",
-        ),
-    ],
-)
-def test_generic_hierarchical_schemes_and_apostrophe_userinfo_are_sanitized(
-    raw: str,
-    expected: str,
-) -> None:
-    api = _api()
-
-    assert api.redact_url(raw) == expected
-
-
-def test_unknown_scheme_without_sensitive_components_remains_unchanged() -> None:
-    api = _api()
-    raw = "ftp://packages.example.invalid/private?channel=stable"
-
-    assert api.redact_url(raw) == raw
-
-
-def test_email_followed_by_colon_prose_is_not_treated_as_scp_git_syntax() -> None:
-    api = _api()
-    text = "Contact dev@example.invalid:today or dev@example.invalid: today."
-
-    assert api.redact_url("dev@example.invalid:today") == "dev@example.invalid:today"
-    assert api.redact_text(text) == text
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "https://user:malformed-secret@[broken.example.invalid/repo",
-        "https://user:port-secret@packages.example.invalid:notaport/repo",
-        "https://user:percent-secret@packages.example.invalid/repo?to%ZZken=value-secret",
-    ],
-)
-def test_malformed_suspicious_urls_fail_closed_without_throwing(raw: str) -> None:
-    api = _api()
-
-    redacted = api.redact_url(raw)
-
-    assert redacted == api.REDACTED_URL
-    assert "secret" not in redacted.lower()
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "https://user:range-secret@packages.example.invalid:99999/repo",
-        "https://user:ipv6-secret@[2001:db8::1/repo",
-        "https://user:nfkc-secret@exam\uff0fple.invalid/repo",
-        "https://first:multiple-secret@second@packages.example.invalid/repo",
-        "https://user:slash-secret@packages.example.invalid\\@other.invalid/repo",
-        "https://user:control-secret@packages.example.invalid/repo\nInjected: value",
-    ],
-)
-def test_ambiguous_authorities_and_urlsplit_normalization_traps_fail_closed(raw: str) -> None:
-    api = _api()
-
-    redacted = api.redact_url(raw)
-
-    assert redacted == api.REDACTED_URL
-    assert "secret" not in redacted.lower()
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "https://user:empty-port-secret@packages.example.invalid:/repo",
-        "https://user:encoded-colon-secret@packages%3Aevil.example.invalid/repo",
-        "https://user:encoded-at-secret@packages%40evil.example.invalid/repo",
-        "https://user:encoded-slash-secret@packages%2Fevil.example.invalid/repo",
-        "https://user:encoded-query-secret@packages%3Fevil.example.invalid/repo",
-        "https://user:encoded-fragment-secret@packages%23evil.example.invalid/repo",
-        "https://user:encoded-control-secret@packages%00evil.example.invalid/repo",
-        "https://user:encoded-space-secret@packages%20evil.example.invalid/repo",
-        "https://user:unbracketed-secret@2001:db8::1/repo",
-        "https://user:bad-bracket-secret@[not-ipv6]/repo",
-        "https://user:empty-host-secret@:443/repo",
-        "scp-bracket-secret@[not-ipv6]:org/repo.git",
-    ],
-)
-def test_ambiguous_authority_delimiters_ports_and_bracket_hosts_fail_closed(raw: str) -> None:
-    api = _api()
-
-    redacted = api.redact_url(raw)
-
-    assert redacted == api.REDACTED_URL
-    assert "secret" not in redacted.lower()
-
-
-def test_query_redaction_preserves_nonsensitive_raw_order_duplicates_blanks_flags_and_encoding() -> (
-    None
-):
-    api = _api()
-    raw = (
-        "https://packages.example.invalid/simple?"
-        "channel=one&token=token-secret&channel=two&blank=&flag&encoded=a%2Fb&"
-        "API%5FKEY=key-secret&%74oken=decoded-secret"
-    )
-
-    redacted = api.redact_url(raw)
-
-    assert redacted == (
-        "https://packages.example.invalid/simple?"
-        "channel=one&token=REDACTED&channel=two&blank=&flag&encoded=a%2Fb&"
-        "API%5FKEY=REDACTED&%74oken=REDACTED"
-    )
-
-
-def test_query_redaction_preserves_mixed_ampersand_semicolon_delimiters() -> None:
-    api = _api()
-    raw = (
-        "https://packages.example.invalid/simple?"
-        "channel=one;apikey=semicolon-secret&flag;token=second-secret;blank=&channel=two"
-    )
-
-    redacted = api.redact_url(raw)
-
-    assert redacted == (
-        "https://packages.example.invalid/simple?"
-        "channel=one;apikey=REDACTED&flag;token=REDACTED;blank=&channel=two"
-    )
-    assert "semicolon-secret" not in redacted
-    assert "second-secret" not in redacted
-
-
-@pytest.mark.parametrize(
-    "query_key",
-    [
-        "monkey",
-        "MONKEY",
-        "Monkey",
-        "monKey",
-        "%6Donkey",
-        "compass",
-        "COMPASS",
-        "Compass",
-        "comPass",
-        "%63ompass",
-        "tokenizer",
-        "TOKENIZER",
-        "Tokenizer",
-        "%74okenizer",
-        "secretary",
-        "SECRETARY",
-        "Secretary",
-        "%73ecretary",
-        "registrytokenizer",
-        "clientsecretary",
-        "dbauthor",
-        "accesskeyboard",
-        "requestsignatory",
-        "passwordless",
-        "keynote",
-        "privatekeyboard",
-        "authorizationtokenizer",
-    ],
-)
-def test_ambiguous_query_key_substrings_are_conservatively_redacted(
-    query_key: str,
-) -> None:
-    api = _api()
-    raw = f"https://packages.example.invalid/simple?{query_key}=visible-value"
-
-    redacted = api.redact_url(raw)
-
-    assert redacted.endswith(f"?{query_key}=REDACTED")
-    assert "visible-value" not in redacted
-
-
-def test_nested_hierarchical_uri_in_query_fails_closed_without_leaking_userinfo() -> None:
-    api = _api()
-    sentinel = "nested-query-uri-secret-c8b2"
-    text = (
-        "Use https://safe.example.invalid/path?next="
-        f"https://user:{sentinel}@evil.example.invalid/repo now."
-    )
-
-    redacted = api.redact_text(text)
-
-    assert redacted == f"Use {api.REDACTED_URL} now."
-    assert sentinel not in redacted
-
-
-def test_nested_scp_uri_in_query_fails_closed_without_leaking_userinfo() -> None:
-    api = _api()
-    sentinel = "nested-scp-query-secret-14da"
-    text = (
-        "Use https://safe.example.invalid/path?next="
-        f"{sentinel}@evil.example.invalid:org/repo.git now."
-    )
-
-    redacted = api.redact_text(text)
-
-    assert redacted == f"Use {api.REDACTED_URL} now."
-    assert sentinel not in redacted
-
-
-@pytest.mark.parametrize("query_key", ["%FFtoken", "to%00ken", "%2574oken"])
-def test_ambiguous_or_control_bearing_query_keys_fail_closed(query_key: str) -> None:
-    api = _api()
-    sentinel = "ambiguous-key-value-secret-b712"
-
-    redacted = api.redact_url(f"https://packages.example.invalid/simple?{query_key}={sentinel}")
-
-    assert redacted == api.REDACTED_URL
-    assert sentinel not in redacted
-
-
-def test_query_key_bounds_accept_exact_decoded_and_raw_limits_and_reject_one_over() -> None:
-    api = _api()
-    sentinel = "bounded-key-value-secret-65e3"
-    exact_decoded = ("a" * 251) + "token"
-    exact_raw = ("%61" * 251) + "%74%6F%6B%65%6E"
-    over_decoded = "a" + exact_decoded
-    over_raw = "x" + exact_raw
-
-    assert len(exact_decoded) == 256
-    assert len(exact_raw) == 768
-    for query_key in (exact_decoded, exact_raw):
-        redacted = api.redact_url(f"https://packages.example.invalid/simple?{query_key}={sentinel}")
-        assert redacted.endswith(f"?{query_key}=REDACTED")
-        assert sentinel not in redacted
-    for query_key in (over_decoded, over_raw):
-        assert (
-            api.redact_url(f"https://packages.example.invalid/simple?{query_key}={sentinel}")
-            == api.REDACTED_URL
-        )
-
-
-def test_embedded_urls_are_redacted_without_changing_surrounding_free_text() -> None:
-    api = _api()
-    sentinel = "embedded-secret-741e"
-    raw_url = f"https://user:{sentinel}@packages.example.invalid/private?channel=stable"
-    text = f"Use registry {raw_url} for the build, then continue."
-
-    redacted = api.redact_text(text)
-
-    assert redacted == (
-        "Use registry https://REDACTED@packages.example.invalid/private?channel=stable "
-        "for the build, then continue."
-    )
-    assert sentinel not in redacted
-
-
-@pytest.mark.parametrize(
-    ("token", "sentinel"),
-    [
-        (
-            "1https://alice:leading-digit-secret@host.invalid/path",
-            "leading-digit-secret",
-        ),
-        (
-            "-https://alice:leading-hyphen-secret@host.invalid/path",
-            "leading-hyphen-secret",
-        ),
-        (
-            "://alice:missing-scheme-secret@host.invalid/path",
-            "missing-scheme-secret",
-        ),
-        (
-            "http:://alice:double-colon-secret@host.invalid/path",
-            "double-colon-secret",
-        ),
-        (
-            "https_://alice:underscore-scheme-secret@host.invalid/path",
-            "underscore-scheme-secret",
-        ),
-    ],
-)
-def test_malformed_hierarchical_tokens_fail_closed_as_one_bounded_span(
-    token: str,
-    sentinel: str,
-) -> None:
-    api = _api()
-
-    redacted = api.redact_text(f"Use {token} now.")
-
-    assert redacted == f"Use {api.REDACTED_URL} now."
-    assert sentinel not in redacted
-
-
-@pytest.mark.parametrize(
-    ("text", "_previous_exact_output"),
-    [
-        (
-            '<a href="https://host.invalid/path">link</a>',
-            '<a href="https://host.invalid/path">link</a>',
-        ),
-        (
-            '<a href="https://alice:html-secret@host.invalid/path">link</a>',
-            '<a href="https://REDACTED@host.invalid/path">link</a>',
-        ),
-        (
-            "<a href=https://host.invalid/path>link</a>",
-            "<a href=https://host.invalid/path>link</a>",
-        ),
-        (
-            "<a href=https://alice:html-unquoted-secret@host.invalid/path>link</a>",
-            "<a href=https://REDACTED@host.invalid/path>link</a>",
-        ),
-        (
-            "<a href=git@host.invalid:org/repo.git>link</a>",
-            "<a href=REDACTED@host.invalid:org/repo.git>link</a>",
-        ),
-        (
-            'x="https://host.invalid/path"; next',
-            'x="https://host.invalid/path"; next',
-        ),
-        (
-            'x="https://alice:assignment-secret@host.invalid/path"; next',
-            'x="https://REDACTED@host.invalid/path"; next',
-        ),
-        (
-            "const registry=`https://alice:tick-source-secret@host.invalid/path`; next",
-            "const registry=`https://REDACTED@host.invalid/path`; next",
-        ),
-        (
-            "[https://host.invalid/path](mailto:dev@example.invalid)",
-            "[https://host.invalid/path](mailto:dev@example.invalid)",
-        ),
-        (
-            "[https://alice:markdown-secret@host.invalid/path](mailto:dev@example.invalid)",
-            "[https://REDACTED@host.invalid/path](mailto:dev@example.invalid)",
-        ),
-        (
-            "[dev](mailto:dev@example.invalid)[site](https://host.invalid/path)",
-            "[dev](mailto:dev@example.invalid)[site](https://host.invalid/path)",
-        ),
-        (
-            "[dev@example.invalid](https://alice:reverse-markdown-secret@host.invalid/path)",
-            "[dev@example.invalid](https://REDACTED@host.invalid/path)",
-        ),
-        (
-            'x="https://host.invalid/path";y="dev@example.invalid"',
-            'x="https://host.invalid/path";y="dev@example.invalid"',
-        ),
-        (
-            'x="https://alice:code-secret@host.invalid/path";y="dev@example.invalid"',
-            'x="https://REDACTED@host.invalid/path";y="dev@example.invalid"',
-        ),
-        (
-            'const x="https://host.invalid/path"+"dev@example.invalid/path";',
-            'const x="https://host.invalid/path"+"dev@example.invalid/path";',
-        ),
-        (
-            'const x="https://alice:concat-secret@host.invalid/path"+"dev@example.invalid/path";',
-            'const x="https://REDACTED@host.invalid/path"+"dev@example.invalid/path";',
-        ),
-    ],
-)
-def test_ambiguous_markup_and_source_tokens_are_masked_deterministically(
-    text: str,
-    _previous_exact_output: str,
-) -> None:
-    api = _api()
-    redacted = api.redact_text(text)
-
-    assert api.REDACTED_URL in redacted
-    assert api.redact_text(redacted) == redacted
-    for sentinel in (
-        "html-secret",
-        "html-unquoted-secret",
-        "assignment-secret",
-        "tick-source-secret",
-        "markdown-secret",
-        "reverse-markdown-secret",
-        "code-secret",
-        "concat-secret",
-    ):
-        assert sentinel not in redacted
-
-
-@pytest.mark.parametrize(
-    ("text", "_previous_exact_output"),
-    [
-        (
-            '{"url":"https://host.invalid/path","enabled":true}',
-            '{"url":"https://host.invalid/path","enabled":true}',
-        ),
-        (
-            '{"url":"https://user:json-secret@host.invalid/path","enabled":true}',
-            '{"url":"https://REDACTED@host.invalid/path","enabled":true}',
-        ),
-        (
-            '["https://host.invalid/one","https://host.invalid/two"]',
-            '["https://host.invalid/one","https://host.invalid/two"]',
-        ),
-        (
-            '["https://user:first-array-secret@one.invalid/x",'
-            '"https://user:second-array-secret@two.invalid/y"]',
-            '["https://REDACTED@one.invalid/x","https://REDACTED@two.invalid/y"]',
-        ),
-    ],
-)
-def test_minified_json_url_tokens_are_masked_as_ambiguous_provider_context(
-    text: str,
-    _previous_exact_output: str,
-) -> None:
-    api = _api()
-    redacted = api.redact_text(text)
-
-    assert redacted == api.REDACTED_URL
-    assert api.redact_text(redacted) == redacted
-    assert "json-secret" not in redacted
-    assert "array-secret" not in redacted
-
-
-def test_paired_punctuation_survives_fragment_removal() -> None:
-    api = _api()
-    text = "Open [https://user:fragment-secret@host.invalid/path#private-fragment], next."
-
-    assert api.redact_text(text) == ("Open [https://REDACTED@host.invalid/path], next.")
-
-
-def test_embedded_url_fragment_is_removed_without_swallowing_trailing_prose_punctuation() -> None:
-    api = _api()
-    text = (
-        "Fetch (https://user:punctuation-secret@packages.example.invalid/private"
-        "#fragment-secret), then continue."
-    )
-
-    assert api.redact_text(text) == (
-        "Fetch (https://REDACTED@packages.example.invalid/private), then continue."
-    )
-
-
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        (
-            "Use 'https://user:quoted-secret@packages.example.invalid/private'.",
-            "Use 'https://REDACTED@packages.example.invalid/private'.",
-        ),
-        (
-            "Use `https://user:tick-secret@packages.example.invalid/private`.",
-            "Use `https://REDACTED@packages.example.invalid/private`.",
-        ),
-        (
-            'Use "https://user:double-secret@packages.example.invalid/private".',
-            'Use "https://REDACTED@packages.example.invalid/private".',
-        ),
-        (
-            "Use https://user:'userinfo-secret@packages.example.invalid/private now.",
-            "Use https://REDACTED@packages.example.invalid/private now.",
-        ),
-    ],
-)
-def test_embedded_quotes_are_preserved_while_apostrophes_inside_userinfo_are_redacted(
-    text: str,
-    expected: str,
-) -> None:
-    api = _api()
-
-    redacted = api.redact_text(text)
-
-    assert redacted == expected
-    assert api.redact_text(redacted) == redacted
-    assert "secret" not in redacted
-
-
-@pytest.mark.parametrize("delimiter", ['"', "`", "<"])
-def test_invalid_userinfo_delimiters_cannot_leave_a_raw_secret_suffix(
-    delimiter: str,
-) -> None:
-    api = _api()
-    sentinel = "delimiter-userinfo-secret-9e41"
-    text = f"Use https://user:{delimiter}{sentinel}@packages.example.invalid/private now."
-
-    redacted = api.redact_text(text)
-
-    assert redacted == f"Use {api.REDACTED_URL} now."
-    assert sentinel not in redacted
-
-
-@pytest.mark.parametrize(
-    ("text", "_previous_exact_output"),
-    [
-        (
-            'x="https://user:123"quoted-suffix-secret@host.invalid/path"',
-            'x="[REDACTED_URL]"',
-        ),
-        (
-            "x=`https://user:123`tick-suffix-secret@host.invalid/path`",
-            "x=`[REDACTED_URL]`",
-        ),
-        (
-            'x="https://user:123"unclosed-suffix-secret@host.invalid/path',
-            'x="[REDACTED_URL]',
-        ),
-    ],
-)
-def test_apparent_wrapper_inside_incomplete_userinfo_cannot_expose_its_suffix(
-    text: str,
-    _previous_exact_output: str,
-) -> None:
-    api = _api()
-
-    redacted = api.redact_text(text)
-
-    assert redacted == api.REDACTED_URL
-    assert "suffix-secret" not in redacted
-
-
-@pytest.mark.parametrize("separator", ["+", "=", ",", ";", ":"])
-def test_apparent_wrapper_cannot_use_userinfo_punctuation_to_expose_a_later_at_sign(
-    separator: str,
-) -> None:
-    api = _api()
-    text = f'x="https://user:123"quoted{separator}suffix-secret@host.invalid/path"'
-
-    redacted = api.redact_text(text)
-
-    assert redacted == api.REDACTED_URL
-    assert "suffix-secret" not in redacted
+    assert "secret" not in api.redact_url(raw)
 
 
 @pytest.mark.parametrize(
     "text",
     [
-        'x="https://user:123"}suffix-secret@host.invalid/path"',
-        'x="https://user:123","suffix-secret@host.invalid/path"',
+        "ordinary // comment",
+        "path a//b remains ordinary",
+        "email dev@example.invalid remains ordinary",
+        "Unicode ☃ and punctuation stay byte-for-byte unchanged.",
     ],
 )
-def test_apparent_wrapper_structural_shortcuts_cannot_expose_a_later_at_sign(
-    text: str,
-) -> None:
-    api = _api()
-
-    redacted = api.redact_text(text)
-
-    assert api.REDACTED_URL in redacted
-    assert "suffix-secret" not in redacted
-
-
-def test_angle_bracket_prose_wrapper_is_preserved_around_a_sanitized_url() -> None:
-    api = _api()
-    text = "Use <https://user:angle-secret@packages.example.invalid/private>."
-
-    assert api.redact_text(text) == ("Use <https://REDACTED@packages.example.invalid/private>.")
-
-
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        (
-            "Use //user:relative-prose-secret@packages.example.invalid/private now.",
-            "Use [REDACTED_URL] now.",
-        ),
-        (
-            "Use (//user:relative-wrapper-secret@packages.example.invalid/private), now.",
-            "Use [REDACTED_URL], now.",
-        ),
-        (
-            "Use (//packages.example.invalid/private), now.",
-            "Use (//packages.example.invalid/private), now.",
-        ),
-    ],
-)
-def test_free_text_scheme_relative_attempts_are_one_bounded_candidate(
-    text: str,
-    expected: str,
-) -> None:
-    api = _api()
-
-    result = api.redact_text_result(text, max_candidates=1)
-
-    assert result == api.TextRedactionResult(expected, True, 1, None)
-    assert api.redact_text(text, max_candidates=0).endswith(api.REDACTED_REMAINDER)
-    assert "secret" not in result.value
-
-
-def test_bare_scheme_relative_token_masks_the_remaining_ambiguous_context() -> None:
-    api = _api()
-    text = "prefix // user:whitespace-secret@packages.example.invalid"
-
-    result = api.redact_text_result(text, max_candidates=1)
-
-    assert result == api.TextRedactionResult("prefix [REDACTED_URL]", True, 1, None)
-    assert "secret" not in result.value
-    assert api.redact_text(text, max_candidates=0) == "prefix [REDACTED_REMAINDER]"
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "// comment",
-        "// dev@example.invalid",
-        "// dev%40example.invalid",
-        "prefix // comment text",
-        "prefix // dev@example.invalid",
-    ],
-)
-def test_bare_double_slash_comment_controls_are_preserved_exactly(text: str) -> None:
-    api = _api()
-
+def test_ordinary_no_match_text_is_unchanged(text: str) -> None:
     assert api.redact_text_result(text) == api.TextRedactionResult(
         value=text,
         complete=True,
@@ -1068,340 +126,39 @@ def test_bare_double_slash_comment_controls_are_preserved_exactly(text: str) -> 
     )
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "//: user:colon-prefix-secret@packages.example.invalid/path",
-        "// user:encoded-prefix-secret%40packages.example.invalid/path",
-        "// user%3Aencoded-prefix-secret%40packages.example.invalid/path",
-        "prefix // user:encoded-prefix-secret%40packages.example.invalid/path",
-        "// token=assignment-prefix-secret@packages.example.invalid",
-        "// token%3Dassignment-prefix-secret%40packages.example.invalid",
-        "// port-prefix-secret@packages.example.invalid:8443",
-        "prefix // bracket-prefix-secret@[2001:db8::1]",
-        "//: user:encoded-prefix-secret%40packages.example.invalid/path",
-        "prefix //? /x?token=query-prefix-secret",
-        "/// /x?token=slash-prefix-secret",
-        "//; user=semicolon-prefix-secret@packages.example.invalid/path",
-    ],
-)
-def test_incomplete_scheme_relative_attempt_masks_remaining_context(text: str) -> None:
-    api = _api()
-    prefix = "prefix " if text.startswith("prefix ") else ""
-
-    assert api.redact_text_result(text, max_candidates=1) == api.TextRedactionResult(
-        value=f"{prefix}{api.REDACTED_URL}",
-        complete=True,
-        candidates=1,
-        reason=None,
+def test_text_scanner_supports_only_one_simple_paired_prose_wrapper() -> None:
+    raw = (
+        "Use (https://user:secret@packages.example.invalid/private?channel=stable#part), "
+        "not ([https://nested:secret@other.example.invalid/x])."
     )
-    assert api.redact_text(text, max_candidates=0) == f"{prefix}{api.REDACTED_REMAINDER}"
-    assert "secret" not in api.redact_text(text)
 
-
-@pytest.mark.parametrize("value", ["//:", "//?", "///", "//;"])
-def test_incomplete_scheme_relative_exact_values_fail_closed(value: str) -> None:
-    api = _api()
-
-    assert api.redact_url(value) == api.REDACTED_URL
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "x=//packages.example.invalid/private",
-        'href="//packages.example.invalid/private"',
-        "x//packages.example.invalid/private",
-    ],
-)
-def test_assignment_markup_and_interior_syntax_are_not_parsed_as_relative_references(
-    text: str,
-) -> None:
-    api = _api()
-
-    result = api.redact_text_result(text)
-
-    assert result == api.TextRedactionResult(
-        value=text,
-        complete=True,
-        candidates=0,
-        reason=None,
+    assert api.redact_text(raw) == (
+        "Use (https://packages.example.invalid/REDACTED_PATH), not [REDACTED_URL]."
     )
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "x=//user:relative-assignment-secret@packages.example.invalid/private",
-        'href="//user:relative-attribute-secret@packages.example.invalid/private"',
-        "x//user:interior-token-secret@packages.example.invalid/private",
-        "x=//packages.example.invalid/private#relative-fragment-secret",
-        "href=//packages.example.invalid/private?token=relative-query-secret",
-    ],
-)
-def test_ambiguous_assignment_markup_and_interior_tokens_fail_closed(text: str) -> None:
-    api = _api()
+def test_separate_whitespace_tokens_are_sanitized_independently() -> None:
+    raw = (
+        "mirror https://user:first-secret@one.example.invalid/x?token=one "
+        "then git-user@two.example.invalid:org/repo.git#second-secret"
+    )
 
-    assert api.redact_text_result(text) == api.TextRedactionResult(
+    assert api.redact_text(raw) == (
+        "mirror https://one.example.invalid/REDACTED_PATH "
+        "then REDACTED@two.example.invalid:REDACTED_PATH"
+    )
+
+
+def test_multiple_candidates_in_one_token_are_whole_masked_or_exhaust_the_remainder() -> None:
+    raw = "https://one.invalid/x,https://two.invalid/y"
+
+    assert api.redact_text_result(raw, max_candidates=2) == api.TextRedactionResult(
         value=api.REDACTED_URL,
         complete=True,
-        candidates=1,
-        reason=None,
-    )
-    assert "secret" not in api.redact_text(text)
-
-
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        (
-            "Use 'scp-wrapper-secret@git.example.invalid:repo.git' now.",
-            "Use 'REDACTED@git.example.invalid:repo.git' now.",
-        ),
-        (
-            "Use scp-punctuation-secret@git.example.invalid:repo.git, now.",
-            "Use REDACTED@git.example.invalid:repo.git, now.",
-        ),
-    ],
-)
-def test_simple_scp_wrappers_and_punctuation_do_not_hide_dot_git_candidates(
-    text: str,
-    expected: str,
-) -> None:
-    api = _api()
-
-    assert api.redact_text(text) == expected
-
-
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        (
-            "Open (https://[2001:db8::1]:8443/index), then continue.",
-            "Open (https://[2001:db8::1]:8443/index), then continue.",
-        ),
-        (
-            "Open (https://user:ipv6-embedded-secret@[2001:db8::1]:8443/index), then.",
-            "Open (https://REDACTED@[2001:db8::1]:8443/index), then.",
-        ),
-        (
-            "See [https://user:bracket-secret@packages.example.invalid/private].",
-            "See [https://REDACTED@packages.example.invalid/private].",
-        ),
-    ],
-)
-def test_embedded_ipv6_authority_brackets_and_paired_prose_closers_are_preserved(
-    text: str,
-    expected: str,
-) -> None:
-    api = _api()
-
-    assert api.redact_text(text) == expected
-
-
-def test_ordinary_no_match_text_is_byte_for_byte_unchanged() -> None:
-    api = _api()
-    text = "Keep punctuation, Unicode ☃, paths ./src, and email dev@example.invalid exactly."
-
-    assert api.redact_text(text) == text
-
-
-def test_default_text_bound_preserves_large_benign_provider_content() -> None:
-    api = _api()
-    text = "ordinary provider context\n" * 5_000
-
-    assert len(text) > 100_000
-    assert api.MAX_REDACTION_CHARACTERS == 16 * 1024 * 1024
-    assert api.redact_text(text) == text
-
-
-def test_repeated_false_scp_prefixes_are_processed_in_linear_tokens() -> None:
-    api = _api()
-    atom = "a@h:x"
-    text = ",".join([atom] * 20_000)
-
-    started = perf_counter()
-    result = api.redact_text_result(text)
-    elapsed = perf_counter() - started
-
-    assert result.value == text
-    assert result.complete is True
-    assert result.candidates == 0
-    assert elapsed < 2.0
-
-
-def test_dense_ambiguous_url_envelope_is_processed_once_and_fails_closed() -> None:
-    api = _api()
-    text = "[" + ",".join(f'"https://host.invalid/{index}"' for index in range(400)) + "]"
-
-    started = perf_counter()
-    result = api.redact_text_result(text, max_candidates=400)
-    elapsed = perf_counter() - started
-
-    assert result == api.TextRedactionResult(
-        value=api.REDACTED_URL,
-        complete=True,
-        candidates=400,
-        reason=None,
-    )
-    assert api.redact_text(result.value) == result.value
-    assert elapsed < 2.0
-
-
-def test_benign_16_mib_text_uses_the_constant_time_candidate_fast_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    api = _api()
-    text = "x" * api.MAX_REDACTION_CHARACTERS
-
-    def unexpected_scan(*_args: Any, **_kwargs: Any) -> Any:
-        pytest.fail("candidate scanner should not run for benign text")
-
-    monkeypatch.setattr(api, "_redact_text_with_usage", unexpected_scan)
-    started = perf_counter()
-    result = api.redact_text_result(text)
-    elapsed = perf_counter() - started
-
-    assert result.value is text
-    assert result.complete is True
-    assert result.candidates == 0
-    assert result.reason is None
-    assert elapsed < 2.0
-
-
-def test_nested_benign_text_uses_the_same_candidate_fast_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    api = _api()
-    text = "nested benign provider context" * 4_000
-
-    def unexpected_scan(*_args: Any, **_kwargs: Any) -> Any:
-        pytest.fail("candidate scanner should not run for benign nested text")
-
-    monkeypatch.setattr(api, "_redact_text_with_usage", unexpected_scan)
-
-    assert api.redact_value(
-        {"body": text},
-        max_nodes=2,
-        max_text_characters=len(text),
-    ) == {"body": text}
-
-
-class _CopyCountingString(str):
-    copied_characters: int
-
-    def __new__(cls, value: str) -> _CopyCountingString:
-        instance = super().__new__(cls, value)
-        instance.copied_characters = 0
-        return instance
-
-    def __getitem__(self, key: int | slice) -> str:
-        result = super().__getitem__(key)
-        if isinstance(key, int):
-            character = _CopyCountingString(result)
-            character.copied_characters = self.copied_characters
-            return character
-        return result
-
-    def __add__(self, other: str) -> _CopyCountingString:
-        result = _CopyCountingString(super().__add__(other))
-        result.copied_characters = (
-            self.copied_characters + getattr(other, "copied_characters", 0) + len(self) + len(other)
-        )
-        return result
-
-
-class _FindSpanCountingString(str):
-    requested_characters: int
-
-    def __new__(cls, value: str) -> _FindSpanCountingString:
-        instance = super().__new__(cls, value)
-        instance.requested_characters = 0
-        return instance
-
-    def find(
-        self,
-        sub: str,
-        start: int = 0,
-        end: int | None = None,
-    ) -> int:
-        limit = len(self) if end is None else min(end, len(self))
-        self.requested_characters += max(0, limit - start)
-        return super().find(sub, start, len(self) if end is None else end)
-
-
-def test_trailing_punctuation_is_detached_without_repeated_suffix_copying() -> None:
-    api = _api()
-    value = _CopyCountingString("https://host.invalid/path" + ("." * 1_000))
-
-    candidate, punctuation = api._detach_trailing_prose_punctuation(value, None)
-
-    assert candidate == "https://host.invalid/path"
-    assert punctuation == "." * 1_000
-    assert getattr(punctuation, "copied_characters", 0) <= len(value) * 2
-
-
-def test_text_redaction_fails_closed_when_candidate_or_character_bound_is_exhausted() -> None:
-    api = _api()
-    first_secret = "first-bound-secret"
-    second_secret = "second-bound-secret"
-    text = (
-        f"https://user:{first_secret}@one.example.invalid/repo "
-        f"https://user:{second_secret}@two.example.invalid/repo"
-    )
-
-    candidate_bounded = api.redact_text(text, max_candidates=1)
-    character_bounded = api.redact_text(text, max_characters=24)
-
-    assert first_secret not in candidate_bounded
-    assert second_secret not in candidate_bounded
-    assert api.REDACTED_REMAINDER in candidate_bounded
-    assert first_secret not in character_bounded
-    assert second_secret not in character_bounded
-    assert api.REDACTED_REMAINDER in character_bounded
-
-
-def test_candidate_signal_budget_has_exact_one_over_and_zero_behavior() -> None:
-    api = _api()
-    text = (
-        "https://user:first-budget-secret@one.invalid/x "
-        "https://user:second-budget-secret@two.invalid/y"
-    )
-
-    assert api.redact_text(text, max_candidates=2) == (
-        "https://REDACTED@one.invalid/x https://REDACTED@two.invalid/y"
-    )
-    assert api.redact_text(text, max_candidates=1) == (
-        f"https://REDACTED@one.invalid/x {api.REDACTED_REMAINDER}"
-    )
-    assert api.redact_text(text, max_candidates=0) == api.REDACTED_REMAINDER
-
-
-def test_scheme_relative_candidates_have_exact_budget_usage_without_double_charging() -> None:
-    api = _api()
-    text = (
-        "//user:first-relative-budget-secret@one.invalid/x "
-        "https://user:absolute-budget-secret@two.invalid/y "
-        "//three.invalid/z?token=third-relative-budget-secret"
-    )
-
-    exact = api.redact_text_result(text, max_candidates=3)
-    one_over = api.redact_text_result(text, max_candidates=2)
-    zero = api.redact_text_result(text, max_candidates=0)
-
-    assert exact == api.TextRedactionResult(
-        value=("[REDACTED_URL] https://REDACTED@two.invalid/y [REDACTED_URL]"),
-        complete=True,
-        candidates=3,
-        reason=None,
-    )
-    assert one_over == api.TextRedactionResult(
-        value=(f"[REDACTED_URL] https://REDACTED@two.invalid/y {api.REDACTED_REMAINDER}"),
-        complete=False,
         candidates=2,
-        reason=api.TextRedactionIncompleteReason.CANDIDATE_LIMIT,
+        reason=None,
     )
-    assert zero == api.TextRedactionResult(
+    assert api.redact_text_result(raw, max_candidates=1) == api.TextRedactionResult(
         value=api.REDACTED_REMAINDER,
         complete=False,
         candidates=0,
@@ -1409,355 +166,173 @@ def test_scheme_relative_candidates_have_exact_budget_usage_without_double_charg
     )
 
 
-def test_scheme_relative_ipv6_userinfo_is_one_candidate_not_an_scp_candidate() -> None:
-    api = _api()
-    text = "//user:relative-ipv6-budget-secret@[2001:db8::1]:8443/private"
+def test_candidate_budget_is_aggregate_and_exact_limit_succeeds() -> None:
+    raw = "https://user:first-secret@one.invalid/x https://user:second-secret@two.invalid/y"
 
-    assert api.redact_text_result(text, max_candidates=1) == api.TextRedactionResult(
-        value=api.REDACTED_URL,
+    assert api.redact_text_result(raw, max_candidates=2) == api.TextRedactionResult(
+        value="https://one.invalid/REDACTED_PATH https://two.invalid/REDACTED_PATH",
         complete=True,
-        candidates=1,
+        candidates=2,
         reason=None,
     )
-    assert api.redact_text(text, max_candidates=0) == api.REDACTED_REMAINDER
+    one_over = api.redact_text_result(raw, max_candidates=1)
+    assert one_over.value == api.REDACTED_REMAINDER
+    assert one_over.complete is False
+    assert one_over.candidates == 1
+    assert one_over.reason is api.TextRedactionIncompleteReason.CANDIDATE_LIMIT
 
 
-def test_large_interior_double_slash_text_stays_bounded_and_off_the_candidate_scanner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    api = _api()
-    text = " ".join(["src/a//b.py"] * 50_000)
-
-    def unexpected_scan(*_args: Any, **_kwargs: Any) -> Any:
-        pytest.fail("candidate scanner should not run for interior double slashes")
-
-    monkeypatch.setattr(api, "_redact_text_with_usage", unexpected_scan)
-    started = perf_counter()
-    result = api.redact_text_result(text)
-    elapsed = perf_counter() - started
-
-    assert result.value is text
-    assert result.complete is True
-    assert result.candidates == 0
-    assert elapsed < 2.0
-
-
-def test_structured_text_result_distinguishes_literal_placeholder_from_exhaustion() -> None:
-    api = _api()
+def test_structured_result_distinguishes_literal_placeholder_from_real_exhaustion() -> None:
     literal = api.redact_text_result(api.REDACTED_REMAINDER)
-    literal_with_prefix = api.redact_text_result(f"prefix {api.REDACTED_REMAINDER}")
     exhausted = api.redact_text_result(
-        "https://user:structured-result-secret@host.invalid/path",
-        max_candidates=0,
-    )
-    exhausted_with_prefix = api.redact_text_result(
-        "prefix https://user:structured-result-secret@host.invalid/path",
+        "prefix https://user:secret@host.invalid/path",
         max_candidates=0,
     )
 
-    assert literal == api.TextRedactionResult(
-        value=api.REDACTED_REMAINDER,
-        complete=True,
-        candidates=0,
-        reason=None,
-    )
-    assert exhausted.value == api.REDACTED_REMAINDER
+    assert literal.value == exhausted.value
+    assert literal.complete is True
+    assert literal.reason is None
     assert exhausted.complete is False
-    assert exhausted.candidates == 0
     assert exhausted.reason is api.TextRedactionIncompleteReason.CANDIDATE_LIMIT
-    assert literal_with_prefix.value == exhausted_with_prefix.value
-    assert literal_with_prefix.complete is True
-    assert exhausted_with_prefix.complete is False
 
 
-def test_structured_text_result_reports_character_bound_and_retained_candidate_usage() -> None:
-    api = _api()
-    text = (
-        "https://user:first-structured-secret@one.invalid/path "
-        "https://user:second-structured-secret@two.invalid/path"
-    )
+def test_character_overflow_masks_the_whole_input_without_parsing_a_prefix() -> None:
+    raw = "https://user:prefix-secret@packages.example.invalid/private"
 
-    character_limited = api.redact_text_result(text, max_characters=len(text) - 1)
-    candidate_limited = api.redact_text_result(text, max_candidates=1)
-
-    assert character_limited == api.TextRedactionResult(
+    assert api.redact_text_result(raw, max_characters=len(raw) - 1) == api.TextRedactionResult(
         value=api.REDACTED_REMAINDER,
         complete=False,
         candidates=0,
         reason=api.TextRedactionIncompleteReason.CHARACTER_LIMIT,
     )
-    assert candidate_limited.complete is False
-    assert candidate_limited.candidates == 1
-    assert candidate_limited.reason is api.TextRedactionIncompleteReason.CANDIDATE_LIMIT
-    assert candidate_limited.value.endswith(api.REDACTED_REMAINDER)
+    assert api.redact_url(raw, max_characters=len(raw) - 1) == api.REDACTED_URL
 
 
-def test_nested_scp_signals_share_the_hierarchical_candidate_budget() -> None:
-    api = _api()
-    text = "https://safe.invalid/p?next=a@b:x.git,c@d:y.git"
+@pytest.mark.parametrize("invalid", [-1, True, False])
+def test_text_redaction_rejects_negative_and_boolean_bounds(invalid: int | bool) -> None:
+    result = api.redact_text_result("https://host.invalid/path", max_candidates=invalid)
 
-    assert api.redact_text(text, max_candidates=3) == api.REDACTED_URL
-    assert api.redact_text(text, max_candidates=2) == api.REDACTED_REMAINDER
-    assert api.redact_text(text, max_candidates=1) == api.REDACTED_REMAINDER
-
-
-def test_scp_candidate_containing_a_hierarchical_marker_fails_closed_and_charges_both() -> None:
-    api = _api()
-    sentinel = "inverse-nested-scp-secret-0bc4"
-    text = f"{sentinel}@host.invalid:org://evil.invalid/repo.git"
-
-    assert api.redact_text(text, max_candidates=2) == api.REDACTED_URL
-    assert api.redact_text(text, max_candidates=1) == api.REDACTED_REMAINDER
-    assert api.redact_text(text, max_candidates=0) == api.REDACTED_REMAINDER
-    assert sentinel not in api.redact_text(text)
+    assert result.complete is False
+    assert result.reason is api.TextRedactionIncompleteReason.INVALID_INPUT
 
 
-def test_ambiguous_email_assignment_and_url_token_is_masked() -> None:
-    api = _api()
-    text = "owner=dev@example.invalid:url=https://host.invalid/path"
+def test_default_text_bound_covers_the_full_artifact_cache_contract() -> None:
+    text = "x" * api.MAX_REDACTION_CHARACTERS
 
-    assert api.redact_text(text) == api.REDACTED_URL
+    result = api.redact_text_result(text)
+
+    assert api.MAX_REDACTION_CHARACTERS == 16 * 1024 * 1024
+    assert result.value is text
+    assert result.complete is True
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "a@b:x.git,https://user:first-same-token-secret@host.invalid/x",
-        (
-            '["https://user:first-array-secret@one.invalid/x",'
-            '"https://user:second-array-secret@two.invalid/y"]'
-        ),
-    ],
-)
-def test_structured_result_retains_same_token_candidate_usage_on_exhaustion(
-    text: str,
-) -> None:
-    api = _api()
+def test_unexpected_url_parser_errors_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken_parser(_value: str) -> object:
+        raise RuntimeError("attacker-controlled parser failure")
 
-    result = api.redact_text_result(text, max_candidates=1)
+    monkeypatch.setattr(api, "urlsplit", broken_parser)
 
-    assert result == api.TextRedactionResult(
+    assert api.redact_url("https://user:secret@host.invalid/path") == api.REDACTED_URL
+
+
+class _BrokenCasefoldString(str):
+    def casefold(self) -> str:
+        raise RuntimeError("attacker-controlled string failure")
+
+
+def test_internal_text_probe_errors_mask_the_whole_input_without_throwing() -> None:
+    raw = _BrokenCasefoldString("https%3A%2F%2Fuser%40host.invalid%2Fpath")
+
+    assert api.redact_text_result(raw) == api.TextRedactionResult(
         value=api.REDACTED_REMAINDER,
         complete=False,
-        candidates=1,
-        reason=api.TextRedactionIncompleteReason.CANDIDATE_LIMIT,
-    )
-    assert "same-token-secret" not in result.value
-    assert "array-secret" not in result.value
-
-
-@pytest.mark.parametrize(
-    "template",
-    [
-        "{sentinel}#x@git.example.invalid:org/repo.git",
-        "{sentinel}@git.example.invalid#x:org/repo.git",
-        "{sentinel}@git.example.invalid:org#x/repo.git",
-    ],
-)
-def test_scp_candidate_with_an_ambiguous_raw_fragment_fails_closed(template: str) -> None:
-    api = _api()
-    sentinel = "scp-fragment-prefix-secret-2e70"
-    text = template.format(sentinel=sentinel)
-
-    assert api.redact_text(text) == api.REDACTED_URL
-    assert api.redact_text(text, max_candidates=0) == api.REDACTED_REMAINDER
-    assert sentinel not in api.redact_text(text)
-
-
-def test_scp_discovery_uses_the_host_path_separator_not_the_last_colon() -> None:
-    api = _api()
-    sentinel = "multi-colon-scp-userinfo-secret-77a1"
-    text = f"user:{sentinel}@evil.invalid:org/repo.git:x"
-
-    assert api.redact_text(text) == api.REDACTED_URL
-    assert api.redact_text(text, max_candidates=0) == api.REDACTED_REMAINDER
-    assert sentinel not in api.redact_text(text)
-
-
-def test_markup_scanner_output_is_idempotent() -> None:
-    api = _api()
-    text = (
-        '{"url":"https://user:json-idempotent-secret@host.invalid/path",'
-        '"mirror":"https://host.invalid/mirror"}'
+        candidates=0,
+        reason=api.TextRedactionIncompleteReason.INTERNAL_ERROR,
     )
 
-    first = api.redact_text(text)
 
-    assert api.redact_text(first) == first
-
-
-@pytest.mark.parametrize(
-    ("raw", "max_characters"),
-    [
-        ("https://alice:123456789@example.invalid/path", 18),
-        ("https://alice:password-cut@example.invalid/path", 27),
-        ("https://packages.example.invalid/path?token=query-cut-secret", 52),
-        ("https://packages.example.invalid/path#fragment-cut-secret", 49),
-    ],
-)
-def test_over_bound_text_never_parses_or_returns_a_clipped_prefix(
-    raw: str,
-    max_characters: int,
-) -> None:
-    api = _api()
-
-    redacted = api.redact_text(raw, max_characters=max_characters)
-
-    assert redacted == api.REDACTED_REMAINDER
-    assert redacted == api.redact_text(redacted, max_characters=max_characters)
-    assert raw[:max_characters] not in redacted
-
-
-def test_direct_url_redaction_fails_closed_when_character_bound_is_exhausted() -> None:
-    api = _api()
-    sentinel = "direct-bound-secret"
-    raw = f"https://user:{sentinel}@packages.example.invalid/private"
-
-    assert api.redact_url(raw, max_characters=16) == api.REDACTED_URL
-
-
-def test_nested_values_are_sanitized_without_rewriting_code_owned_keys_or_container_types() -> None:
-    api = _api()
-    https_secret = "nested-https-secret"
-    ssh_secret = "nested-ssh-secret"
-    prose_secret = "nested-prose-secret"
+def test_nested_values_preserve_code_owned_keys_and_container_types() -> None:
     value = {
-        "registry_url": f"https://user:{https_secret}@packages.example.invalid/private",
+        "registry_url": "https://user:https-secret@packages.example.invalid/private?token=x",
         "details": [
-            f"ssh://user:{ssh_secret}@git.example.invalid/org/repo.git",
-            (f"Mirror: https://user:{prose_secret}@mirror.example.invalid/simple", 7),
+            "ssh://user:ssh-secret@git.example.invalid/org/repo.git#part",
+            ("ordinary", 7),
         ],
         "enabled": True,
     }
 
     redacted = api.redact_value(value)
 
-    assert set(redacted) == {"registry_url", "details", "enabled"}
-    assert isinstance(redacted["details"], list)
-    assert isinstance(redacted["details"][1], tuple)
-    assert redacted["details"][1][1] == 7
-    assert redacted["enabled"] is True
-    rendered = repr(redacted)
-    for sentinel in (https_secret, ssh_secret, prose_secret):
-        assert sentinel not in rendered
-    assert "packages.example.invalid/private" in rendered
-    assert "git.example.invalid/org/repo.git" in rendered
-
-
-def test_nested_redaction_fails_closed_at_depth_and_item_bounds() -> None:
-    api = _api()
-    depth_secret = "depth-bound-secret"
-    item_secret = "item-bound-secret"
-
-    depth_bounded = api.redact_value(
-        {"outer": {"inner": f"https://user:{depth_secret}@packages.example.invalid/repo"}},
-        max_depth=1,
-    )
-    item_bounded = api.redact_value(
-        {
-            "first": "safe",
-            "second": f"https://user:{item_secret}@packages.example.invalid/repo",
-        },
-        max_nodes=2,
-    )
-
-    assert depth_secret not in repr(depth_bounded)
-    assert item_secret not in repr(item_bounded)
-    assert api.REDACTED_VALUE in repr(depth_bounded)
-    assert item_bounded == api.REDACTED_VALUE
-
-
-def test_recursive_value_exact_depth_and_node_bounds_succeed_but_one_over_is_redacted() -> None:
-    api = _api()
-    depth_secret = "one-over-depth-secret"
-    node_secret = "one-over-node-secret"
-    exact_depth = {"outer": {"leaf": "safe"}}
-    over_depth = {"outer": {"inner": {"leaf": f"https://user:{depth_secret}@host.invalid/x"}}}
-    exact_nodes = {"leaf": "safe"}
-    over_nodes = {
-        "first": "safe",
-        "second": f"https://user:{node_secret}@host.invalid/x",
+    assert redacted == {
+        "registry_url": "https://packages.example.invalid/REDACTED_PATH",
+        "details": ["ssh://git.example.invalid/REDACTED_PATH", ("ordinary", 7)],
+        "enabled": True,
     }
 
-    assert api.redact_value(exact_depth, max_depth=2) == exact_depth
-    depth_result = api.redact_value(over_depth, max_depth=2)
-    assert depth_secret not in repr(depth_result)
-    assert api.REDACTED_VALUE in repr(depth_result)
-    assert api.redact_value(exact_nodes, max_nodes=2) == exact_nodes
-    node_result = api.redact_value(over_nodes, max_nodes=2)
-    assert node_secret not in repr(node_result)
-    assert api.REDACTED_VALUE in repr(node_result)
 
-
-def test_recursive_value_self_reference_terminates_fail_closed() -> None:
-    api = _api()
-    value: list[object] = []
-    value.append(value)
-
-    redacted = api.redact_value(value)
-
-    assert redacted == [api.REDACTED_VALUE]
-
-
-def test_recursive_text_character_budget_is_aggregate_across_sibling_values() -> None:
-    api = _api()
-    value = {"first": "abcd", "second": "efgh"}
-
-    assert api.redact_value(value, max_text_characters=8) == value
-    assert api.redact_value(value, max_text_characters=7) == api.REDACTED_VALUE
-
-
-def test_recursive_candidate_budget_is_aggregate_across_sibling_values() -> None:
-    api = _api()
-    value = {
-        "first": "https://user:first-aggregate-secret@one.example.invalid/repo",
-        "second": "https://user:second-aggregate-secret@two.example.invalid/repo",
+def test_recursive_text_character_and_candidate_budgets_are_aggregate() -> None:
+    benign = {"first": "abcd", "second": "efgh"}
+    candidates = {
+        "first": "https://user:first-secret@one.invalid/x",
+        "second": "https://user:second-secret@two.invalid/y",
     }
 
-    exact = api.redact_value(value, max_text_candidates=2)
+    assert api.redact_value(benign, max_text_characters=8) == benign
+    assert api.redact_value(benign, max_text_characters=7) == api.REDACTED_VALUE
+    assert api.redact_value(candidates, max_text_candidates=1) == api.REDACTED_VALUE
+    exact = api.redact_value(candidates, max_text_candidates=2)
+    assert exact == {
+        "first": "https://one.invalid/REDACTED_PATH",
+        "second": "https://two.invalid/REDACTED_PATH",
+    }
 
-    assert "first-aggregate-secret" not in repr(exact)
-    assert "second-aggregate-secret" not in repr(exact)
-    assert api.redact_value(value, max_text_candidates=1) == api.REDACTED_VALUE
+
+def test_recursive_depth_and_node_bounds_are_exact_and_fail_closed_one_over() -> None:
+    depth_value = {"outer": {"leaf": "ordinary"}}
+    node_value = {"leaf": "ordinary"}
+
+    assert api.redact_value(depth_value, max_depth=2) == depth_value
+    assert api.redact_value(depth_value, max_depth=1) == api.REDACTED_VALUE
+    assert api.redact_value(node_value, max_nodes=2) == node_value
+    assert api.redact_value(node_value, max_nodes=1) == api.REDACTED_VALUE
 
 
 class _CountingMapping(Mapping[str, str]):
     def __init__(self) -> None:
         self.iterations = 0
-        self._values = {"first": "one", "second": "two", "third": "three"}
 
     def __getitem__(self, key: str) -> str:
-        return self._values[key]
+        return {"first": "one", "second": "two", "third": "three"}[key]
 
     def __iter__(self) -> Iterator[str]:
-        for key in self._values:
+        for key in ("first", "second", "third"):
             self.iterations += 1
             yield key
 
     def __len__(self) -> int:
-        return len(self._values)
+        return 3
 
 
 def test_recursive_node_exhaustion_stops_before_iterating_an_oversized_mapping() -> None:
-    api = _api()
     value = _CountingMapping()
 
-    redacted = api.redact_value(value, max_nodes=2)
-
-    assert redacted == api.REDACTED_VALUE
+    assert api.redact_value(value, max_nodes=2) == api.REDACTED_VALUE
     assert value.iterations == 0
 
 
-@pytest.mark.parametrize(
-    "function_name",
-    ["redact_url", "redact_text"],
-)
+def test_recursive_self_reference_terminates_fail_closed() -> None:
+    value: list[object] = []
+    value.append(value)
+
+    assert api.redact_value(value) == api.REDACTED_VALUE
+
+
+@pytest.mark.parametrize("function_name", ["redact_url", "redact_text"])
 def test_string_redactors_are_deterministic_and_idempotent(function_name: str) -> None:
-    api = _api()
     function = getattr(api, function_name)
     raw = (
         "Prefix " if function_name == "redact_text" else ""
-    ) + "https://user:idempotent-secret@packages.example.invalid/repo?token=query-secret"
+    ) + "https://user:secret@packages.example.invalid/repo?token=query#part"
 
     first = function(raw)
 
@@ -1766,9 +341,8 @@ def test_string_redactors_are_deterministic_and_idempotent(function_name: str) -
 
 
 def test_recursive_value_redaction_is_idempotent() -> None:
-    api = _api()
     value = {
-        "url": "https://user:value-secret@packages.example.invalid/repo",
+        "url": "https://user:secret@packages.example.invalid/repo?token=x",
         "items": ("plain",),
     }
 

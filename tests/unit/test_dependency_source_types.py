@@ -114,7 +114,7 @@ def test_source_change_accepts_only_redacted_resolved_destinations() -> None:
     with pytest.raises(ValueError) as error:
         api.SourceChange(
             ecosystem="npm",
-            surface="npm config",
+            surface="source",
             operation="replace",
             scope="global",
             destination=raw_destination,
@@ -126,14 +126,18 @@ def test_source_change_accepts_only_redacted_resolved_destinations() -> None:
 
     change = api.SourceChange(
         ecosystem="npm",
-        surface="npm config",
+        surface="source",
         operation="replace",
         scope="global",
-        destination="https://REDACTED@packages.example.invalid/private",
+        destination="https://packages.example.invalid/REDACTED_PATH",
         destination_status=api.DestinationStatus.RESOLVED,
         span=_span(api),
     )
-    assert change.destination == "https://REDACTED@packages.example.invalid/private"
+    assert change.destination == "https://packages.example.invalid/REDACTED_PATH"
+    assert change.ecosystem is api.DependencyEcosystem.NPM
+    assert change.surface is api.DependencySourceSurface.SOURCE
+    assert change.operation is api.DependencySourceOperation.REPLACE
+    assert change.scope is api.DependencySourceScope.GLOBAL
     assert change.destination_status is api.DestinationStatus.RESOLVED
 
 
@@ -153,7 +157,7 @@ def test_source_change_rejects_raw_destination_redaction_bypasses(
     with pytest.raises(ValueError) as error:
         api.SourceChange(
             ecosystem="npm",
-            surface="npm config",
+            surface="source",
             operation="replace",
             scope="global",
             destination=raw_destination,
@@ -165,71 +169,21 @@ def test_source_change_rejects_raw_destination_redaction_bypasses(
 
 
 @pytest.mark.parametrize(
-    "raw_destination",
-    [
-        "//user:scheme-relative-source-secret@packages.example.invalid/private",
-        "//packages.example.invalid/private?token=scheme-relative-source-secret",
-        "//?token=scheme-relative-source-secret",
-        "// /x?token=scheme-relative-source-secret",
-        "// user:scheme-relative-source-secret@packages.example.invalid/private",
-        "// user:scheme-relative-source-secret%40packages.example.invalid/private",
-        "// user%3Ascheme-relative-source-secret%40packages.example.invalid/private",
-        "// token=scheme-relative-source-secret@packages.example.invalid",
-        "// token%3Dscheme-relative-source-secret%40packages.example.invalid",
-        "// scheme-relative-source-secret@packages.example.invalid:8443",
-        "// scheme-relative-source-secret@[2001:db8::1]",
-        "//: user:scheme-relative-source-secret@packages.example.invalid/private",
-        "//: user:scheme-relative-source-secret%40packages.example.invalid/private",
-        "//? /x?token=scheme-relative-source-secret",
-        "/// /x?token=scheme-relative-source-secret",
-        "//; user:scheme-relative-source-secret@packages.example.invalid/private",
-        "x//user:ambiguous-source-secret@packages.example.invalid/private",
-        "x//packages.example.invalid/private#ambiguous-source-secret",
-        "x//packages.example.invalid/private?token=ambiguous-source-secret",
-        "x//user:ambiguous-source-secret%40packages.example.invalid/private",
-        "x?next=a//evil.invalid/path&token=ambiguous-source-secret",
-        "https://safe.invalid/path?next=x//user:nested-source-secret@evil.invalid/x",
-        "https://safe.invalid/path?next=x//user:nested-source-secret%40evil.invalid/x",
-        "https://safe.invalid/a//user:nested-source-secret@evil.invalid/x",
-        "//safe.invalid/path?next=x//user:nested-source-secret@evil.invalid/x",
-    ],
-)
-def test_source_change_rejects_raw_scheme_relative_credentials(
-    raw_destination: str,
-) -> None:
-    api = _api()
-
-    with pytest.raises(ValueError) as error:
-        api.SourceChange(
-            ecosystem="npm",
-            surface="npm config",
-            operation="replace",
-            scope="global",
-            destination=raw_destination,
-            destination_status=api.DestinationStatus.RESOLVED,
-            span=_span(api),
-        )
-
-    assert "scheme-relative-source-secret" not in str(error.value)
-
-
-@pytest.mark.parametrize(
     "destination",
     [
         "[REDACTED_URL]",
-        "//packages.example.invalid/private?channel=stable",
-        "https://safe.invalid/a//b/c?channel=dev@example.invalid",
-        "https://safe.invalid/a//b/c?scope=%40org",
+        "//packages.example.invalid/REDACTED_PATH",
+        "https://safe.invalid/REDACTED_PATH",
     ],
 )
-def test_source_change_accepts_sanitized_scheme_relative_destinations(
+def test_source_change_accepts_only_stable_sanitized_destinations(
     destination: str,
 ) -> None:
     api = _api()
 
     change = api.SourceChange(
         ecosystem="npm",
-        surface="npm config",
+        surface="source",
         operation="replace",
         scope="global",
         destination=destination,
@@ -246,7 +200,7 @@ def test_source_change_accepts_interior_double_slash_as_non_reference_syntax() -
 
     change = api.SourceChange(
         ecosystem="npm",
-        surface="npm config",
+        surface="source",
         operation="replace",
         scope="global",
         destination=destination,
@@ -257,78 +211,12 @@ def test_source_change_accepts_interior_double_slash_as_non_reference_syntax() -
     assert change.destination == destination
 
 
-@pytest.mark.parametrize(
-    "query_key",
-    [
-        "authorizationtoken",
-        "authenticationtoken",
-        "credentialtoken",
-        "tokensecret",
-        "secretkeytoken",
-        "passphrasekey",
-        "signaturetoken",
-        "dbpassword",
-        "registrytoken",
-        "dbauth",
-        "clientcredential",
-        "requestsignature",
-        "accesskey",
-        "githubtoken",
-        "githubtokenvalue",
-        "GITHUBTOKENVALUE",
-        "github%54oken%56alue",
-    ],
-)
-def test_source_change_rejects_compact_credential_query_grammar_bypasses(
-    query_key: str,
-) -> None:
-    api = _api()
-    sentinel = "source-change-query-secret-4b6a"
-
-    with pytest.raises(ValueError) as error:
-        api.SourceChange(
-            ecosystem="npm",
-            surface="npm config",
-            operation="replace",
-            scope="global",
-            destination=(f"https://packages.example.invalid/private?{query_key}={sentinel}"),
-            destination_status=api.DestinationStatus.RESOLVED,
-            span=_span(api),
-        )
-
-    assert sentinel not in str(error.value)
-
-
-@pytest.mark.parametrize(
-    "query_key",
-    ["ssh_key", "registry-key", "encryption.key", "x_pass", "db_sig"],
-)
-def test_source_change_rejects_explicitly_separated_weak_credential_words(
-    query_key: str,
-) -> None:
-    api = _api()
-    sentinel = "source-change-separated-weak-secret-498c"
-
-    with pytest.raises(ValueError) as error:
-        api.SourceChange(
-            ecosystem="npm",
-            surface="npm config",
-            operation="replace",
-            scope="global",
-            destination=(f"https://packages.example.invalid/simple?{query_key}={sentinel}"),
-            destination_status=api.DestinationStatus.RESOLVED,
-            span=_span(api),
-        )
-
-    assert sentinel not in str(error.value)
-
-
 def test_source_change_uses_one_exact_unresolved_representation() -> None:
     api = _api()
 
     change = api.SourceChange(
         ecosystem="pip",
-        surface="pip config",
+        surface="source",
         operation="replace",
         scope="global",
         destination="unresolved",
@@ -347,7 +235,7 @@ def test_source_change_rejects_empty_semantic_fields_and_has_no_raw_payload_slot
     api = _api()
     base = api.SourceChange(
         ecosystem="pip",
-        surface="pip config",
+        surface="source",
         operation="replace",
         scope="global",
         destination="unresolved",
@@ -371,15 +259,15 @@ def test_source_change_rejects_empty_semantic_fields_and_has_no_raw_payload_slot
 
 
 @pytest.mark.parametrize("field", ["ecosystem", "surface", "operation", "scope"])
-@pytest.mark.parametrize("control", ["\x00", "\x1f", "\x7f"])
-def test_source_change_semantic_fields_reject_c0_and_del_controls(
+@pytest.mark.parametrize("unsafe", ["attacker-secret", "safe\x00value"])
+def test_source_change_semantics_reject_attacker_controlled_labels(
     field: str,
-    control: str,
+    unsafe: str,
 ) -> None:
     api = _api()
     base = api.SourceChange(
         ecosystem="pip",
-        surface="pip config",
+        surface="source",
         operation="replace",
         scope="global",
         destination="unresolved",
@@ -388,7 +276,7 @@ def test_source_change_semantic_fields_reject_c0_and_del_controls(
     )
 
     with pytest.raises(ValueError):
-        dataclasses.replace(base, **{field: f"safe{control}value"})
+        dataclasses.replace(base, **{field: unsafe})
 
 
 @pytest.mark.parametrize("destination", ["", "   ", "https://host.invalid/\x00path"])
@@ -398,7 +286,7 @@ def test_resolved_destination_rejects_blank_or_control_bearing_values(destinatio
     with pytest.raises(ValueError):
         api.SourceChange(
             ecosystem="npm",
-            surface="npm config",
+            surface="source",
             operation="replace",
             scope="global",
             destination=destination,
@@ -416,7 +304,7 @@ def test_resolved_destination_rejects_values_above_its_explicit_bound() -> None:
     with pytest.raises(ValueError):
         api.SourceChange(
             ecosystem="npm",
-            surface="npm config",
+            surface="source",
             operation="replace",
             scope="global",
             destination=destination,
@@ -429,7 +317,7 @@ def test_parse_and_analysis_results_freeze_iterables_as_tuples() -> None:
     api = _api()
     change = api.SourceChange(
         ecosystem="pip",
-        surface="pip config",
+        surface="source",
         operation="replace",
         scope="global",
         destination="unresolved",
@@ -521,10 +409,10 @@ def test_source_change_conversion_is_the_single_safe_finding_boundary() -> None:
     api = _api()
     change = api.SourceChange(
         ecosystem="npm",
-        surface="npm config",
+        surface="source",
         operation="replace",
-        scope="@acme",
-        destination="https://REDACTED@packages.example.invalid/private",
+        scope="scoped",
+        destination="https://packages.example.invalid/REDACTED_PATH",
         destination_status=api.DestinationStatus.RESOLVED,
         span=_span(api),
     )
@@ -537,10 +425,10 @@ def test_source_change_conversion_is_the_single_safe_finding_boundary() -> None:
     assert (finding.start_line, finding.end_line) == (1, 1)
     assert finding.evidence == {
         "ecosystem": "npm",
-        "surface": "npm config",
+        "surface": "source",
         "operation": "replace",
-        "scope": "@acme",
-        "destination": "https://REDACTED@packages.example.invalid/private",
+        "scope": "scoped",
+        "destination": "https://packages.example.invalid/REDACTED_PATH",
         "destination_status": "resolved",
     }
 
