@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from io import StringIO
 from ipaddress import IPv6Address
 from typing import Final
@@ -46,40 +47,20 @@ _CREDENTIAL_WORDS: Final = frozenset(
         "tokens",
     }
 )
-_COMPACT_CREDENTIAL_KEYS: Final = frozenset(
-    {
-        "accesstoken",
-        "apikey",
-        "authtoken",
-        "bearertoken",
-        "clientsecret",
-        "clienttoken",
-        "idtoken",
-        "privatekey",
-        "refreshtoken",
-        "secretkey",
-        "sessionkey",
-        "signingkey",
-    }
-)
+_MAX_RAW_QUERY_KEY_CHARACTERS: Final = 3 * 256
+_MAX_DECODED_QUERY_KEY_CHARACTERS: Final = 256
 _CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
 _UNSAFE_URI_CHARACTER = re.compile(r'[<>"`]')
 _BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 _ENCODED_UNSAFE_AUTHORITY_CHARACTER = re.compile(
     r"%(?:0[0-9A-Fa-f]|1[0-9A-Fa-f]|20|23|2[fF]|3[aAfF]|40|5[bBcCdD]|7[fF])"
 )
-_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-_QUERY_WORD_SEPARATOR = re.compile(r"[^A-Za-z0-9]+")
 _SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*$")
 _SCP_URL = re.compile(
     r"^(?P<user>[^@/:\\\s]+)@"
     r"(?P<host>\[[^\]\s]+\]|[^@/:\\\s]+):"
     r"(?P<path>.+)$"
-)
-_CANDIDATE_START = re.compile(
-    r"(?P<uri>(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://)"
-    r"|(?P<scp>(?<![A-Za-z0-9._~-])[^@/:\\\s<>\"`]+@"
-    r"(?:\[[^\]\s]+\]|[^@/:\\\s<>\"`]+):)",
 )
 _PROSE_OPENERS: Final = frozenset("([{<\"'`")
 _PAIRED_CLOSERS: Final = {
@@ -103,14 +84,20 @@ def _has_ambiguous_percent_escape(value: str) -> bool:
 
 
 def _query_key_is_sensitive(raw_key: str) -> bool:
+    if len(raw_key) > _MAX_RAW_QUERY_KEY_CHARACTERS:
+        raise ValueError("query key exceeds its bound")
     try:
         decoded = unquote_plus(raw_key, encoding="utf-8", errors="strict")
     except (UnicodeDecodeError, ValueError):
         raise ValueError("query key is ambiguous") from None
-    expanded = _CAMEL_BOUNDARY.sub("_", decoded)
-    words = {word.casefold() for word in _QUERY_WORD_SEPARATOR.split(expanded) if word}
-    compact = "".join(character for character in decoded if character.isalnum()).casefold()
-    return bool(words & _CREDENTIAL_WORDS) or compact in _COMPACT_CREDENTIAL_KEYS
+    if (
+        len(decoded) > _MAX_DECODED_QUERY_KEY_CHARACTERS
+        or _CONTROL_CHARACTER.search(decoded)
+        or _PERCENT_ESCAPE.search(decoded)
+    ):
+        raise ValueError("query key is ambiguous")
+    folded = decoded.casefold()
+    return any(term in folded for term in _CREDENTIAL_WORDS)
 
 
 def _redact_query(raw_query: str) -> str:
@@ -233,12 +220,44 @@ def _redact_scp_url(value: str) -> str:
     return f"REDACTED@{match.group('host')}:{raw_path}{suffix}"
 
 
+def _scp_discovery_path(candidate: str) -> str | None:
+    at_sign = candidate.find("@")
+    if at_sign < 0 or at_sign + 1 >= len(candidate):
+        return None
+    host_start = at_sign + 1
+    if candidate[host_start] == "[":
+        close = candidate.find("]", host_start + 1)
+        if close < 0 or close + 1 >= len(candidate) or candidate[close + 1] != ":":
+            return None
+        separator = close + 1
+    else:
+        separator = candidate.find(":", host_start)
+        if separator < 0:
+            return None
+    return candidate[separator + 1 :].split("?", 1)[0]
+
+
 def _looks_like_scp_git(value: str) -> bool:
-    without_fragment = value.split("#", 1)[0]
-    if "@" not in without_fragment or ":" not in without_fragment:
-        return False
-    path = without_fragment.rsplit(":", 1)[-1].split("?", 1)[0]
-    return "/" in path or path.casefold().endswith(".git")
+    candidates = (value.split("#", 1)[0], value.replace("#", ""))
+    for candidate in candidates:
+        path = _scp_discovery_path(candidate)
+        if path is None:
+            continue
+        if "/" in path or ".git" in path.casefold():
+            return True
+    return False
+
+
+def _hierarchical_suffix_after_authority(value: str) -> str:
+    marker = value.find("://")
+    if marker < 0:
+        return ""
+    suffix_start = len(value)
+    for delimiter in "/?#":
+        position = value.find(delimiter, marker + 3)
+        if position >= 0:
+            suffix_start = min(suffix_start, position)
+    return value[suffix_start:]
 
 
 def _detach_trailing_prose_punctuation(
@@ -246,16 +265,13 @@ def _detach_trailing_prose_punctuation(
     opener: str | None,
 ) -> tuple[str, str]:
     split_at = len(value)
-    suffix = ""
     while split_at > 0 and value[split_at - 1] in _SENTENCE_PUNCTUATION:
         split_at -= 1
-        suffix = value[split_at] + suffix
     if split_at > 0 and opener is not None:
         closer = value[split_at - 1]
         if _PAIRED_CLOSERS.get(closer) == opener:
             split_at -= 1
-            suffix = closer + suffix
-    return value[:split_at], suffix
+    return value[:split_at], value[split_at:]
 
 
 def redact_url(value: str, *, max_characters: int = MAX_REDACTION_CHARACTERS) -> str:
@@ -268,6 +284,14 @@ def redact_url(value: str, *, max_characters: int = MAX_REDACTION_CHARACTERS) ->
     suspicious = is_hierarchical_uri or _looks_like_scp_git(value)
     if not suspicious:
         return value
+    if is_hierarchical_uri:
+        first_marker = value.find("://")
+        if value.find("://", first_marker + 3) >= 0 or _looks_like_scp_git(
+            _hierarchical_suffix_after_authority(value)
+        ):
+            return REDACTED_URL
+    elif "#" in value and not _looks_like_scp_git(value.split("#", 1)[0]):
+        return REDACTED_URL
     if (
         _CONTROL_CHARACTER.search(value)
         or _UNSAFE_URI_CHARACTER.search(value)
@@ -285,51 +309,194 @@ def redact_url(value: str, *, max_characters: int = MAX_REDACTION_CHARACTERS) ->
         return REDACTED_URL
 
 
+class TextRedactionIncompleteReason(StrEnum):
+    """Content-free reason that one bounded text redaction did not complete."""
+
+    CHARACTER_LIMIT = "character_limit"
+    CANDIDATE_LIMIT = "candidate_limit"
+    INVALID_INPUT = "invalid_input"
+    INTERNAL_ERROR = "internal_error"
+
+
 @dataclass(frozen=True, slots=True)
-class _TextRedactionResult:
+class TextRedactionResult:
+    """Sanitized text plus truthful bounded completion and usage metadata."""
+
+    value: str
+    complete: bool
+    candidates: int
+    reason: TextRedactionIncompleteReason | None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.value, str)
+            or type(self.complete) is not bool
+            or not _valid_bound(self.candidates)
+            or self.candidates > MAX_REDACTION_CHARACTERS
+            or (
+                self.reason is not None
+                and not isinstance(self.reason, TextRedactionIncompleteReason)
+            )
+            or self.complete is (self.reason is not None)
+        ):
+            raise ValueError("invalid text redaction result")
+
+
+@dataclass(frozen=True, slots=True)
+class _TokenRedactionResult:
     value: str
     candidates: int
     complete: bool
 
 
-def _candidate_end(value: str, start: int) -> int:
-    index = start
-    while index < len(value) and not value[index].isspace():
-        index += 1
-    return index
+def _simple_token_parts(token: str) -> tuple[str, str, str, str]:
+    split_at = len(token)
+    while split_at > 0 and token[split_at - 1] in _SENTENCE_PUNCTUATION:
+        split_at -= 1
+    punctuation = token[split_at:]
+    core = token[:split_at]
+    if len(core) >= 2 and core[0] in _PROSE_OPENERS:
+        opener = core[0]
+        closer = core[-1]
+        if _PAIRED_CLOSERS.get(closer) == opener:
+            return opener, core[1:-1], closer, punctuation
+    return "", core, "", punctuation
 
 
-def _redact_text_with_usage(value: str, *, max_candidates: int) -> _TextRedactionResult:
-    result: list[str] = []
+def _scp_signals_in_token(token: str, first_marker: int) -> int:
+    if "@" not in token or ":" not in token:
+        return 0
+    if first_marker < 0:
+        return token.count("@") if _looks_like_scp_git(token) else 0
+
+    signals = 0
+    at_before = token.find("@", 0, first_marker)
+    if at_before >= 0:
+        separator = token.find(":", at_before + 1, first_marker)
+        assignment = token.find("=", at_before + 1, first_marker)
+        if separator >= 0 and assignment < 0:
+            signals += token[:first_marker].count("@")
+
+    suffix_start = len(token)
+    for delimiter in "/?#":
+        position = token.find(delimiter, first_marker + 3)
+        if position >= 0:
+            suffix_start = min(suffix_start, position)
+    suffix = token[suffix_start:]
+    if _looks_like_scp_git(suffix):
+        signals += suffix.count("@")
+    return signals
+
+
+def _simple_redact_token(token: str, *, max_candidates: int) -> _TokenRedactionResult:
+    marker_count = token.count("://")
+    first_marker = token.find("://")
+    scp_signals = _scp_signals_in_token(token, first_marker)
+    signals = marker_count + scp_signals
+    if signals == 0:
+        return _TokenRedactionResult(token, 0, True)
+    if signals > max_candidates:
+        return _TokenRedactionResult(
+            REDACTED_REMAINDER,
+            max_candidates,
+            False,
+        )
+
+    opener, candidate, closer, punctuation = _simple_token_parts(token)
+    sanitized = redact_url(candidate, max_characters=len(candidate))
+    if sanitized == REDACTED_URL:
+        return _TokenRedactionResult(f"{REDACTED_URL}{punctuation}", signals, True)
+    return _TokenRedactionResult(
+        f"{opener}{sanitized}{closer}{punctuation}",
+        signals,
+        True,
+    )
+
+
+def _redact_text_with_usage(value: str, *, max_candidates: int) -> TextRedactionResult:
+    result = StringIO()
     cursor = 0
+    index = 0
     candidates = 0
     try:
-        for match in _CANDIDATE_START.finditer(value):
-            if match.start() < cursor:
+        while index < len(value):
+            while index < len(value) and value[index].isspace():
+                index += 1
+            token_start = index
+            while index < len(value) and not value[index].isspace():
+                index += 1
+            if token_start == index:
                 continue
-            opener = value[match.start() - 1] if match.start() > 0 else None
-            if opener not in _PROSE_OPENERS:
-                opener = None
-            end = _candidate_end(value, match.start())
-            candidate, punctuation = _detach_trailing_prose_punctuation(
-                value[match.start() : end], opener
+            result.write(value[cursor:token_start])
+            token = _simple_redact_token(
+                value[token_start:index],
+                max_candidates=max_candidates - candidates,
             )
-            if match.lastgroup == "scp" and not _looks_like_scp_git(candidate):
-                continue
-            if candidates >= max_candidates:
-                result.append(value[cursor : match.start()])
-                result.append(REDACTED_REMAINDER)
-                return _TextRedactionResult("".join(result), candidates, False)
-            result.append(value[cursor : match.start()])
-            result.append(redact_url(candidate, max_characters=len(candidate)))
-            result.append(punctuation)
-            cursor = end
-            candidates += 1
+            result.write(token.value)
+            if not token.complete:
+                return TextRedactionResult(
+                    value=result.getvalue(),
+                    complete=False,
+                    candidates=candidates + token.candidates,
+                    reason=TextRedactionIncompleteReason.CANDIDATE_LIMIT,
+                )
+            candidates += token.candidates
+            cursor = index
     except Exception:
-        result.append(REDACTED_REMAINDER)
-        return _TextRedactionResult("".join(result), candidates, False)
-    result.append(value[cursor:])
-    return _TextRedactionResult("".join(result), candidates, True)
+        result.write(REDACTED_REMAINDER)
+        return TextRedactionResult(
+            value=result.getvalue(),
+            complete=False,
+            candidates=candidates,
+            reason=TextRedactionIncompleteReason.INTERNAL_ERROR,
+        )
+    result.write(value[cursor:])
+    return TextRedactionResult(
+        value=result.getvalue(),
+        complete=True,
+        candidates=candidates,
+        reason=None,
+    )
+
+
+def redact_text_result(
+    value: str,
+    *,
+    max_characters: int = MAX_REDACTION_CHARACTERS,
+    max_candidates: int = MAX_REDACTION_CANDIDATES,
+) -> TextRedactionResult:
+    """Return sanitized text with content-free bounded completion metadata."""
+    if not isinstance(value, str):
+        return TextRedactionResult(
+            value=REDACTED_REMAINDER,
+            complete=False,
+            candidates=0,
+            reason=TextRedactionIncompleteReason.INVALID_INPUT,
+        )
+    if value == REDACTED_REMAINDER:
+        return TextRedactionResult(value=value, complete=True, candidates=0, reason=None)
+    if not _valid_bound(max_characters) or not _valid_bound(max_candidates):
+        return TextRedactionResult(
+            value=REDACTED_REMAINDER,
+            complete=False,
+            candidates=0,
+            reason=TextRedactionIncompleteReason.INVALID_INPUT,
+        )
+    if len(value) > max_characters:
+        return TextRedactionResult(
+            value=REDACTED_REMAINDER,
+            complete=False,
+            candidates=0,
+            reason=TextRedactionIncompleteReason.CHARACTER_LIMIT,
+        )
+    if "://" not in value and ("@" not in value or ":" not in value):
+        return TextRedactionResult(
+            value=value,
+            complete=True,
+            candidates=0,
+            reason=None,
+        )
+    return _redact_text_with_usage(value, max_candidates=max_candidates)
 
 
 def redact_text(
@@ -339,15 +506,11 @@ def redact_text(
     max_candidates: int = MAX_REDACTION_CANDIDATES,
 ) -> str:
     """Redact bounded URL candidates while preserving ordinary text exactly."""
-    if not isinstance(value, str):
-        return REDACTED_REMAINDER
-    if value == REDACTED_REMAINDER:
-        return value
-    if not _valid_bound(max_characters) or not _valid_bound(max_candidates):
-        return REDACTED_REMAINDER
-    if len(value) > max_characters:
-        return REDACTED_REMAINDER
-    return _redact_text_with_usage(value, max_candidates=max_candidates).value
+    return redact_text_result(
+        value,
+        max_characters=max_characters,
+        max_candidates=max_candidates,
+    ).value
 
 
 class _AggregateRedactionExhaustedError(Exception):
@@ -370,8 +533,9 @@ class _ValueWalk:
         if isinstance(value, str):
             if len(value) > self.remaining_text_characters:
                 raise _AggregateRedactionExhaustedError
-            result = _redact_text_with_usage(
+            result = redact_text_result(
                 value,
+                max_characters=self.remaining_text_characters,
                 max_candidates=self.remaining_text_candidates,
             )
             if not result.complete:

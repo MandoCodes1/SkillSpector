@@ -164,6 +164,72 @@ def test_source_change_rejects_raw_destination_redaction_bypasses(
     assert "type-boundary-secret" not in str(error.value)
 
 
+@pytest.mark.parametrize(
+    "query_key",
+    [
+        "authorizationtoken",
+        "authenticationtoken",
+        "credentialtoken",
+        "tokensecret",
+        "secretkeytoken",
+        "passphrasekey",
+        "signaturetoken",
+        "dbpassword",
+        "registrytoken",
+        "dbauth",
+        "clientcredential",
+        "requestsignature",
+        "accesskey",
+        "githubtoken",
+        "githubtokenvalue",
+        "GITHUBTOKENVALUE",
+        "github%54oken%56alue",
+    ],
+)
+def test_source_change_rejects_compact_credential_query_grammar_bypasses(
+    query_key: str,
+) -> None:
+    api = _api()
+    sentinel = "source-change-query-secret-4b6a"
+
+    with pytest.raises(ValueError) as error:
+        api.SourceChange(
+            ecosystem="npm",
+            surface="npm config",
+            operation="replace",
+            scope="global",
+            destination=(f"https://packages.example.invalid/private?{query_key}={sentinel}"),
+            destination_status=api.DestinationStatus.RESOLVED,
+            span=_span(api),
+        )
+
+    assert sentinel not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "query_key",
+    ["ssh_key", "registry-key", "encryption.key", "x_pass", "db_sig"],
+)
+def test_source_change_rejects_explicitly_separated_weak_credential_words(
+    query_key: str,
+) -> None:
+    api = _api()
+    sentinel = "source-change-separated-weak-secret-498c"
+
+    with pytest.raises(ValueError) as error:
+        api.SourceChange(
+            ecosystem="npm",
+            surface="npm config",
+            operation="replace",
+            scope="global",
+            destination=(f"https://packages.example.invalid/simple?{query_key}={sentinel}"),
+            destination_status=api.DestinationStatus.RESOLVED,
+            span=_span(api),
+        )
+
+    assert sentinel not in str(error.value)
+
+
 def test_source_change_uses_one_exact_unresolved_representation() -> None:
     api = _api()
 
