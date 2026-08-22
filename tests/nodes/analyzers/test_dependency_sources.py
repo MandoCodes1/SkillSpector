@@ -204,21 +204,24 @@ def test_pip_handles_delimiters_continuations_and_normalized_last_values() -> No
     ]
 
 
-def test_pip_last_values_use_normalized_section_identity() -> None:
+def test_pip_sections_keep_exact_configparser_identity() -> None:
     content = (
-        "[Install]\n"
+        "[GLOBAL]\n"
         "index-url = https://first.example.invalid/simple\n"
-        "[install]\n"
+        "[global]\n"
         "index_url = https://effective.example.invalid/simple\n"
     )
 
     analysis = _analyze({"pip.conf": content})
 
     assert analysis.limitations == ()
-    assert [finding.start_line for finding in analysis.findings] == [4]
-    assert analysis.findings[0].evidence["destination"] == (
-        "https://effective.example.invalid/REDACTED_PATH"
-    )
+    assert [
+        (finding.start_line, finding.evidence["scope"], finding.evidence["destination"])
+        for finding in analysis.findings
+    ] == [
+        (2, "command", "https://first.example.invalid/REDACTED_PATH"),
+        (4, "global", "https://effective.example.invalid/REDACTED_PATH"),
+    ]
 
 
 def test_pip_same_indent_options_are_assignments_not_continuation_tokens() -> None:

@@ -168,30 +168,9 @@ def _normalize_pip_option(value: str) -> str:
     return normalized.casefold().replace("_", "-")
 
 
-def _normalize_pip_section(value: str) -> str:
-    return value.strip().casefold().replace("_", "-")
-
-
 class _PipConfigParser(configparser.ConfigParser):
     def optionxform(self, optionstr: str) -> str:
         return _normalize_pip_option(optionstr)
-
-
-def _normalized_pip_parser_text(lines: Sequence[str]) -> str:
-    normalized_lines: list[str] = []
-    for line in lines:
-        section = _PIP_SECTION.fullmatch(line)
-        if section is None:
-            normalized_lines.append(line)
-            continue
-        raw_name = section.group(1).strip()
-        normalized_name = (
-            raw_name if raw_name == configparser.DEFAULTSECT else _normalize_pip_section(raw_name)
-        )
-        normalized_lines.append(
-            f"{line[: section.start(1)]}{normalized_name}{line[section.end(1) :]}"
-        )
-    return "\n".join(normalized_lines)
 
 
 def _canonical_destination(ecosystem: DependencyEcosystem, value: str) -> bool:
@@ -393,12 +372,8 @@ def _parse_pip(
                 return DependencySourceParseResult(
                     limitations=(_limitation(path, raw, exhaustion),)
                 )
-            raw_section = section_match.group(1).strip()
-            section = (
-                None
-                if raw_section == configparser.DEFAULTSECT
-                else _normalize_pip_section(raw_section)
-            )
+            raw_section = section_match.group(1)
+            section = None if raw_section == configparser.DEFAULTSECT else raw_section
             section_seen = True
             current_key = None
             current_fragments = None
@@ -460,7 +435,7 @@ def _parse_pip(
         delimiters=("=", ":"),
     )
     try:
-        parser.read_string(_normalized_pip_parser_text(lines))
+        parser.read_string(text)
     except configparser.Error:
         return DependencySourceParseResult(limitations=(_limitation(path, raw),))
 
