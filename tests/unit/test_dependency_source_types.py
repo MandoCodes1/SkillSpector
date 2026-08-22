@@ -165,6 +165,57 @@ def test_source_change_rejects_raw_destination_redaction_bypasses(
 
 
 @pytest.mark.parametrize(
+    "raw_destination",
+    [
+        "//user:scheme-relative-source-secret@packages.example.invalid/private",
+        "//packages.example.invalid/private?token=scheme-relative-source-secret",
+    ],
+)
+def test_source_change_rejects_raw_scheme_relative_credentials(
+    raw_destination: str,
+) -> None:
+    api = _api()
+
+    with pytest.raises(ValueError) as error:
+        api.SourceChange(
+            ecosystem="npm",
+            surface="npm config",
+            operation="replace",
+            scope="global",
+            destination=raw_destination,
+            destination_status=api.DestinationStatus.RESOLVED,
+            span=_span(api),
+        )
+
+    assert "scheme-relative-source-secret" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [
+        "//REDACTED@packages.example.invalid/private",
+        "//packages.example.invalid/private?token=REDACTED",
+    ],
+)
+def test_source_change_accepts_sanitized_scheme_relative_destinations(
+    destination: str,
+) -> None:
+    api = _api()
+
+    change = api.SourceChange(
+        ecosystem="npm",
+        surface="npm config",
+        operation="replace",
+        scope="global",
+        destination=destination,
+        destination_status=api.DestinationStatus.RESOLVED,
+        span=_span(api),
+    )
+
+    assert change.destination == destination
+
+
+@pytest.mark.parametrize(
     "query_key",
     [
         "authorizationtoken",

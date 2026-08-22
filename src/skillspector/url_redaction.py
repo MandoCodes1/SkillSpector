@@ -73,6 +73,8 @@ _PAIRED_CLOSERS: Final = {
     "`": "`",
 }
 _SENTENCE_PUNCTUATION: Final = frozenset(".,")
+_SCHEME_RELATIVE_BOUNDARIES: Final = frozenset("=([{<\"'`,;")
+_SCHEME_RELATIVE_START = re.compile(r"(?:^|[\s=\(\[\{<\"'`,;])//")
 
 
 def _valid_bound(value: object) -> bool:
@@ -177,7 +179,17 @@ def _validated_safe_authority(parsed: SplitResult, authority: str) -> str | None
 
 def _redact_standard_url(value: str) -> str:
     parsed = urlsplit(value)
-    if not _SCHEME.fullmatch(parsed.scheme) or not parsed.netloc:
+    scheme_relative = value.startswith("//")
+    if (
+        not parsed.netloc
+        or (scheme_relative and parsed.scheme)
+        or (not scheme_relative and not _SCHEME.fullmatch(parsed.scheme))
+    ):
+        return REDACTED_URL
+    if not scheme_relative and (
+        _scheme_relative_reference_signals(parsed.path)
+        or _scheme_relative_reference_signals(parsed.query)
+    ):
         return REDACTED_URL
     safe_authority = _validated_safe_authority(parsed, parsed.netloc)
     if safe_authority is None:
@@ -186,7 +198,8 @@ def _redact_standard_url(value: str) -> str:
     without_fragment = value.split("#", 1)[0]
     had_query_delimiter = "?" in without_fragment
     suffix = f"?{safe_query}" if had_query_delimiter else ""
-    return f"{parsed.scheme}://{safe_authority}{parsed.path}{suffix}"
+    prefix = "//" if scheme_relative else f"{parsed.scheme}://"
+    return f"{prefix}{safe_authority}{parsed.path}{suffix}"
 
 
 def _valid_scp_host(host: str) -> bool:
@@ -260,6 +273,55 @@ def _hierarchical_suffix_after_authority(value: str) -> str:
     return value[suffix_start:]
 
 
+def _scheme_relative_suffix_after_authority(value: str) -> str:
+    index = 2
+    while index < len(value) and value[index] not in "/?#":
+        index += 1
+    return value[index:]
+
+
+def _scan_scheme_relative_references(value: str) -> tuple[int, int | None]:
+    signals = 0
+    first_start: int | None = None
+    index = 0
+    while index + 1 < len(value):
+        if value[index] != "/" or value[index + 1] != "/":
+            index += 1
+            continue
+        start = index
+        index += 2
+        if start > 0 and value[start - 1] == ":":
+            continue
+        if (
+            start > 0
+            and not value[start - 1].isspace()
+            and value[start - 1] not in _SCHEME_RELATIVE_BOUNDARIES
+        ):
+            continue
+        authority_start = index
+        if authority_start >= len(value):
+            continue
+        authority_end = authority_start
+        while (
+            authority_end < len(value)
+            and not value[authority_end].isspace()
+            and value[authority_end] not in "/?#"
+        ):
+            authority_end += 1
+        authority = value[authority_start:authority_end]
+        ended_at_reference_delimiter = authority_end < len(value) and value[authority_end] in "/?#"
+        if authority and (ended_at_reference_delimiter or "@" in authority):
+            signals += 1
+            if first_start is None:
+                first_start = start
+    return signals, first_start
+
+
+def _scheme_relative_reference_signals(value: str) -> int:
+    """Count bounded `//authority` references without treating `a//b` as one."""
+    return _scan_scheme_relative_references(value)[0]
+
+
 def _detach_trailing_prose_punctuation(
     value: str,
     opener: str | None,
@@ -280,17 +342,31 @@ def redact_url(value: str, *, max_characters: int = MAX_REDACTION_CHARACTERS) ->
         return REDACTED_URL
     if len(value) > max_characters:
         return REDACTED_URL
-    is_hierarchical_uri = "://" in value
+    scheme_relative_signals = _scheme_relative_reference_signals(value)
+    is_scheme_relative = value.startswith("//") and scheme_relative_signals > 0
+    if scheme_relative_signals and not is_scheme_relative:
+        return REDACTED_URL
+    if is_scheme_relative and scheme_relative_signals > 1:
+        return REDACTED_URL
+    is_absolute_hierarchical_uri = "://" in value
+    is_hierarchical_uri = is_absolute_hierarchical_uri or is_scheme_relative
     suspicious = is_hierarchical_uri or _looks_like_scp_git(value)
     if not suspicious:
         return value
-    if is_hierarchical_uri:
+    if is_scheme_relative and (
+        is_absolute_hierarchical_uri
+        or _looks_like_scp_git(_scheme_relative_suffix_after_authority(value))
+    ):
+        return REDACTED_URL
+    if is_absolute_hierarchical_uri:
         first_marker = value.find("://")
         if value.find("://", first_marker + 3) >= 0 or _looks_like_scp_git(
             _hierarchical_suffix_after_authority(value)
         ):
             return REDACTED_URL
-    elif "#" in value and not _looks_like_scp_git(value.split("#", 1)[0]):
+    elif (
+        not is_hierarchical_uri and "#" in value and not _looks_like_scp_git(value.split("#", 1)[0])
+    ):
         return REDACTED_URL
     if (
         _CONTROL_CHARACTER.search(value)
@@ -367,6 +443,10 @@ def _scp_signals_in_token(token: str, first_marker: int) -> int:
     if "@" not in token or ":" not in token:
         return 0
     if first_marker < 0:
+        relative_signals, relative_start = _scan_scheme_relative_references(token)
+        if relative_signals and relative_start is not None:
+            suffix = _scheme_relative_suffix_after_authority(token[relative_start:])
+            return suffix.count("@") if _looks_like_scp_git(suffix) else 0
         return token.count("@") if _looks_like_scp_git(token) else 0
 
     signals = 0
@@ -391,8 +471,15 @@ def _scp_signals_in_token(token: str, first_marker: int) -> int:
 def _simple_redact_token(token: str, *, max_candidates: int) -> _TokenRedactionResult:
     marker_count = token.count("://")
     first_marker = token.find("://")
+    if first_marker >= 0:
+        scheme_relative_signals = _scheme_relative_reference_signals(token[:first_marker])
+        scheme_relative_signals += _scheme_relative_reference_signals(
+            _hierarchical_suffix_after_authority(token)
+        )
+    else:
+        scheme_relative_signals = _scheme_relative_reference_signals(token)
     scp_signals = _scp_signals_in_token(token, first_marker)
-    signals = marker_count + scp_signals
+    signals = marker_count + scheme_relative_signals + scp_signals
     if signals == 0:
         return _TokenRedactionResult(token, 0, True)
     if signals > max_candidates:
@@ -489,7 +576,17 @@ def redact_text_result(
             candidates=0,
             reason=TextRedactionIncompleteReason.CHARACTER_LIMIT,
         )
-    if "://" not in value and ("@" not in value or ":" not in value):
+    might_have_scheme_relative_reference = (
+        "//" in value and _SCHEME_RELATIVE_START.search(value) is not None
+    )
+    has_scheme_relative_reference = might_have_scheme_relative_reference and bool(
+        _scheme_relative_reference_signals(value)
+    )
+    if (
+        "://" not in value
+        and not has_scheme_relative_reference
+        and ("@" not in value or ":" not in value)
+    ):
         return TextRedactionResult(
             value=value,
             complete=True,

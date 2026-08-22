@@ -237,6 +237,94 @@ def test_valid_ipv6_http_and_git_urls_preserve_safe_authority_and_path(
     assert api.redact_url(raw) == expected
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "//user:scheme-relative-secret@packages.example.invalid/private#private-fragment",
+            "//REDACTED@packages.example.invalid/private",
+        ),
+        (
+            "//packages.example.invalid/private?token=scheme-relative-query-secret&channel=stable",
+            "//packages.example.invalid/private?token=REDACTED&channel=stable",
+        ),
+        (
+            "//user:scheme-relative-ipv6-secret@[2001:db8::1]:8443/private",
+            "//REDACTED@[2001:db8::1]:8443/private",
+        ),
+        (
+            "//[2001:db8::1]:8443/private?channel=stable",
+            "//[2001:db8::1]:8443/private?channel=stable",
+        ),
+    ],
+)
+def test_scheme_relative_urls_sanitize_authority_query_and_fragment(
+    raw: str,
+    expected: str,
+) -> None:
+    api = _api()
+
+    redacted = api.redact_url(raw)
+
+    assert redacted == expected
+    assert api.redact_url(redacted) == redacted
+    assert "secret" not in redacted
+    assert "fragment" not in redacted
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "//user:scheme-relative-port-secret@packages.example.invalid:/private",
+        "//user:scheme-relative-bracket-secret@[not-ipv6]/private",
+        "//first:scheme-relative-at-secret@second@packages.example.invalid/private",
+        "//user:scheme-relative-host-secret@/private",
+    ],
+)
+def test_malformed_scheme_relative_authorities_fail_closed(raw: str) -> None:
+    api = _api()
+
+    redacted = api.redact_url(raw)
+
+    assert redacted == api.REDACTED_URL
+    assert "secret" not in redacted
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "https://safe.invalid/?next=//user:nested-relative-secret@evil.invalid/x",
+        "https://safe.invalid//user:nested-path-secret@evil.invalid/x",
+        "https://safe.invalid/?next=//evil.invalid/x?token=nested-query-secret",
+    ],
+)
+def test_nested_scheme_relative_references_make_outer_urls_fail_closed(raw: str) -> None:
+    api = _api()
+
+    redacted = api.redact_url(raw)
+
+    assert redacted == api.REDACTED_URL
+    assert "secret" not in redacted
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "//safe.invalid/path?next=https://user:nested-absolute-secret@evil.invalid/x",
+        "//safe.invalid/path?next=user:nested-scp-secret@evil.invalid:repo.git",
+    ],
+)
+def test_scheme_relative_outer_references_reject_nested_credential_candidates(
+    raw: str,
+) -> None:
+    api = _api()
+
+    redacted = api.redact_url(raw)
+
+    assert redacted == api.REDACTED_URL
+    assert "secret" not in redacted
+
+
 def test_cargo_sparse_url_preserves_safe_scheme_host_and_path() -> None:
     api = _api()
     raw = "sparse+https://user:sparse-secret@packages.example.invalid/index/"
@@ -804,6 +892,77 @@ def test_angle_bracket_prose_wrapper_is_preserved_around_a_sanitized_url() -> No
     ("text", "expected"),
     [
         (
+            "Use //user:relative-prose-secret@packages.example.invalid/private now.",
+            "Use //REDACTED@packages.example.invalid/private now.",
+        ),
+        (
+            "Use (//user:relative-wrapper-secret@packages.example.invalid/private), now.",
+            "Use (//REDACTED@packages.example.invalid/private), now.",
+        ),
+    ],
+)
+def test_embedded_scheme_relative_references_are_sanitized_with_simple_wrappers(
+    text: str,
+    expected: str,
+) -> None:
+    api = _api()
+
+    redacted = api.redact_text(text)
+
+    assert redacted == expected
+    assert api.redact_text(redacted) == redacted
+    assert "secret" not in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "Use //packages.example.invalid/private?token=relative-query-prose-secret now.",
+            "Use //packages.example.invalid/private?token=REDACTED now.",
+        ),
+        (
+            "before\n//packages.example.invalid/private?token=relative-query-line-secret\nafter",
+            "before\n//packages.example.invalid/private?token=REDACTED\nafter",
+        ),
+    ],
+)
+def test_embedded_query_only_scheme_relative_references_cross_whitespace_boundaries(
+    text: str,
+    expected: str,
+) -> None:
+    api = _api()
+
+    redacted = api.redact_text(text)
+
+    assert redacted == expected
+    assert "secret" not in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x=//user:relative-assignment-secret@packages.example.invalid/private",
+        'href="//user:relative-attribute-secret@packages.example.invalid/private"',
+        '<a href="//user:relative-markup-secret@packages.example.invalid/private">link</a>',
+    ],
+)
+def test_ambiguous_scheme_relative_assignment_and_markup_tokens_are_masked(
+    text: str,
+) -> None:
+    api = _api()
+
+    redacted = api.redact_text(text)
+
+    assert api.REDACTED_URL in redacted
+    assert "secret" not in redacted
+    assert api.redact_text(redacted) == redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
             "Use 'scp-wrapper-secret@git.example.invalid:repo.git' now.",
             "Use 'REDACTED@git.example.invalid:repo.git' now.",
         ),
@@ -960,6 +1119,25 @@ class _CopyCountingString(str):
         return result
 
 
+class _FindSpanCountingString(str):
+    requested_characters: int
+
+    def __new__(cls, value: str) -> _FindSpanCountingString:
+        instance = super().__new__(cls, value)
+        instance.requested_characters = 0
+        return instance
+
+    def find(
+        self,
+        sub: str,
+        start: int = 0,
+        end: int | None = None,
+    ) -> int:
+        limit = len(self) if end is None else min(end, len(self))
+        self.requested_characters += max(0, limit - start)
+        return super().find(sub, start, len(self) if end is None else end)
+
+
 def test_trailing_punctuation_is_detached_without_repeated_suffix_copying() -> None:
     api = _api()
     value = _CopyCountingString("https://host.invalid/path" + ("." * 1_000))
@@ -969,6 +1147,14 @@ def test_trailing_punctuation_is_detached_without_repeated_suffix_copying() -> N
     assert candidate == "https://host.invalid/path"
     assert punctuation == "." * 1_000
     assert getattr(punctuation, "copied_characters", 0) <= len(value) * 2
+
+
+def test_scheme_relative_signal_discovery_does_not_rescan_dense_suffixes() -> None:
+    api = _api()
+    value = _FindSpanCountingString(",".join(["x=//user@host.invalid"] * 200))
+
+    assert api._scheme_relative_reference_signals(value) == 200
+    assert value.requested_characters <= len(value) * 4
 
 
 def test_text_redaction_fails_closed_when_candidate_or_character_bound_is_exhausted() -> None:
@@ -1005,6 +1191,112 @@ def test_candidate_signal_budget_has_exact_one_over_and_zero_behavior() -> None:
         f"https://REDACTED@one.invalid/x {api.REDACTED_REMAINDER}"
     )
     assert api.redact_text(text, max_candidates=0) == api.REDACTED_REMAINDER
+
+
+def test_scheme_relative_candidates_have_exact_budget_usage_without_double_charging() -> None:
+    api = _api()
+    text = (
+        "//user:first-relative-budget-secret@one.invalid/x "
+        "https://user:absolute-budget-secret@two.invalid/y "
+        "//three.invalid/z?token=third-relative-budget-secret"
+    )
+
+    exact = api.redact_text_result(text, max_candidates=3)
+    one_over = api.redact_text_result(text, max_candidates=2)
+    zero = api.redact_text_result(text, max_candidates=0)
+
+    assert exact == api.TextRedactionResult(
+        value=(
+            "//REDACTED@one.invalid/x https://REDACTED@two.invalid/y "
+            "//three.invalid/z?token=REDACTED"
+        ),
+        complete=True,
+        candidates=3,
+        reason=None,
+    )
+    assert one_over == api.TextRedactionResult(
+        value=(f"//REDACTED@one.invalid/x https://REDACTED@two.invalid/y {api.REDACTED_REMAINDER}"),
+        complete=False,
+        candidates=2,
+        reason=api.TextRedactionIncompleteReason.CANDIDATE_LIMIT,
+    )
+    assert zero == api.TextRedactionResult(
+        value=api.REDACTED_REMAINDER,
+        complete=False,
+        candidates=0,
+        reason=api.TextRedactionIncompleteReason.CANDIDATE_LIMIT,
+    )
+
+
+def test_scheme_relative_ipv6_userinfo_is_one_candidate_not_an_scp_candidate() -> None:
+    api = _api()
+    text = "//user:relative-ipv6-budget-secret@[2001:db8::1]:8443/private"
+
+    assert api.redact_text_result(text, max_candidates=1) == api.TextRedactionResult(
+        value="//REDACTED@[2001:db8::1]:8443/private",
+        complete=True,
+        candidates=1,
+        reason=None,
+    )
+    assert api.redact_text(text, max_candidates=0) == api.REDACTED_REMAINDER
+
+
+def test_interior_double_slash_prefix_does_not_double_charge_a_later_relative_ipv6() -> None:
+    api = _api()
+    text = "a//b,x=//user:relative-ipv6-prefix-secret@[2001:db8::1]:8443/private"
+
+    result = api.redact_text_result(text, max_candidates=1)
+
+    assert result == api.TextRedactionResult(
+        value=api.REDACTED_URL,
+        complete=True,
+        candidates=1,
+        reason=None,
+    )
+    assert "secret" not in result.value
+
+
+def test_non_reference_double_slashes_remain_on_the_benign_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _api()
+    text = "Keep //path, src/a//b.py, and // comment text unchanged."
+
+    def unexpected_scan(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("candidate scanner should not run without a hierarchical reference")
+
+    monkeypatch.setattr(api, "_redact_text_with_usage", unexpected_scan)
+
+    assert api.redact_text_result(text) == api.TextRedactionResult(
+        value=text,
+        complete=True,
+        candidates=0,
+        reason=None,
+    )
+
+
+def test_large_interior_double_slash_text_stays_bounded_and_off_the_candidate_scanner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _api()
+    text = " ".join(["src/a//b.py"] * 50_000)
+
+    def unexpected_scan(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("candidate scanner should not run for interior double slashes")
+
+    def unexpected_relative_scan(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("Python relative-reference scan should not run for interior double slashes")
+
+    monkeypatch.setattr(api, "_redact_text_with_usage", unexpected_scan)
+    monkeypatch.setattr(api, "_scan_scheme_relative_references", unexpected_relative_scan)
+    started = perf_counter()
+    result = api.redact_text_result(text)
+    elapsed = perf_counter() - started
+
+    assert result.value is text
+    assert result.complete is True
+    assert result.candidates == 0
+    assert elapsed < 2.0
 
 
 def test_structured_text_result_distinguishes_literal_placeholder_from_exhaustion() -> None:
