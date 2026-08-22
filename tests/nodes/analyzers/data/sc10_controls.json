@@ -4,7 +4,7 @@
   "rows": [
     {
       "id": "control-pip-global-index",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -17,7 +17,7 @@
           "surface": "pip config",
           "operation": "replace",
           "scope": "global",
-          "destination": "https://evil.example.invalid/simple",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pip.conf",
           "start_line": 2
@@ -26,7 +26,7 @@
     },
     {
       "id": "control-pip-install-index",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -38,8 +38,8 @@
           "ecosystem": "pip",
           "surface": "pip config",
           "operation": "replace",
-          "scope": "install",
-          "destination": "https://evil.example.invalid/simple",
+          "scope": "command",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pip.conf",
           "start_line": 2
@@ -114,7 +114,7 @@
     },
     {
       "id": "control-npmrc-registry",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -136,7 +136,7 @@
     },
     {
       "id": "control-npmrc-spaced-assignment",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -158,7 +158,7 @@
     },
     {
       "id": "control-npmrc-scoped-registry",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -170,7 +170,7 @@
           "ecosystem": "npm",
           "surface": ".npmrc",
           "operation": "replace",
-          "scope": "@acme",
+          "scope": "scoped",
           "destination": "https://packages.example.invalid/",
           "destination_status": "resolved",
           "file": ".npmrc",
@@ -180,7 +180,7 @@
     },
     {
       "id": "control-npmrc-canonical-with-slash",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "inert",
       "files": {
@@ -190,7 +190,7 @@
     },
     {
       "id": "control-npmrc-canonical-without-slash",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "inert",
       "files": {
@@ -200,7 +200,7 @@
     },
     {
       "id": "control-npmrc-canonical-with-comment",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "inert",
       "files": {
@@ -210,7 +210,7 @@
     },
     {
       "id": "control-npmrc-auth-token-only",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "inert",
       "files": {
@@ -230,7 +230,7 @@
     },
     {
       "id": "control-npmrc-quoted-canonical-registry",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "inert",
       "files": {
@@ -240,7 +240,7 @@
     },
     {
       "id": "control-npmrc-nested-path",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -262,7 +262,7 @@
     },
     {
       "id": "control-npmrc-hidden-parent",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -284,7 +284,7 @@
     },
     {
       "id": "control-pip-basic-index",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -297,7 +297,7 @@
           "surface": "pip config",
           "operation": "replace",
           "scope": "global",
-          "destination": "https://packages.example.invalid/simple",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pip.conf",
           "start_line": 2
@@ -306,7 +306,7 @@
     },
     {
       "id": "control-pip-extra-index",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -318,8 +318,8 @@
           "ecosystem": "pip",
           "surface": "pip config",
           "operation": "add",
-          "scope": "install",
-          "destination": "https://packages.example.invalid/simple",
+          "scope": "command",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pip.conf",
           "start_line": 2
@@ -328,7 +328,7 @@
     },
     {
       "id": "control-pip-canonical-index",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "inert",
       "files": {
@@ -338,7 +338,7 @@
     },
     {
       "id": "control-pip-ini-index",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -351,7 +351,7 @@
           "surface": "pip config",
           "operation": "replace",
           "scope": "global",
-          "destination": "https://packages.example.invalid/simple",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pip.ini",
           "start_line": 2

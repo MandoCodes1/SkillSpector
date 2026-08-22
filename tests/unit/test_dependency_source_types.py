@@ -162,6 +162,21 @@ def test_dependency_ecosystem_has_fixed_pr2_parser_categories(
 
 
 @pytest.mark.parametrize(
+    ("value", "member_name"),
+    [(".npmrc", "NPMRC"), ("pip config", "PIP_CONFIG")],
+)
+def test_dependency_surface_has_fixed_direct_config_categories(
+    value: str,
+    member_name: str,
+) -> None:
+    api = _api()
+
+    member = getattr(api.DependencySourceSurface, member_name)
+
+    assert api.DependencySourceSurface(value) is member
+
+
+@pytest.mark.parametrize(
     "raw_destination",
     [
         "token=type-boundary-secret",

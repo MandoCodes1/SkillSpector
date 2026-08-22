@@ -57,6 +57,8 @@ class DependencyEcosystem(StrEnum):
 class DependencySourceSurface(StrEnum):
     """Coarse code-owned surface where a dependency source was declared."""
 
+    NPMRC = ".npmrc"
+    PIP_CONFIG = "pip config"
     SOURCE = "source"
     REPOSITORY = "repository"
     MIRROR = "mirror"

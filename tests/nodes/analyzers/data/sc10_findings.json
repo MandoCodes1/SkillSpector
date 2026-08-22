@@ -4,7 +4,7 @@
   "rows": [
     {
       "id": "pipconf-colon-delimiter",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -17,7 +17,7 @@
           "surface": "pip config",
           "operation": "replace",
           "scope": "global",
-          "destination": "https://evil.example.invalid/simple",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pip.conf",
           "start_line": 2
@@ -26,7 +26,7 @@
     },
     {
       "id": "pip-conf-colon-delimiter",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -39,7 +39,7 @@
           "surface": "pip config",
           "operation": "replace",
           "scope": "global",
-          "destination": "https://packages.example.invalid/simple",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pip.conf",
           "start_line": 2
@@ -48,7 +48,7 @@
     },
     {
       "id": "pip-conf-multiline-continuation",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -61,7 +61,7 @@
           "surface": "pip config",
           "operation": "add",
           "scope": "global",
-          "destination": "https://packages.example.invalid/simple",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pip.conf",
           "start_line": 3
@@ -70,7 +70,7 @@
     },
     {
       "id": "pip-conf-continuation-drops-extra-urls",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -83,7 +83,7 @@
           "surface": "pip config",
           "operation": "add",
           "scope": "global",
-          "destination": "https://a.example.invalid/simple",
+          "destination": "https://a.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pip.conf",
           "start_line": 2
@@ -94,7 +94,7 @@
           "surface": "pip config",
           "operation": "add",
           "scope": "global",
-          "destination": "https://b.example.invalid/simple",
+          "destination": "https://b.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pip.conf",
           "start_line": 3
@@ -103,7 +103,7 @@
     },
     {
       "id": "pip-conf-multi-url-single-line",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -116,7 +116,7 @@
           "surface": "pip config",
           "operation": "add",
           "scope": "global",
-          "destination": "https://a.example.invalid/simple",
+          "destination": "https://a.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pip.conf",
           "start_line": 2
@@ -127,7 +127,7 @@
           "surface": "pip config",
           "operation": "add",
           "scope": "global",
-          "destination": "https://b.example.invalid/simple",
+          "destination": "https://b.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pip.conf",
           "start_line": 2
@@ -301,7 +301,7 @@
     },
     {
       "id": "npmrc-semicolon-inline-comment",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "inert",
       "files": {

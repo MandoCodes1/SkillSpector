@@ -13,6 +13,9 @@ from typing import Any
 
 import pytest
 
+from skillspector.artifacts import classify_artifact
+from skillspector.dependency_source_types import DependencyWorkBudget
+
 DATA_DIR = Path(__file__).with_name("data")
 DATA_FILES = (DATA_DIR / "sc10_findings.json", DATA_DIR / "sc10_controls.json")
 STATUS_VALUES = {"fixed", "unfixed", "deferred"}
@@ -147,7 +150,7 @@ def test_corpus_schema_and_self_checks() -> None:
         path, content = next(iter(row["files"].items()))
         assert isinstance(path, str) and path
         assert isinstance(content, str)
-        physical_line_count = len(content.splitlines())
+        physical_line_count = max(1, content.encode("utf-8").count(b"\n") + 1)
         assert physical_line_count >= 1
         file_inputs.append((path, content))
         assert isinstance(row["expected_sc10"], list)
@@ -177,7 +180,10 @@ def test_corpus_schema_and_self_checks() -> None:
             assert set(row["expected_limitation"]) == {"reason", "path", "range"}
             assert isinstance(row["expected_limitation"]["reason"], str)
             assert row["expected_limitation"]["reason"]
-            assert row["expected_limitation"]["reason"] == "unscanned_executable_content"
+            assert row["expected_limitation"]["reason"] in {
+                "dependency_source_parse_incomplete",
+                "unscanned_executable_content",
+            }
             assert isinstance(row["expected_limitation"]["path"], str)
             assert row["expected_limitation"]["path"]
             assert row["expected_limitation"]["path"] == path
@@ -200,7 +206,14 @@ def test_dependency_source_behavior(row: dict[str, Any]) -> None:
         pytest.fail(f"real dependency-source analyzer is unavailable: {exc}")
 
     files = row["files"]
-    analysis = analyze_dependency_sources(sorted(files), files, [])
+    raw_files = {path: content.encode("utf-8") for path, content in files.items()}
+    analysis = analyze_dependency_sources(
+        components=sorted(files),
+        local_file_cache=files,
+        raw_file_cache=raw_files,
+        artifact_inventory=[classify_artifact(path, raw_files[path]) for path in sorted(raw_files)],
+        budget=DependencyWorkBudget(),
+    )
     findings = list(getattr(analysis, "findings", analysis))
     limitations = list(getattr(analysis, "limitations", []))
     actual_sc10 = [
@@ -213,3 +226,4 @@ def test_dependency_source_behavior(row: dict[str, Any]) -> None:
     actual_limitations = [_normalized_limitation(item) for item in limitations]
     assert len(actual_limitations) == len(expected_limitations)
     assert _multiset(actual_limitations) == _multiset(expected_limitations)
+    assert row["status"] == "fixed", "unimplemented corpus rows remain explicit red gates"
