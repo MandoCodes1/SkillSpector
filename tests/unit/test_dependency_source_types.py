@@ -169,6 +169,29 @@ def test_source_change_rejects_raw_destination_redaction_bypasses(
     [
         "//user:scheme-relative-source-secret@packages.example.invalid/private",
         "//packages.example.invalid/private?token=scheme-relative-source-secret",
+        "//?token=scheme-relative-source-secret",
+        "// /x?token=scheme-relative-source-secret",
+        "// user:scheme-relative-source-secret@packages.example.invalid/private",
+        "// user:scheme-relative-source-secret%40packages.example.invalid/private",
+        "// user%3Ascheme-relative-source-secret%40packages.example.invalid/private",
+        "// token=scheme-relative-source-secret@packages.example.invalid",
+        "// token%3Dscheme-relative-source-secret%40packages.example.invalid",
+        "// scheme-relative-source-secret@packages.example.invalid:8443",
+        "// scheme-relative-source-secret@[2001:db8::1]",
+        "//: user:scheme-relative-source-secret@packages.example.invalid/private",
+        "//: user:scheme-relative-source-secret%40packages.example.invalid/private",
+        "//? /x?token=scheme-relative-source-secret",
+        "/// /x?token=scheme-relative-source-secret",
+        "//; user:scheme-relative-source-secret@packages.example.invalid/private",
+        "x//user:ambiguous-source-secret@packages.example.invalid/private",
+        "x//packages.example.invalid/private#ambiguous-source-secret",
+        "x//packages.example.invalid/private?token=ambiguous-source-secret",
+        "x//user:ambiguous-source-secret%40packages.example.invalid/private",
+        "x?next=a//evil.invalid/path&token=ambiguous-source-secret",
+        "https://safe.invalid/path?next=x//user:nested-source-secret@evil.invalid/x",
+        "https://safe.invalid/path?next=x//user:nested-source-secret%40evil.invalid/x",
+        "https://safe.invalid/a//user:nested-source-secret@evil.invalid/x",
+        "//safe.invalid/path?next=x//user:nested-source-secret@evil.invalid/x",
     ],
 )
 def test_source_change_rejects_raw_scheme_relative_credentials(
@@ -193,14 +216,33 @@ def test_source_change_rejects_raw_scheme_relative_credentials(
 @pytest.mark.parametrize(
     "destination",
     [
-        "//REDACTED@packages.example.invalid/private",
-        "//packages.example.invalid/private?token=REDACTED",
+        "[REDACTED_URL]",
+        "//packages.example.invalid/private?channel=stable",
+        "https://safe.invalid/a//b/c?channel=dev@example.invalid",
+        "https://safe.invalid/a//b/c?scope=%40org",
     ],
 )
 def test_source_change_accepts_sanitized_scheme_relative_destinations(
     destination: str,
 ) -> None:
     api = _api()
+
+    change = api.SourceChange(
+        ecosystem="npm",
+        surface="npm config",
+        operation="replace",
+        scope="global",
+        destination=destination,
+        destination_status=api.DestinationStatus.RESOLVED,
+        span=_span(api),
+    )
+
+    assert change.destination == destination
+
+
+def test_source_change_accepts_interior_double_slash_as_non_reference_syntax() -> None:
+    api = _api()
+    destination = "src/a//b.py"
 
     change = api.SourceChange(
         ecosystem="npm",

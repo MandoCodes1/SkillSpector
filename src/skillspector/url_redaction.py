@@ -56,6 +56,7 @@ _PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 _ENCODED_UNSAFE_AUTHORITY_CHARACTER = re.compile(
     r"%(?:0[0-9A-Fa-f]|1[0-9A-Fa-f]|20|23|2[fF]|3[aAfF]|40|5[bBcCdD]|7[fF])"
 )
+_ENCODED_AT_SIGN = re.compile(r"%40", re.IGNORECASE)
 _SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*$")
 _SCP_URL = re.compile(
     r"^(?P<user>[^@/:\\\s]+)@"
@@ -73,8 +74,7 @@ _PAIRED_CLOSERS: Final = {
     "`": "`",
 }
 _SENTENCE_PUNCTUATION: Final = frozenset(".,")
-_SCHEME_RELATIVE_BOUNDARIES: Final = frozenset("=([{<\"'`,;")
-_SCHEME_RELATIVE_START = re.compile(r"(?:^|[\s=\(\[\{<\"'`,;])//")
+_SCHEME_RELATIVE_TOKEN_START = re.compile(r"(?:^|\s)[\(\[\{<\"'`]?//")
 
 
 def _valid_bound(value: object) -> bool:
@@ -100,6 +100,63 @@ def _query_key_is_sensitive(raw_key: str) -> bool:
         raise ValueError("query key is ambiguous")
     folded = decoded.casefold()
     return any(term in folded for term in _CREDENTIAL_WORDS)
+
+
+def _query_has_sensitive_key(raw_query: str) -> bool:
+    cursor = 0
+    for delimiter in re.finditer(r"[&;]", raw_query):
+        raw_key, separator, _ = raw_query[cursor : delimiter.start()].partition("=")
+        try:
+            if separator and _query_key_is_sensitive(raw_key):
+                return True
+        except ValueError:
+            return True
+        cursor = delimiter.end()
+    raw_key, separator, _ = raw_query[cursor:].partition("=")
+    try:
+        return bool(separator and _query_key_is_sensitive(raw_key))
+    except ValueError:
+        return True
+
+
+def _query_has_nested_reference(raw_query: str) -> bool:
+    cursor = 0
+    for delimiter in re.finditer(r"[&;]", raw_query):
+        raw_part = raw_query[cursor : delimiter.start()]
+        raw_key, separator, raw_value = raw_part.partition("=")
+        candidate = raw_value if separator else raw_key
+        if candidate.startswith("//") or _has_ambiguous_interior_double_slash(candidate):
+            return True
+        cursor = delimiter.end()
+    raw_key, separator, raw_value = raw_query[cursor:].partition("=")
+    candidate = raw_value if separator else raw_key
+    return candidate.startswith("//") or _has_ambiguous_interior_double_slash(candidate)
+
+
+def _double_slash_tail_has_credential_shape(
+    value: str,
+    marker: int,
+    raw_query: str,
+) -> bool:
+    suffix = value[marker + 2 :]
+    return bool(
+        "@" in suffix
+        or "#" in suffix
+        or _ENCODED_AT_SIGN.search(suffix)
+        or (raw_query and _query_has_sensitive_key(raw_query))
+    )
+
+
+def _has_ambiguous_interior_double_slash(value: str) -> bool:
+    marker = value.find("//")
+    if marker <= 0 or "://" in value:
+        return False
+    _, separator, raw_query = value.partition("?")
+    return _double_slash_tail_has_credential_shape(
+        value,
+        marker,
+        raw_query if separator else "",
+    )
 
 
 def _redact_query(raw_query: str) -> str:
@@ -178,19 +235,22 @@ def _validated_safe_authority(parsed: SplitResult, authority: str) -> str | None
 
 
 def _redact_standard_url(value: str) -> str:
-    parsed = urlsplit(value)
-    scheme_relative = value.startswith("//")
-    if (
-        not parsed.netloc
-        or (scheme_relative and parsed.scheme)
-        or (not scheme_relative and not _SCHEME.fullmatch(parsed.scheme))
-    ):
+    try:
+        parsed = urlsplit(value)
+    except (UnicodeError, ValueError):
         return REDACTED_URL
-    if not scheme_relative and (
-        _scheme_relative_reference_signals(parsed.path)
-        or _scheme_relative_reference_signals(parsed.query)
-    ):
+    if not _SCHEME.fullmatch(parsed.scheme) or not parsed.netloc:
         return REDACTED_URL
+    if _query_has_nested_reference(parsed.query):
+        return REDACTED_URL
+    interior_marker = parsed.path.find("//")
+    if interior_marker >= 0:
+        if parsed.fragment or _double_slash_tail_has_credential_shape(
+            parsed.path,
+            interior_marker,
+            "",
+        ):
+            return REDACTED_URL
     safe_authority = _validated_safe_authority(parsed, parsed.netloc)
     if safe_authority is None:
         return REDACTED_URL
@@ -198,8 +258,52 @@ def _redact_standard_url(value: str) -> str:
     without_fragment = value.split("#", 1)[0]
     had_query_delimiter = "?" in without_fragment
     suffix = f"?{safe_query}" if had_query_delimiter else ""
-    prefix = "//" if scheme_relative else f"{parsed.scheme}://"
-    return f"{prefix}{safe_authority}{parsed.path}{suffix}"
+    return f"{parsed.scheme}://{safe_authority}{parsed.path}{suffix}"
+
+
+def _validated_scheme_relative_reference(
+    value: str,
+) -> tuple[SplitResult, str] | None:
+    if (
+        len(value) <= 2
+        or _CONTROL_CHARACTER.search(value)
+        or any(character.isspace() for character in value)
+        or _UNSAFE_URI_CHARACTER.search(value)
+        or _has_ambiguous_percent_escape(value)
+    ):
+        return None
+    try:
+        parsed = urlsplit(value)
+    except (UnicodeError, ValueError):
+        return None
+    if parsed.scheme or not parsed.netloc or "#" in value:
+        return None
+    safe_authority = _validated_safe_authority(parsed, parsed.netloc)
+    if safe_authority is None or not any(
+        character.isalnum() for character in (parsed.hostname or "")
+    ):
+        return None
+    return parsed, safe_authority
+
+
+def _redact_scheme_relative_reference(value: str) -> str:
+    validated = _validated_scheme_relative_reference(value)
+    if validated is None:
+        return REDACTED_URL
+    parsed, safe_authority = validated
+    if safe_authority != parsed.netloc:
+        return REDACTED_URL
+    if (
+        _query_has_sensitive_key(parsed.query)
+        or _query_has_nested_reference(parsed.query)
+        or "://" in parsed.path
+        or "://" in parsed.query
+        or "//" in parsed.path
+        or _looks_like_scp_git(parsed.path)
+        or _looks_like_scp_git(parsed.query)
+    ):
+        return REDACTED_URL
+    return value
 
 
 def _valid_scp_host(host: str) -> bool:
@@ -273,55 +377,6 @@ def _hierarchical_suffix_after_authority(value: str) -> str:
     return value[suffix_start:]
 
 
-def _scheme_relative_suffix_after_authority(value: str) -> str:
-    index = 2
-    while index < len(value) and value[index] not in "/?#":
-        index += 1
-    return value[index:]
-
-
-def _scan_scheme_relative_references(value: str) -> tuple[int, int | None]:
-    signals = 0
-    first_start: int | None = None
-    index = 0
-    while index + 1 < len(value):
-        if value[index] != "/" or value[index + 1] != "/":
-            index += 1
-            continue
-        start = index
-        index += 2
-        if start > 0 and value[start - 1] == ":":
-            continue
-        if (
-            start > 0
-            and not value[start - 1].isspace()
-            and value[start - 1] not in _SCHEME_RELATIVE_BOUNDARIES
-        ):
-            continue
-        authority_start = index
-        if authority_start >= len(value):
-            continue
-        authority_end = authority_start
-        while (
-            authority_end < len(value)
-            and not value[authority_end].isspace()
-            and value[authority_end] not in "/?#"
-        ):
-            authority_end += 1
-        authority = value[authority_start:authority_end]
-        ended_at_reference_delimiter = authority_end < len(value) and value[authority_end] in "/?#"
-        if authority and (ended_at_reference_delimiter or "@" in authority):
-            signals += 1
-            if first_start is None:
-                first_start = start
-    return signals, first_start
-
-
-def _scheme_relative_reference_signals(value: str) -> int:
-    """Count bounded `//authority` references without treating `a//b` as one."""
-    return _scan_scheme_relative_references(value)[0]
-
-
 def _detach_trailing_prose_punctuation(
     value: str,
     opener: str | None,
@@ -342,31 +397,24 @@ def redact_url(value: str, *, max_characters: int = MAX_REDACTION_CHARACTERS) ->
         return REDACTED_URL
     if len(value) > max_characters:
         return REDACTED_URL
-    scheme_relative_signals = _scheme_relative_reference_signals(value)
-    is_scheme_relative = value.startswith("//") and scheme_relative_signals > 0
-    if scheme_relative_signals and not is_scheme_relative:
+    if value.startswith("//"):
+        try:
+            return _redact_scheme_relative_reference(value)
+        except Exception:
+            return REDACTED_URL
+    if _has_ambiguous_interior_double_slash(value):
         return REDACTED_URL
-    if is_scheme_relative and scheme_relative_signals > 1:
-        return REDACTED_URL
-    is_absolute_hierarchical_uri = "://" in value
-    is_hierarchical_uri = is_absolute_hierarchical_uri or is_scheme_relative
+    is_hierarchical_uri = "://" in value
     suspicious = is_hierarchical_uri or _looks_like_scp_git(value)
     if not suspicious:
         return value
-    if is_scheme_relative and (
-        is_absolute_hierarchical_uri
-        or _looks_like_scp_git(_scheme_relative_suffix_after_authority(value))
-    ):
-        return REDACTED_URL
-    if is_absolute_hierarchical_uri:
+    if is_hierarchical_uri:
         first_marker = value.find("://")
         if value.find("://", first_marker + 3) >= 0 or _looks_like_scp_git(
             _hierarchical_suffix_after_authority(value)
         ):
             return REDACTED_URL
-    elif (
-        not is_hierarchical_uri and "#" in value and not _looks_like_scp_git(value.split("#", 1)[0])
-    ):
+    elif "#" in value and not _looks_like_scp_git(value.split("#", 1)[0]):
         return REDACTED_URL
     if (
         _CONTROL_CHARACTER.search(value)
@@ -443,10 +491,6 @@ def _scp_signals_in_token(token: str, first_marker: int) -> int:
     if "@" not in token or ":" not in token:
         return 0
     if first_marker < 0:
-        relative_signals, relative_start = _scan_scheme_relative_references(token)
-        if relative_signals and relative_start is not None:
-            suffix = _scheme_relative_suffix_after_authority(token[relative_start:])
-            return suffix.count("@") if _looks_like_scp_git(suffix) else 0
         return token.count("@") if _looks_like_scp_git(token) else 0
 
     signals = 0
@@ -469,17 +513,14 @@ def _scp_signals_in_token(token: str, first_marker: int) -> int:
 
 
 def _simple_redact_token(token: str, *, max_candidates: int) -> _TokenRedactionResult:
-    marker_count = token.count("://")
-    first_marker = token.find("://")
-    if first_marker >= 0:
-        scheme_relative_signals = _scheme_relative_reference_signals(token[:first_marker])
-        scheme_relative_signals += _scheme_relative_reference_signals(
-            _hierarchical_suffix_after_authority(token)
-        )
+    opener, candidate, closer, punctuation = _simple_token_parts(token)
+    if candidate.startswith("//"):
+        signals = 1
+    elif _has_ambiguous_interior_double_slash(candidate):
+        signals = 1
     else:
-        scheme_relative_signals = _scheme_relative_reference_signals(token)
-    scp_signals = _scp_signals_in_token(token, first_marker)
-    signals = marker_count + scheme_relative_signals + scp_signals
+        first_marker = token.find("://")
+        signals = token.count("://") + _scp_signals_in_token(token, first_marker)
     if signals == 0:
         return _TokenRedactionResult(token, 0, True)
     if signals > max_candidates:
@@ -489,7 +530,6 @@ def _simple_redact_token(token: str, *, max_candidates: int) -> _TokenRedactionR
             False,
         )
 
-    opener, candidate, closer, punctuation = _simple_token_parts(token)
     sanitized = redact_url(candidate, max_characters=len(candidate))
     if sanitized == REDACTED_URL:
         return _TokenRedactionResult(f"{REDACTED_URL}{punctuation}", signals, True)
@@ -498,6 +538,43 @@ def _simple_redact_token(token: str, *, max_candidates: int) -> _TokenRedactionR
         signals,
         True,
     )
+
+
+def _next_token_has_credential_shape(value: str, start: int) -> bool:
+    index = start
+    while index < len(value) and value[index].isspace():
+        index += 1
+    token_start = index
+    while index < len(value) and not value[index].isspace():
+        index += 1
+    token = value[token_start:index]
+    if not token:
+        return False
+    at_sign = token.find("@")
+    colon = token.find(":")
+    if at_sign >= 0 and (
+        0 <= colon < at_sign
+        or "=" in token[:at_sign]
+        or any(delimiter in token[at_sign + 1 :] for delimiter in "/?#:[]")
+    ):
+        return True
+    encoded_at_sign = _ENCODED_AT_SIGN.search(token)
+    if encoded_at_sign is not None:
+        encoded_user = token[: encoded_at_sign.start()].casefold()
+        encoded_suffix = token[encoded_at_sign.end() :].casefold()
+        if (
+            ":" in encoded_user
+            or "%3a" in encoded_user
+            or "=" in encoded_user
+            or "%3d" in encoded_user
+            or any(delimiter in encoded_suffix for delimiter in "/?#:[]")
+            or any(delimiter in encoded_suffix for delimiter in ("%3a", "%5b", "%5d"))
+        ):
+            return True
+    if "#" in token:
+        return True
+    _, separator, raw_query = token.partition("?")
+    return bool(separator and _query_has_sensitive_key(raw_query))
 
 
 def _redact_text_with_usage(value: str, *, max_candidates: int) -> TextRedactionResult:
@@ -515,8 +592,36 @@ def _redact_text_with_usage(value: str, *, max_candidates: int) -> TextRedaction
             if token_start == index:
                 continue
             result.write(value[cursor:token_start])
+            token_value = value[token_start:index]
+            _, bare_candidate, _, _ = _simple_token_parts(token_value)
+            incomplete_relative_attempt = bare_candidate.startswith("//") and (
+                _validated_scheme_relative_reference(bare_candidate) is None
+            )
+            ambiguous_continuation = incomplete_relative_attempt and (
+                _next_token_has_credential_shape(value, index)
+            )
+            if bare_candidate == "//" and not ambiguous_continuation:
+                result.write(token_value)
+                cursor = index
+                continue
+            if incomplete_relative_attempt and ambiguous_continuation:
+                if candidates >= max_candidates:
+                    result.write(REDACTED_REMAINDER)
+                    return TextRedactionResult(
+                        value=result.getvalue(),
+                        complete=False,
+                        candidates=candidates,
+                        reason=TextRedactionIncompleteReason.CANDIDATE_LIMIT,
+                    )
+                result.write(REDACTED_URL)
+                return TextRedactionResult(
+                    value=result.getvalue(),
+                    complete=True,
+                    candidates=candidates + 1,
+                    reason=None,
+                )
             token = _simple_redact_token(
-                value[token_start:index],
+                token_value,
                 max_candidates=max_candidates - candidates,
             )
             result.write(token.value)
@@ -576,15 +681,16 @@ def redact_text_result(
             candidates=0,
             reason=TextRedactionIncompleteReason.CHARACTER_LIMIT,
         )
-    might_have_scheme_relative_reference = (
-        "//" in value and _SCHEME_RELATIVE_START.search(value) is not None
+    has_scheme_relative_attempt = (
+        "//" in value and _SCHEME_RELATIVE_TOKEN_START.search(value) is not None
     )
-    has_scheme_relative_reference = might_have_scheme_relative_reference and bool(
-        _scheme_relative_reference_signals(value)
+    might_have_ambiguous_interior = "//" in value and (
+        any(signal in value for signal in "@#?") or _ENCODED_AT_SIGN.search(value) is not None
     )
     if (
         "://" not in value
-        and not has_scheme_relative_reference
+        and not has_scheme_relative_attempt
+        and not might_have_ambiguous_interior
         and ("@" not in value or ":" not in value)
     ):
         return TextRedactionResult(
