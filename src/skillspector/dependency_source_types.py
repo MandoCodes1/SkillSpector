@@ -59,6 +59,8 @@ class DependencySourceSurface(StrEnum):
 
     NPMRC = ".npmrc"
     PIP_CONFIG = "pip config"
+    YARN_CONFIG = "yarn-config"
+    PYTHON_PROJECT_CONFIG = "python-project-config"
     SOURCE = "source"
     REPOSITORY = "repository"
     MIRROR = "mirror"

@@ -70,7 +70,7 @@
     },
     {
       "id": "control-poetry-source",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -80,10 +80,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "poetry",
-          "surface": "pyproject.toml source",
-          "operation": "add",
-          "scope": "evil",
-          "destination": "https://evil.example.invalid/simple",
+          "surface": "python-project-config",
+          "operation": "replace",
+          "scope": "project",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pyproject.toml",
           "start_line": 3
@@ -220,7 +220,7 @@
     },
     {
       "id": "control-yarnrc-canonical-registry",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "inert",
       "files": {
@@ -360,7 +360,7 @@
     },
     {
       "id": "control-yarn-scoped-registry",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -370,9 +370,9 @@
         {
           "severity": "HIGH",
           "ecosystem": "yarn",
-          "surface": ".yarnrc.yml",
+          "surface": "yarn-config",
           "operation": "replace",
-          "scope": "acme",
+          "scope": "scoped",
           "destination": "https://packages.example.invalid",
           "destination_status": "resolved",
           "file": ".yarnrc.yml",
@@ -382,7 +382,7 @@
     },
     {
       "id": "control-yarn-http-registry",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -392,7 +392,7 @@
         {
           "severity": "HIGH",
           "ecosystem": "yarn",
-          "surface": ".yarnrc.yml",
+          "surface": "yarn-config",
           "operation": "replace",
           "scope": "global",
           "destination": "http://packages.example.invalid",
@@ -404,7 +404,7 @@
     },
     {
       "id": "control-poetry-private-source",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -414,10 +414,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "poetry",
-          "surface": "pyproject.toml source",
-          "operation": "add",
-          "scope": "private",
-          "destination": "https://packages.example.invalid/simple",
+          "surface": "python-project-config",
+          "operation": "replace",
+          "scope": "project",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pyproject.toml",
           "start_line": 3

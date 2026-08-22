@@ -13,10 +13,12 @@ import pytest
 
 from skillspector.artifacts import ArtifactDisposition, ArtifactRecord, classify_artifact
 from skillspector.dependency_source_types import (
+    MAX_DEPENDENCY_CONFIG_DEPTH,
     MAX_DEPENDENCY_CONFIG_NODES,
     MAX_DEPENDENCY_RETAINED_LITERAL_BYTES,
     MAX_DEPENDENCY_SOURCE_CHANGES,
     MAX_DEPENDENCY_SOURCE_RECORDS,
+    MAX_DEPENDENCY_YAML_ALIASES,
     DependencySourceLimitationReason,
     DependencyWorkBudget,
 )
@@ -756,3 +758,524 @@ def test_malformed_pip_configs_are_localized_limitations(content: str) -> None:
         path="pip.conf",
         end_line=max(1, content.encode().count(b"\n") + 1),
     )
+
+
+def test_yarn_v1_uses_case_sensitive_independent_last_values_and_fixed_scopes() -> None:
+    content = (
+        "  # ignored\n"
+        "registry https://first.example.invalid/a#fragment;data\n"
+        "Registry https://ignored.example.invalid\n"
+        '"@private:registry" "https://user:secret@packages.example.invalid/team" ; note\n'
+        "registry https://registry.yarnpkg.com/ # effective default\n"
+    )
+
+    analysis = _analyze({"project/.yarnrc": content})
+
+    assert analysis.limitations == ()
+    assert _finding_projection(analysis) == [
+        {
+            "ecosystem": "yarn",
+            "surface": "yarn-config",
+            "operation": "replace",
+            "scope": "scoped",
+            "destination": "https://packages.example.invalid/REDACTED_PATH",
+            "destination_status": "resolved",
+            "file": "project/.yarnrc",
+            "start_line": 4,
+            "end_line": 4,
+        }
+    ]
+    assert "private" not in repr(analysis)
+    assert "secret" not in repr(analysis)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "registry https://old.example.invalid\nregistry\n",
+        'registry "https://old.example.invalid"\nregistry "https://broken.example.invalid\n',
+        '"@private:registry"\n',
+        'registry "https://packages.example.invalid"#not-a-comment\n',
+    ],
+)
+def test_yarn_v1_malformed_final_relevant_assignment_does_not_revive_old_value(
+    content: str,
+) -> None:
+    analysis = _analyze({".yarnrc": content})
+
+    _assert_single_parse_limitation(
+        analysis,
+        path=".yarnrc",
+        end_line=content.encode().count(b"\n") + 1,
+    )
+
+
+@pytest.mark.parametrize("path", [".yarnrc.yml", ".yarnrc.yaml"])
+def test_yarn_yaml_accepts_flow_quoted_block_and_alias_values_with_exact_spans(
+    path: str,
+) -> None:
+    content = (
+        "note: café\r\n"
+        'defaults: &registry "https://alias.example.invalid/simple"\r\n'
+        '"npmRegistryServer": >-\r\n'
+        "  https://global.example.invalid/simple\r\n"
+        "npmScopes: {private: {npmRegistryServer: *registry}}\r\n"
+    )
+
+    analysis = _analyze({path: content})
+
+    assert analysis.limitations == ()
+    assert [
+        (
+            finding.evidence["scope"],
+            finding.evidence["destination"],
+            finding.start_line,
+            finding.end_line,
+        )
+        for finding in analysis.findings
+    ] == [
+        ("global", "https://global.example.invalid/REDACTED_PATH", 3, 4),
+        ("scoped", "https://alias.example.invalid/REDACTED_PATH", 5, 5),
+    ]
+    module = importlib.import_module("skillspector.dependency_sources")
+    parsed = module._parse_file(
+        path,
+        content,
+        content.encode(),
+        DependencyWorkBudget().for_file(path),
+    )
+    assert content.encode()[
+        parsed.changes[0].span.start_byte : parsed.changes[0].span.end_byte
+    ].startswith(b">-")
+    assert (
+        content.encode()[parsed.changes[1].span.start_byte : parsed.changes[1].span.end_byte]
+        == b"*registry"
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "npmRegistryServer: https://one.example.invalid\nnpmRegistryServer: https://two.example.invalid\n",
+        "npmScopes: 1\n",
+        "npmScopes:\n  private: 1\n",
+        "npmScopes:\n  private:\n    npmRegistryServer: 1\n",
+        "npmScopes:\n  private: {}\n  private: {}\n",
+        "npmScopes:\n  private:\n    npmRegistryServer: https://one.example.invalid\n    npmRegistryServer: https://two.example.invalid\n",
+        "base: &base {npmRegistryServer: https://one.example.invalid}\nnpmScopes:\n  private:\n    <<: *base\n",
+        "base: &base {npmRegistryServer: https://one.example.invalid}\n<<: *base\n",
+        "npmRegistryServer: !mirror https://one.example.invalid\n",
+        "? [npmRegistryServer]\n: https://one.example.invalid\n",
+    ],
+)
+def test_yarn_yaml_rejects_ambiguous_relevant_shapes(content: str) -> None:
+    analysis = _analyze({".yarnrc.yml": content})
+
+    _assert_single_parse_limitation(
+        analysis,
+        path=".yarnrc.yml",
+        end_line=content.encode().count(b"\n") + 1,
+    )
+
+
+def test_yarn_yaml_ignores_unrelated_registry_keys_even_when_duplicated() -> None:
+    analysis = _analyze(
+        {".yarnrc.yml": ("packageExtensions:\n  pkg:\n    registry: first\n    registry: second\n")}
+    )
+
+    assert analysis.findings == ()
+    assert analysis.limitations == ()
+
+
+def test_yarn_yaml_alias_limit_is_exact_and_one_over() -> None:
+    exact = (
+        "base: &base value\nitems: ["
+        + ", ".join("*base" for _ in range(MAX_DEPENDENCY_YAML_ALIASES))
+        + "]\n"
+    )
+    one_over = exact.replace("]\n", ", *base]\n")
+
+    assert _analyze({".yarnrc.yml": exact}).limitations == ()
+    limitation = _assert_single_parse_limitation(
+        _analyze({".yarnrc.yml": one_over}),
+        path=".yarnrc.yml",
+        end_line=3,
+    )
+    assert limitation.ledger_metrics() == {
+        "observed_records": MAX_DEPENDENCY_YAML_ALIASES + 1,
+        "limit_records": MAX_DEPENDENCY_YAML_ALIASES,
+    }
+
+
+def test_yarn_yaml_recursive_alias_is_a_limitation() -> None:
+    content = "npmScopes: &scopes\n  private: *scopes\n"
+
+    analysis = _analyze({".yarnrc.yml": content})
+
+    _assert_single_parse_limitation(analysis, path=".yarnrc.yml", end_line=3)
+
+
+def test_yarn_yaml_node_budget_is_charged_once_before_construction() -> None:
+    # Root mapping, key scalar, and value scalar are the three node-producing events.
+    exact_budget = DependencyWorkBudget()
+    assert exact_budget.charge_config_nodes(MAX_DEPENDENCY_CONFIG_NODES - 3) is None
+    assert _analyze({".yarnrc.yml": "unrelated: value\n"}, budget=exact_budget).limitations == ()
+
+    over_budget = DependencyWorkBudget()
+    assert over_budget.charge_config_nodes(MAX_DEPENDENCY_CONFIG_NODES - 2) is None
+    limitation = _assert_single_parse_limitation(
+        _analyze({".yarnrc.yml": "unrelated: value\n"}, budget=over_budget),
+        path=".yarnrc.yml",
+        end_line=2,
+    )
+    assert limitation.ledger_metrics() == {
+        "observed_records": MAX_DEPENDENCY_CONFIG_NODES + 1,
+        "limit_records": MAX_DEPENDENCY_CONFIG_NODES,
+    }
+
+
+def test_yarn_yaml_depth_limit_is_exact_and_one_over() -> None:
+    def nested(depth: int) -> str:
+        return "root: " + "[" * (depth - 1) + "value" + "]" * (depth - 1) + "\n"
+
+    assert _analyze({".yarnrc.yml": nested(MAX_DEPENDENCY_CONFIG_DEPTH)}).limitations == ()
+    limitation = _assert_single_parse_limitation(
+        _analyze({".yarnrc.yml": nested(MAX_DEPENDENCY_CONFIG_DEPTH + 1)}),
+        path=".yarnrc.yml",
+        end_line=2,
+    )
+    assert limitation.ledger_metrics() == {
+        "observed_depth": MAX_DEPENDENCY_CONFIG_DEPTH + 1,
+        "limit_depth": MAX_DEPENDENCY_CONFIG_DEPTH,
+    }
+
+
+def test_python_project_sources_apply_manager_specific_operations_and_fixed_scope() -> None:
+    content = (
+        "[[tool.poetry.source]]\n"
+        'name = "primary-name"\n'
+        'url = "https://poetry-primary.example.invalid/simple"\n'
+        "\n[[tool.poetry.source]]\n"
+        'name = "supplement-name"\n'
+        'url = "https://poetry-extra.example.invalid/simple"\n'
+        'priority = "supplemental"\n'
+        "\n[[tool.poetry.source]]\n"
+        'name = "explicit-name"\n'
+        'url = "https://poetry-explicit.example.invalid/simple"\n'
+        'priority = "explicit"\n'
+        "\n[[tool.pdm.source]]\n"
+        'name = "pypi"\n'
+        'url = "https://pdm-primary.example.invalid/simple"\n'
+        "\n[[tool.pdm.source]]\n"
+        'name = "extra-name"\n'
+        'url = "https://pdm-extra.example.invalid/simple"\n'
+        "\n[[tool.uv.index]]\n"
+        'url = "https://uv-extra.example.invalid/simple"\n'
+        "\n[[tool.uv.index]]\n"
+        'name = "uv-primary-name"\n'
+        'url = "https://uv-primary.example.invalid/simple"\n'
+        "default = true\n"
+    )
+
+    analysis = _analyze({"pyproject.toml": content})
+
+    assert analysis.limitations == ()
+    assert [
+        (finding.evidence["ecosystem"], finding.evidence["operation"], finding.start_line)
+        for finding in analysis.findings
+    ] == [
+        ("poetry", "replace", 3),
+        ("poetry", "add", 7),
+        ("poetry", "add", 12),
+        ("pdm", "replace", 17),
+        ("pdm", "add", 21),
+        ("uv", "add", 24),
+        ("uv", "replace", 28),
+    ]
+    assert {finding.evidence["surface"] for finding in analysis.findings} == {
+        "python-project-config"
+    }
+    assert {finding.evidence["scope"] for finding in analysis.findings} == {"project"}
+    for raw_name in (
+        "primary-name",
+        "supplement-name",
+        "explicit-name",
+        "extra-name",
+        "uv-primary-name",
+    ):
+        assert raw_name not in repr(analysis)
+
+
+def test_pdm_alone_models_ascii_environment_substitution_without_environment_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PRIVATE_INDEX", "https://must-not-be-read.example.invalid")
+    content = (
+        "[[tool.pdm.source]]\n"
+        'name = "private"\n'
+        'url = "https://${PRIVATE_INDEX}/simple"\n'
+        "[[tool.poetry.source]]\n"
+        'name = "private"\n'
+        'url = "https://${PRIVATE_INDEX}/simple"\n'
+        "[[tool.uv.index]]\n"
+        'url = "https://${PRIVATE_INDEX}/simple"\n'
+    )
+
+    analysis = _analyze({"pyproject.toml": content})
+
+    assert analysis.limitations == ()
+    assert [finding.evidence["destination_status"] for finding in analysis.findings] == [
+        "unresolved",
+        "resolved",
+        "resolved",
+    ]
+    assert analysis.findings[0].evidence["destination"] == "unresolved"
+    assert "must-not-be-read" not in repr(analysis)
+    assert "PRIVATE_INDEX" not in repr(analysis)
+
+
+def test_same_directory_uv_toml_precedes_only_pyproject_uv_tables() -> None:
+    pyproject = (
+        "[[tool.poetry.source]]\n"
+        'name = "private"\n'
+        'url = "https://poetry.example.invalid/simple"\n'
+        "[[tool.pdm.source]]\n"
+        'name = "private"\n'
+        'url = "https://pdm.example.invalid/simple"\n'
+        "[[tool.uv.index]]\n"
+        'url = "https://ignored-uv.example.invalid/simple"\n'
+    )
+    uv = '[[index]]\nurl = "https://effective-uv.example.invalid/simple"\ndefault = true\n'
+
+    analysis = _analyze({"nested/pyproject.toml": pyproject, "nested/uv.toml": uv})
+
+    assert analysis.limitations == ()
+    assert [finding.evidence["ecosystem"] for finding in analysis.findings] == [
+        "poetry",
+        "pdm",
+        "uv",
+    ]
+    assert "ignored-uv" not in repr(analysis)
+
+
+def test_uv_toml_does_not_precede_a_pyproject_in_another_directory() -> None:
+    pyproject = '[[tool.uv.index]]\nurl = "https://project-uv.example.invalid/simple"\n'
+    uv = '[[index]]\nurl = "https://standalone-uv.example.invalid/simple"\n'
+
+    analysis = _analyze({"one/pyproject.toml": pyproject, "two/uv.toml": uv})
+
+    assert analysis.limitations == ()
+    assert [finding.file for finding in analysis.findings] == [
+        "one/pyproject.toml",
+        "two/uv.toml",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("pyproject.toml", "[tool.poetry.source]\nname='x'\nurl='https://x.example.invalid'\n"),
+        ("pyproject.toml", "[[tool.poetry.source]]\nurl='https://x.example.invalid'\n"),
+        ("pyproject.toml", "[[tool.poetry.source]]\nname=''\nurl='https://x.example.invalid'\n"),
+        ("pyproject.toml", "[[tool.poetry.source]]\nname='x'\nurl=''\n"),
+        (
+            "pyproject.toml",
+            "[[tool.poetry.source]]\nname='x'\nurl='https://x.example.invalid'\npriority='secondary'\n",
+        ),
+        ("pyproject.toml", "[[tool.pdm.source]]\nname=1\nurl='https://x.example.invalid'\n"),
+        ("pyproject.toml", "[[tool.uv.index]]\nname=''\nurl='https://x.example.invalid'\n"),
+        ("pyproject.toml", "[[tool.uv.index]]\nurl='https://x.example.invalid'\ndefault='true'\n"),
+        ("uv.toml", "[index]\nurl='https://x.example.invalid'\n"),
+        ("uv.toml", "index=[]\n"),
+        ("uv.toml", "[[index]]\nurl=1\n"),
+        ("pyproject.toml", "[[tool.uv.index]\nurl='https://x.example.invalid'\n"),
+    ],
+)
+def test_python_project_relevant_shape_and_field_errors_are_limitations(
+    path: str,
+    content: str,
+) -> None:
+    analysis = _analyze({path: content})
+
+    _assert_single_parse_limitation(
+        analysis,
+        path=path,
+        end_line=content.encode().count(b"\n") + 1,
+    )
+
+
+def test_python_project_accepts_quoted_dotted_keys_and_anchors_each_url_occurrence() -> None:
+    prefix = "# café decoy https://same.example.invalid/simple\r\n"
+    first = (
+        '[["tool"."poetry"."source"]]\r\n'
+        '"name" = "first"\r\n'
+        '"url" = "https://same.example.invalid/simple"\r\n'
+    )
+    second = (
+        "[[tool.poetry.source]]\r\n"
+        'name = "second"\r\n'
+        'url = "https://same.example.invalid/simple"\r\n'
+        'priority = "explicit"\r\n'
+    )
+    content = prefix + first + second
+
+    analysis = _analyze({"pyproject.toml": content})
+
+    assert analysis.limitations == ()
+    assert [finding.start_line for finding in analysis.findings] == [4, 7]
+    module = importlib.import_module("skillspector.dependency_sources")
+    parsed = module._parse_file(
+        "pyproject.toml",
+        content,
+        content.encode(),
+        DependencyWorkBudget().for_file("pyproject.toml"),
+    )
+    assert [
+        content.encode()[change.span.start_byte : change.span.end_byte] for change in parsed.changes
+    ] == [
+        b'"https://same.example.invalid/simple"',
+        b'"https://same.example.invalid/simple"',
+    ]
+
+
+def test_python_project_multiline_url_span_covers_its_own_value_token() -> None:
+    content = '[[index]]\r\nurl = """https://packages.example.invalid\r\n/simple""" # note\r\n'
+    module = importlib.import_module("skillspector.dependency_sources")
+
+    parsed = module._parse_file(
+        "uv.toml",
+        content,
+        content.encode(),
+        DependencyWorkBudget().for_file("uv.toml"),
+    )
+
+    assert parsed.limitations == ()
+    assert len(parsed.changes) == 1
+    span = parsed.changes[0].span
+    assert (span.start_line, span.end_line) == (2, 3)
+    assert content.encode()[span.start_byte : span.end_byte] == (
+        b'"""https://packages.example.invalid\r\n/simple"""'
+    )
+
+
+def test_toml_config_node_budget_is_exact_and_one_over() -> None:
+    content = '[[index]]\nurl="https://packages.example.invalid/simple"\n'
+    exact_budget = DependencyWorkBudget()
+    assert exact_budget.charge_config_nodes(MAX_DEPENDENCY_CONFIG_NODES - 6) is None
+    assert _analyze({"uv.toml": content}, budget=exact_budget).limitations == ()
+
+    over_budget = DependencyWorkBudget()
+    assert over_budget.charge_config_nodes(MAX_DEPENDENCY_CONFIG_NODES - 5) is None
+    limitation = _assert_single_parse_limitation(
+        _analyze({"uv.toml": content}, budget=over_budget),
+        path="uv.toml",
+        end_line=3,
+    )
+    assert limitation.ledger_metrics() == {
+        "observed_records": MAX_DEPENDENCY_CONFIG_NODES + 1,
+        "limit_records": MAX_DEPENDENCY_CONFIG_NODES,
+    }
+
+
+def test_toml_depth_limit_is_exact_and_one_over() -> None:
+    def nested(parts: int) -> str:
+        return f"[{'.'.join(f'a{index}' for index in range(parts))}]\nvalue=1\n"
+
+    assert _analyze({"pyproject.toml": nested(MAX_DEPENDENCY_CONFIG_DEPTH - 1)}).limitations == ()
+    limitation = _assert_single_parse_limitation(
+        _analyze({"pyproject.toml": nested(MAX_DEPENDENCY_CONFIG_DEPTH)}),
+        path="pyproject.toml",
+        end_line=3,
+    )
+    assert limitation.ledger_metrics() == {
+        "observed_depth": MAX_DEPENDENCY_CONFIG_DEPTH + 1,
+        "limit_depth": MAX_DEPENDENCY_CONFIG_DEPTH,
+    }
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        (".yarnrc", "registry=https://packages.example.invalid\n"),
+        (".yarnrc.yml", "npmRegistryServer: https://registry.yarnpkg.com/\n"),
+        (
+            "pyproject.toml",
+            "[[tool.poetry.source]]\nname='custom'\nurl='https://pypi.org/simple/'\n",
+        ),
+        ("pyproject.toml", "[[tool.pdm.source]]\nname='custom'\nurl='HTTPS://PYPI.ORG/simple'\n"),
+        ("uv.toml", "[[index]]\nurl='https://pypi.org/simple/'\n"),
+    ],
+)
+def test_yarn_and_python_exact_canonical_destinations_are_inert(
+    path: str,
+    content: str,
+) -> None:
+    analysis = _analyze({path: content})
+
+    assert analysis.findings == ()
+    assert analysis.limitations == ()
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        (".yarnrc.yml", "npmRegistryServer: https://registry.yarnpkg.com///\n"),
+        (
+            "uv.toml",
+            "[[index]]\nurl='https://pypi.org/simple///'\n",
+        ),
+    ],
+)
+def test_multiple_trailing_slashes_are_not_canonical_defaults(
+    path: str,
+    content: str,
+) -> None:
+    analysis = _analyze({path: content})
+
+    assert len(analysis.findings) == 1
+    assert analysis.limitations == ()
+
+
+def test_toml_physical_limit_rejects_before_parser_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("skillspector.dependency_sources")
+    calls: list[str] = []
+
+    def unexpected_loads(text: str) -> object:
+        calls.append(text)
+        raise AssertionError("tomllib must not be called")
+
+    monkeypatch.setattr(module.tomllib, "loads", unexpected_loads)
+    content = "[[index]]\nurl='https://x.example.invalid'\n"
+    inventory = classify_artifact("uv.toml", content.encode())
+    inventory["size_bytes"] = 1_000_001
+
+    analysis = _analyze({"uv.toml": content}, artifact_inventory=[inventory])
+
+    _assert_single_parse_limitation(analysis, path="uv.toml", end_line=3)
+    assert calls == []
+
+
+@pytest.mark.parametrize("resource", ["retained", "records", "changes"])
+def test_python_source_budget_one_over_discards_partial_file_results(resource: str) -> None:
+    budget = DependencyWorkBudget()
+    literal = "https://packages.example.invalid/simple"
+    if resource == "retained":
+        assert (
+            budget.charge_retained_literal_bytes(
+                MAX_DEPENDENCY_RETAINED_LITERAL_BYTES - len(literal.encode())
+            )
+            is None
+        )
+    elif resource == "records":
+        assert budget.charge_source_records(MAX_DEPENDENCY_SOURCE_RECORDS - 1) is None
+    else:
+        assert budget.reserve_source_changes(MAX_DEPENDENCY_SOURCE_CHANGES - 1) is None
+    content = f'[[index]]\nurl="{literal}"\n[[index]]\nurl="{literal}"\n'
+
+    analysis = _analyze({"uv.toml": content}, budget=budget)
+
+    assert analysis.findings == ()
+    assert len(analysis.limitations) == 1
+    assert analysis.limitations[0].ledger_metrics()

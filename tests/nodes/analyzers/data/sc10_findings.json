@@ -136,7 +136,7 @@
     },
     {
       "id": "yarnrc-yaml-flow-style",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -146,9 +146,9 @@
         {
           "severity": "HIGH",
           "ecosystem": "yarn",
-          "surface": ".yarnrc.yml",
+          "surface": "yarn-config",
           "operation": "replace",
-          "scope": "acme",
+          "scope": "scoped",
           "destination": "https://packages.example.invalid",
           "destination_status": "resolved",
           "file": ".yarnrc.yml",
@@ -158,7 +158,7 @@
     },
     {
       "id": "yarnrc-yaml-quoted-key",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -168,7 +168,7 @@
         {
           "severity": "HIGH",
           "ecosystem": "yarn",
-          "surface": ".yarnrc.yml",
+          "surface": "yarn-config",
           "operation": "replace",
           "scope": "global",
           "destination": "https://packages.example.invalid",
@@ -180,7 +180,7 @@
     },
     {
       "id": "yarnrc-v1-scoped-quoted-key",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -190,9 +190,9 @@
         {
           "severity": "HIGH",
           "ecosystem": "yarn",
-          "surface": ".yarnrc",
+          "surface": "yarn-config",
           "operation": "replace",
-          "scope": "@acme",
+          "scope": "scoped",
           "destination": "https://packages.example.invalid",
           "destination_status": "resolved",
           "file": ".yarnrc",
@@ -202,7 +202,7 @@
     },
     {
       "id": "yarnrc-yaml-block-scalar",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -212,7 +212,7 @@
         {
           "severity": "HIGH",
           "ecosystem": "yarn",
-          "surface": ".yarnrc.yml",
+          "surface": "yarn-config",
           "operation": "replace",
           "scope": "global",
           "destination": "https://packages.example.invalid",
@@ -225,7 +225,7 @@
     },
     {
       "id": "yarnrc-yaml-explicit-alias",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -235,7 +235,7 @@
         {
           "severity": "HIGH",
           "ecosystem": "yarn",
-          "surface": ".yarnrc.yml",
+          "surface": "yarn-config",
           "operation": "replace",
           "scope": "global",
           "destination": "https://packages.example.invalid",
@@ -247,7 +247,7 @@
     },
     {
       "id": "yarnrc-context-free-registry-key",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "inert",
       "files": {
@@ -257,7 +257,7 @@
     },
     {
       "id": "pyproject-uv-index-table",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -267,10 +267,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "uv",
-          "surface": "pyproject.toml index",
+          "surface": "python-project-config",
           "operation": "replace",
-          "scope": "private",
-          "destination": "https://packages.example.invalid/simple",
+          "scope": "project",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pyproject.toml",
           "start_line": 7
@@ -279,7 +279,7 @@
     },
     {
       "id": "uv-toml-index-table",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -289,10 +289,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "uv",
-          "surface": "uv.toml index",
+          "surface": "python-project-config",
           "operation": "replace",
-          "scope": "private",
-          "destination": "https://packages.example.invalid/simple",
+          "scope": "project",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "uv.toml",
           "start_line": 3
@@ -364,7 +364,7 @@
     },
     {
       "id": "line-anchor-poetry-url",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -374,10 +374,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "poetry",
-          "surface": "pyproject.toml source",
-          "operation": "add",
-          "scope": "private",
-          "destination": "https://packages.example.invalid/simple",
+          "surface": "python-project-config",
+          "operation": "replace",
+          "scope": "project",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pyproject.toml",
           "start_line": 7
