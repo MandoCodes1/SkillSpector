@@ -22,12 +22,14 @@ MAX_REDACTION_CHARACTERS: Final = 16 * 1024 * 1024
 MAX_REDACTION_CANDIDATES: Final = 1_024
 MAX_REDACTION_DEPTH: Final = 16
 MAX_REDACTION_NODES: Final = 10_000
+MAX_REDACTION_MAPPING_KEY_CHARACTERS: Final = 128
 
 _CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
 _SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*$")
 _HIERARCHICAL_MARKER = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 _SAFE_PATH = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@/-]*$")
 _SAFE_SCP_PATH = re.compile(r"^[A-Za-z0-9._~!$&'()*+,;=:@/-]+$")
+_CODE_OWNED_MAPPING_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 _SCP_URL = re.compile(r"^(?P<user>[^@\s]+)@(?P<host>\[[^\]\s]+\]|[^@/:\\\s]+):(?P<path>.+)$")
 _PROSE_OPENERS: Final = frozenset("([{<\"'`")
 _PAIRED_CLOSERS: Final = {
@@ -144,13 +146,28 @@ def _marker_count(value: str) -> int:
         count += max(0, raw_slashes - structural_slashes)
         if _has_nested_scp_marker(value, hierarchical[0].end() if hierarchical else 2):
             count += 1
-    elif _looks_like_scp_git(value):
+    elif _has_encoded_scp_structure(value):
+        count += 1
+    elif _has_scp_structure(value):
         count += max(1, value.count("@"))
     return count
 
 
 def _has_encoded_url_marker(value: str) -> bool:
     return "%" in value and "%2f%2f" in value.casefold()
+
+
+def _has_scp_structure(value: str) -> bool:
+    at_sign = value.find("@")
+    return at_sign > 0 and value.find(":", at_sign + 1) > at_sign + 1
+
+
+def _has_encoded_scp_structure(value: str) -> bool:
+    if "%" not in value:
+        return False
+    folded = value.casefold()
+    at_sign = folded.find("%40")
+    return at_sign > 0 and folded.find(":", at_sign + 3) > at_sign + 3
 
 
 def _has_nested_scp_marker(value: str, authority_start: int) -> bool:
@@ -192,11 +209,7 @@ def _redact_hierarchical(value: str, *, scheme_relative: bool) -> str:
 
 def _looks_like_scp_git(value: str) -> bool:
     base = re.split(r"[?#]", value, maxsplit=1)[0]
-    match = _SCP_URL.fullmatch(base)
-    if match is None:
-        return False
-    path = match.group("path")
-    return "/" in path or ".git" in path.casefold()
+    return _SCP_URL.fullmatch(base) is not None
 
 
 def _redact_scp(value: str) -> str:
@@ -225,7 +238,7 @@ def redact_url(value: str, *, max_characters: int = MAX_REDACTION_CHARACTERS) ->
     except Exception:
         return REDACTED_URL
     if markers == 0:
-        return value
+        return value if value == REDACTED_URL else REDACTED_URL
     if (
         markers != 1
         or "%" in value
@@ -295,6 +308,7 @@ def _might_contain_candidate(value: str) -> bool:
     return bool(
         "://" in value
         or _has_encoded_url_marker(value)
+        or _has_encoded_scp_structure(value)
         or ("//" in value and _SCHEME_RELATIVE_TOKEN.search(value))
         or ("@" in value and ":" in value)
     )
@@ -409,16 +423,16 @@ class _ValueWalk:
         if isinstance(value, str):
             if len(value) > self.remaining_text_characters:
                 raise _AggregateRedactionExhaustedError
-            result = redact_text_result(
+            text_result = redact_text_result(
                 value,
                 max_characters=self.remaining_text_characters,
                 max_candidates=self.remaining_text_candidates,
             )
-            if not result.complete:
+            if not text_result.complete:
                 raise _AggregateRedactionExhaustedError
             self.remaining_text_characters -= len(value)
-            self.remaining_text_candidates -= result.candidates
-            return result.value
+            self.remaining_text_candidates -= text_result.candidates
+            return text_result.value
         if value is None or isinstance(value, (bool, int, float)):
             return value
         if isinstance(value, (Mapping, list, tuple)):
@@ -428,7 +442,19 @@ class _ValueWalk:
             self.active.add(identity)
             try:
                 if isinstance(value, Mapping):
-                    return {key: self.visit(nested, depth + 1) for key, nested in value.items()}
+                    mapping_result: dict[str, object] = {}
+                    for key, nested in value.items():
+                        if (
+                            not isinstance(key, str)
+                            or len(key) > MAX_REDACTION_MAPPING_KEY_CHARACTERS
+                            or _CODE_OWNED_MAPPING_KEY.fullmatch(key) is None
+                            or redact_text(key) != key
+                            or len(key) > self.remaining_text_characters
+                        ):
+                            raise _AggregateRedactionExhaustedError
+                        self.remaining_text_characters -= len(key)
+                        mapping_result[key] = self.visit(nested, depth + 1)
+                    return mapping_result
                 items = [self.visit(nested, depth + 1) for nested in value]
                 return tuple(items) if isinstance(value, tuple) else items
             finally:

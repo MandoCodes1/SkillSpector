@@ -88,6 +88,18 @@ def test_empty_or_root_paths_are_the_only_path_contents_retained(
 
 
 @pytest.mark.parametrize(
+    "value",
+    ["ordinary", "token=plain-secret", "src/a//b.py"],
+)
+def test_exact_value_redaction_rejects_non_url_destinations(value: str) -> None:
+    assert api.redact_url(value) == api.REDACTED_URL
+
+
+def test_exact_value_redaction_preserves_its_fixed_placeholder() -> None:
+    assert api.redact_url(api.REDACTED_URL) == api.REDACTED_URL
+
+
+@pytest.mark.parametrize(
     "raw",
     [
         "https://user%3Asecret%40packages.example.invalid/private",
@@ -95,6 +107,7 @@ def test_empty_or_root_paths_are_the_only_path_contents_retained(
         "https%3A%2F%2Fuser%3Asecret%40packages.example.invalid%2Fprivate",
         "https://user:secret@packages.example.invalid/private?next=https://evil.invalid/x",
         "https://packages.example.invalid/private?next=user@evil.invalid:org/repo.git",
+        "credential-marker%40host.invalid:repo",
         "https://one.invalid/x,https://two.invalid/y",
         "https://first:secret@second@packages.example.invalid/private",
         "https://packages.example.invalid:bad/private",
@@ -147,6 +160,26 @@ def test_separate_whitespace_tokens_are_sanitized_independently() -> None:
         "mirror https://one.example.invalid/REDACTED_PATH "
         "then REDACTED@two.example.invalid:REDACTED_PATH"
     )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "source credential-marker@host.invalid:repo",
+            "source REDACTED@host.invalid:REDACTED_PATH",
+        ),
+        (
+            "source credential-marker%40host.invalid:repo",
+            "source [REDACTED_URL]",
+        ),
+    ],
+)
+def test_text_discovers_single_component_and_encoded_scp_candidates(
+    raw: str,
+    expected: str,
+) -> None:
+    assert api.redact_text(raw) == expected
 
 
 def test_multiple_candidates_in_one_token_are_whole_masked_or_exhaust_the_remainder() -> None:
@@ -270,6 +303,28 @@ def test_nested_values_preserve_code_owned_keys_and_container_types() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "https://user:secret@host.invalid/path",
+        "token=plain-secret",
+        "not code owned",
+        "évidence",
+        7,
+        "a" * 256,
+    ],
+)
+def test_recursive_redaction_rejects_non_code_owned_mapping_keys(key: object) -> None:
+    assert api.redact_value({key: "ordinary"}) == api.REDACTED_VALUE
+
+
+def test_mapping_keys_share_the_aggregate_character_budget_with_values() -> None:
+    value = {"field": "x"}
+
+    assert api.redact_value(value, max_text_characters=6) == value
+    assert api.redact_value(value, max_text_characters=5) == api.REDACTED_VALUE
+
+
 def test_recursive_text_character_and_candidate_budgets_are_aggregate() -> None:
     benign = {"first": "abcd", "second": "efgh"}
     candidates = {
@@ -277,8 +332,8 @@ def test_recursive_text_character_and_candidate_budgets_are_aggregate() -> None:
         "second": "https://user:second-secret@two.invalid/y",
     }
 
-    assert api.redact_value(benign, max_text_characters=8) == benign
-    assert api.redact_value(benign, max_text_characters=7) == api.REDACTED_VALUE
+    assert api.redact_value(benign, max_text_characters=19) == benign
+    assert api.redact_value(benign, max_text_characters=18) == api.REDACTED_VALUE
     assert api.redact_value(candidates, max_text_candidates=1) == api.REDACTED_VALUE
     exact = api.redact_value(candidates, max_text_candidates=2)
     assert exact == {

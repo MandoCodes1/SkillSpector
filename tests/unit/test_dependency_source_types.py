@@ -144,6 +144,7 @@ def test_source_change_accepts_only_redacted_resolved_destinations() -> None:
 @pytest.mark.parametrize(
     "raw_destination",
     [
+        "token=type-boundary-secret",
         "ftp://user:type-boundary-secret@packages.example.invalid/private",
         "https://packages.example.invalid/private?apikey=type-boundary-secret",
         "https://packages.example.invalid/private?channel=stable;authToken=type-boundary-secret",
@@ -194,21 +195,22 @@ def test_source_change_accepts_only_stable_sanitized_destinations(
     assert change.destination == destination
 
 
-def test_source_change_accepts_interior_double_slash_as_non_reference_syntax() -> None:
+def test_source_change_rejects_noncanonical_non_url_destinations() -> None:
     api = _api()
-    destination = "src/a//b.py"
+    sentinel = "non-url-destination-secret"
 
-    change = api.SourceChange(
-        ecosystem="npm",
-        surface="source",
-        operation="replace",
-        scope="global",
-        destination=destination,
-        destination_status=api.DestinationStatus.RESOLVED,
-        span=_span(api),
-    )
+    with pytest.raises(ValueError) as error:
+        api.SourceChange(
+            ecosystem="npm",
+            surface="source",
+            operation="replace",
+            scope="global",
+            destination=f"token={sentinel}",
+            destination_status=api.DestinationStatus.RESOLVED,
+            span=_span(api),
+        )
 
-    assert change.destination == destination
+    assert sentinel not in str(error.value)
 
 
 def test_source_change_uses_one_exact_unresolved_representation() -> None:
