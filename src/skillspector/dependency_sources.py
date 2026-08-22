@@ -441,9 +441,13 @@ def _parse_pip(
 
     candidates: list[_Candidate] = []
     for concrete_section in parser.sections():
-        effective_values = dict(parser.items(concrete_section, raw=True))
         for normalized_key in _PIP_OPTIONS:
-            configured_value = effective_values.get(normalized_key)
+            configured_value = parser.get(
+                concrete_section,
+                normalized_key,
+                raw=True,
+                fallback=None,
+            )
             if configured_value is None:
                 continue
             fragments = occurrences.get((concrete_section, normalized_key))

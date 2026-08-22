@@ -374,6 +374,63 @@ def test_pip_default_inheritance_and_overrides_remain_independent_per_section() 
     ]
 
 
+def test_pip_queries_only_relevant_options_per_concrete_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("skillspector.dependency_sources")
+    get_calls: list[tuple[str, str, bool]] = []
+    items_calls: list[str] = []
+    original_get = module._PipConfigParser.get
+    original_items = module._PipConfigParser.items
+
+    def counted_get(
+        parser: Any,
+        section: str,
+        option: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        get_calls.append((section, option, kwargs.get("raw", False)))
+        return original_get(parser, section, option, *args, **kwargs)
+
+    def counted_items(parser: Any, section: str, *args: Any, **kwargs: Any) -> Any:
+        items_calls.append(section)
+        return original_items(parser, section, *args, **kwargs)
+
+    monkeypatch.setattr(module._PipConfigParser, "get", counted_get)
+    monkeypatch.setattr(module._PipConfigParser, "items", counted_items)
+    irrelevant_defaults = "".join(f"setting-{index}=value-{index}\n" for index in range(64))
+    content = (
+        "[DEFAULT]\n"
+        "index-url=https://default.example.invalid/simple\n"
+        f"{irrelevant_defaults}"
+        "[global]\n"
+        "timeout=30\n"
+        "[install]\n"
+        "index-url=https://pypi.org/simple\n"
+        "[download]\n"
+        "extra-index-url=https://download.example.invalid/simple\n"
+    )
+
+    analysis = _analyze({"pip.conf": content})
+
+    assert analysis.limitations == ()
+    assert [
+        (finding.evidence["operation"], finding.evidence["scope"], finding.start_line)
+        for finding in analysis.findings
+    ] == [
+        ("replace", "global", 2),
+        ("replace", "command", 2),
+        ("add", "command", 72),
+    ]
+    assert items_calls == []
+    assert get_calls == [
+        (section, option, True)
+        for section in ("global", "install", "download")
+        for option in ("index-url", "extra-index-url")
+    ]
+
+
 @pytest.mark.parametrize(
     ("path", "content", "expected_start", "expected_end", "expected_line"),
     [
