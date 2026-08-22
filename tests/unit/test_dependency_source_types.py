@@ -137,6 +137,33 @@ def test_source_change_accepts_only_redacted_resolved_destinations() -> None:
     assert change.destination_status is api.DestinationStatus.RESOLVED
 
 
+@pytest.mark.parametrize(
+    "raw_destination",
+    [
+        "ftp://user:type-boundary-secret@packages.example.invalid/private",
+        "https://packages.example.invalid/private?apikey=type-boundary-secret",
+        "https://packages.example.invalid/private?channel=stable;authToken=type-boundary-secret",
+    ],
+)
+def test_source_change_rejects_raw_destination_redaction_bypasses(
+    raw_destination: str,
+) -> None:
+    api = _api()
+
+    with pytest.raises(ValueError) as error:
+        api.SourceChange(
+            ecosystem="npm",
+            surface="npm config",
+            operation="replace",
+            scope="global",
+            destination=raw_destination,
+            destination_status=api.DestinationStatus.RESOLVED,
+            span=_span(api),
+        )
+
+    assert "type-boundary-secret" not in str(error.value)
+
+
 def test_source_change_uses_one_exact_unresolved_representation() -> None:
     api = _api()
 
@@ -182,6 +209,61 @@ def test_source_change_rejects_empty_semantic_fields_and_has_no_raw_payload_slot
         "destination_status",
         "span",
     }
+
+
+@pytest.mark.parametrize("field", ["ecosystem", "surface", "operation", "scope"])
+@pytest.mark.parametrize("control", ["\x00", "\x1f", "\x7f"])
+def test_source_change_semantic_fields_reject_c0_and_del_controls(
+    field: str,
+    control: str,
+) -> None:
+    api = _api()
+    base = api.SourceChange(
+        ecosystem="pip",
+        surface="pip config",
+        operation="replace",
+        scope="global",
+        destination="unresolved",
+        destination_status=api.DestinationStatus.UNRESOLVED,
+        span=_span(api),
+    )
+
+    with pytest.raises(ValueError):
+        dataclasses.replace(base, **{field: f"safe{control}value"})
+
+
+@pytest.mark.parametrize("destination", ["", "   ", "https://host.invalid/\x00path"])
+def test_resolved_destination_rejects_blank_or_control_bearing_values(destination: str) -> None:
+    api = _api()
+
+    with pytest.raises(ValueError):
+        api.SourceChange(
+            ecosystem="npm",
+            surface="npm config",
+            operation="replace",
+            scope="global",
+            destination=destination,
+            destination_status=api.DestinationStatus.RESOLVED,
+            span=_span(api),
+        )
+
+
+def test_resolved_destination_rejects_values_above_its_explicit_bound() -> None:
+    api = _api()
+    destination = "https://packages.example.invalid/" + (
+        "a" * api.MAX_DEPENDENCY_DESTINATION_CHARACTERS
+    )
+
+    with pytest.raises(ValueError):
+        api.SourceChange(
+            ecosystem="npm",
+            surface="npm config",
+            operation="replace",
+            scope="global",
+            destination=destination,
+            destination_status=api.DestinationStatus.RESOLVED,
+            span=_span(api),
+        )
 
 
 def test_parse_and_analysis_results_freeze_iterables_as_tuples() -> None:
@@ -488,9 +570,11 @@ def test_ledger_budget_reserves_one_truncation_slot_at_9_999_existing_rows() -> 
 
     assert normal_exhaustion.resource is api.DependencyWorkResource.LEDGER_EVENTS
     assert budget.used(api.DependencyWorkResource.LEDGER_EVENTS) == 9_999
-    assert budget.claim_reserved_truncation_event() is None
+    assert budget.claim_reserved_truncation_event() is api.LedgerTruncationClaimStatus.CLAIMED
     assert budget.used(api.DependencyWorkResource.LEDGER_EVENTS) == 10_000
-    assert budget.claim_reserved_truncation_event() is not None
+    assert (
+        budget.claim_reserved_truncation_event() is api.LedgerTruncationClaimStatus.ALREADY_CLAIMED
+    )
 
 
 def test_ledger_budget_allows_one_normal_row_plus_reserved_slot_at_9_998() -> None:
@@ -499,7 +583,7 @@ def test_ledger_budget_allows_one_normal_row_plus_reserved_slot_at_9_998() -> No
 
     assert budget.charge_ledger_events(1) is None
     assert budget.charge_ledger_events(1) is not None
-    assert budget.claim_reserved_truncation_event() is None
+    assert budget.claim_reserved_truncation_event() is api.LedgerTruncationClaimStatus.CLAIMED
     assert budget.used(api.DependencyWorkResource.LEDGER_EVENTS) == 10_000
 
 
@@ -509,8 +593,10 @@ def test_reserved_truncation_slot_can_be_claimed_once_across_file_siblings() -> 
     first = budget.for_file("first.conf")
     second = budget.for_file("second.conf")
 
-    assert first.claim_reserved_truncation_event() is None
-    assert second.claim_reserved_truncation_event() is not None
+    assert first.claim_reserved_truncation_event() is api.LedgerTruncationClaimStatus.CLAIMED
+    assert (
+        second.claim_reserved_truncation_event() is api.LedgerTruncationClaimStatus.ALREADY_CLAIMED
+    )
     assert budget.used(api.DependencyWorkResource.LEDGER_EVENTS) == 10_000
 
 
@@ -518,11 +604,27 @@ def test_full_existing_ledger_has_no_fabricated_truncation_slot() -> None:
     api = _api()
     budget = api.DependencyWorkBudget.from_existing(findings=[], ledger_events=[{}] * 10_000)
 
-    exhaustion = budget.claim_reserved_truncation_event()
+    status = budget.claim_reserved_truncation_event()
 
-    assert exhaustion.resource is api.DependencyWorkResource.LEDGER_EVENTS
-    assert (exhaustion.observed, exhaustion.limit) == (10_001, 10_000)
+    assert status is api.LedgerTruncationClaimStatus.NO_CAPACITY
     assert budget.used(api.DependencyWorkResource.LEDGER_EVENTS) == 10_000
+
+
+def test_dependency_work_exhaustion_requires_a_real_one_over_capacity_observation() -> None:
+    api = _api()
+
+    with pytest.raises(ValueError):
+        api.DependencyWorkExhaustion(
+            resource=api.DependencyWorkResource.LEDGER_EVENTS,
+            observed=2,
+            limit=10_000,
+        )
+    with pytest.raises(ValueError):
+        api.DependencyWorkExhaustion(
+            resource=api.DependencyWorkResource.LEDGER_EVENTS,
+            observed=10_000,
+            limit=10_000,
+        )
 
 
 @pytest.mark.parametrize(

@@ -8,31 +8,22 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from io import StringIO
+from ipaddress import IPv6Address
 from typing import Final
-from urllib.parse import unquote_plus, urlsplit, urlunsplit
+from urllib.parse import SplitResult, unquote_plus, urlsplit
 
 REDACTED_URL: Final = "[REDACTED_URL]"
 REDACTED_REMAINDER: Final = "[REDACTED_REMAINDER]"
 REDACTED_VALUE: Final = "[REDACTED_VALUE]"
 
-MAX_REDACTION_CHARACTERS: Final = 65_536
+# Match the repository's bounded visible-artifact ceiling so provider-bound
+# content is not silently shortened before the caller can account for it.
+MAX_REDACTION_CHARACTERS: Final = 16 * 1024 * 1024
 MAX_REDACTION_CANDIDATES: Final = 1_024
 MAX_REDACTION_DEPTH: Final = 16
 MAX_REDACTION_NODES: Final = 10_000
 
-_ALLOWED_SCHEMES: Final = frozenset(
-    {
-        "http",
-        "https",
-        "ssh",
-        "git",
-        "git+http",
-        "git+https",
-        "git+ssh",
-        "sparse+http",
-        "sparse+https",
-    }
-)
 _CREDENTIAL_WORDS: Final = frozenset(
     {
         "auth",
@@ -48,28 +39,59 @@ _CREDENTIAL_WORDS: Final = frozenset(
         "passphrase",
         "secret",
         "secrets",
+        "sig",
         "signature",
         "signatures",
         "token",
         "tokens",
     }
 )
+_COMPACT_CREDENTIAL_KEYS: Final = frozenset(
+    {
+        "accesstoken",
+        "apikey",
+        "authtoken",
+        "bearertoken",
+        "clientsecret",
+        "clienttoken",
+        "idtoken",
+        "privatekey",
+        "refreshtoken",
+        "secretkey",
+        "sessionkey",
+        "signingkey",
+    }
+)
 _CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
+_UNSAFE_URI_CHARACTER = re.compile(r'[<>"`]')
 _BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_ENCODED_UNSAFE_AUTHORITY_CHARACTER = re.compile(
+    r"%(?:0[0-9A-Fa-f]|1[0-9A-Fa-f]|20|23|2[fF]|3[aAfF]|40|5[bBcCdD]|7[fF])"
+)
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _QUERY_WORD_SEPARATOR = re.compile(r"[^A-Za-z0-9]+")
+_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*$")
 _SCP_URL = re.compile(
     r"^(?P<user>[^@/:\\\s]+)@"
     r"(?P<host>\[[^\]\s]+\]|[^@/:\\\s]+):"
     r"(?P<path>.+)$"
 )
-_TEXT_CANDIDATE = re.compile(
-    r"(?:(?:(?:git|sparse)\+)?(?:https?|ssh|git))://[^\s<>\"']+"
-    r"|(?:[^@/:\\\s<>\"']+)@(?:\[[^\]\s]+\]|[^@/:\\\s<>\"']+):"
-    r"(?:[^\s<>\"']*/[^\s<>\"']*|[^\s<>\"']*\.git(?:[?#][^\s<>\"']*)?)",
-    re.IGNORECASE,
+_CANDIDATE_START = re.compile(
+    r"(?P<uri>(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://)"
+    r"|(?P<scp>(?<![A-Za-z0-9._~-])[^@/:\\\s<>\"`]+@"
+    r"(?:\[[^\]\s]+\]|[^@/:\\\s<>\"`]+):)",
 )
-_TRAILING_PROSE_PUNCTUATION: Final = frozenset(".,)]}")
+_PROSE_OPENERS: Final = frozenset("([{<\"'`")
+_PAIRED_CLOSERS: Final = {
+    ")": "(",
+    "]": "[",
+    "}": "{",
+    ">": "<",
+    '"': '"',
+    "'": "'",
+    "`": "`",
+}
+_SENTENCE_PUNCTUATION: Final = frozenset(".,")
 
 
 def _valid_bound(value: object) -> bool:
@@ -87,44 +109,121 @@ def _query_key_is_sensitive(raw_key: str) -> bool:
         raise ValueError("query key is ambiguous") from None
     expanded = _CAMEL_BOUNDARY.sub("_", decoded)
     words = {word.casefold() for word in _QUERY_WORD_SEPARATOR.split(expanded) if word}
-    return bool(words & _CREDENTIAL_WORDS)
+    compact = "".join(character for character in decoded if character.isalnum()).casefold()
+    return bool(words & _CREDENTIAL_WORDS) or compact in _COMPACT_CREDENTIAL_KEYS
 
 
 def _redact_query(raw_query: str) -> str:
     if not raw_query:
         return raw_query
-    redacted_parts: list[str] = []
-    for raw_part in raw_query.split("&"):
+    output = StringIO()
+    cursor = 0
+    for delimiter in re.finditer(r"[&;]", raw_query):
+        raw_part = raw_query[cursor : delimiter.start()]
         raw_key, separator, _raw_value = raw_part.partition("=")
         if separator and _query_key_is_sensitive(raw_key):
-            redacted_parts.append(f"{raw_key}=REDACTED")
-        else:
-            redacted_parts.append(raw_part)
-    return "&".join(redacted_parts)
+            raw_part = f"{raw_key}=REDACTED"
+        output.write(raw_part)
+        output.write(delimiter.group())
+        cursor = delimiter.end()
+    raw_part = raw_query[cursor:]
+    raw_key, separator, _raw_value = raw_part.partition("=")
+    output.write(
+        f"{raw_key}=REDACTED" if separator and _query_key_is_sensitive(raw_key) else raw_part
+    )
+    return output.getvalue()
+
+
+def _valid_bracketed_ipv6(host: str) -> bool:
+    if not (host.startswith("[") and host.endswith("]")):
+        return False
+    try:
+        IPv6Address(host[1:-1])
+    except ValueError:
+        return False
+    return True
+
+
+def _valid_host_port(host_port: str) -> bool:
+    if not host_port or _ENCODED_UNSAFE_AUTHORITY_CHARACTER.search(host_port):
+        return False
+    if host_port.startswith("["):
+        close = host_port.find("]")
+        if close < 0 or host_port.find("]", close + 1) >= 0:
+            return False
+        if not _valid_bracketed_ipv6(host_port[: close + 1]):
+            return False
+        suffix = host_port[close + 1 :]
+        if not suffix:
+            return True
+        return suffix.startswith(":") and len(suffix) > 1 and suffix[1:].isdigit()
+    if "[" in host_port or "]" in host_port or host_port.count(":") > 1:
+        return False
+    host, separator, port = host_port.partition(":")
+    if not host:
+        return False
+    return not separator or bool(port and port.isdigit())
+
+
+def _validated_safe_authority(parsed: SplitResult, authority: str) -> str | None:
+    if (
+        not authority
+        or authority.count("@") > 1
+        or "\\" in authority
+        or _CONTROL_CHARACTER.search(authority)
+        or any(character.isspace() for character in authority)
+        or _ENCODED_UNSAFE_AUTHORITY_CHARACTER.search(authority)
+    ):
+        return None
+    host_port = authority.rsplit("@", 1)[-1]
+    if not _valid_host_port(host_port):
+        return None
+    try:
+        hostname = parsed.hostname
+        _ = parsed.port
+    except (UnicodeError, ValueError):
+        return None
+    if not hostname:
+        return None
+    return f"REDACTED@{host_port}" if "@" in authority else host_port
 
 
 def _redact_standard_url(value: str) -> str:
     parsed = urlsplit(value)
-    if parsed.scheme.casefold() not in _ALLOWED_SCHEMES or not parsed.netloc:
+    if not _SCHEME.fullmatch(parsed.scheme) or not parsed.netloc:
         return REDACTED_URL
-    authority = parsed.netloc
-    if authority.count("@") > 1 or "\\" in authority or any(char.isspace() for char in authority):
+    safe_authority = _validated_safe_authority(parsed, parsed.netloc)
+    if safe_authority is None:
         return REDACTED_URL
-    # Accessing both properties forces urllib's bracket, NFKC, and port checks.
-    if not parsed.hostname:
-        return REDACTED_URL
-    _ = parsed.port
-
-    host_port = authority.rsplit("@", 1)[-1]
-    safe_authority = f"REDACTED@{host_port}" if "@" in authority else host_port
     safe_query = _redact_query(parsed.query)
-    return urlunsplit((parsed.scheme, safe_authority, parsed.path, safe_query, ""))
+    without_fragment = value.split("#", 1)[0]
+    had_query_delimiter = "?" in without_fragment
+    suffix = f"?{safe_query}" if had_query_delimiter else ""
+    return f"{parsed.scheme}://{safe_authority}{parsed.path}{suffix}"
+
+
+def _valid_scp_host(host: str) -> bool:
+    if (
+        not host
+        or "\\" in host
+        or _CONTROL_CHARACTER.search(host)
+        or any(character.isspace() for character in host)
+        or _ENCODED_UNSAFE_AUTHORITY_CHARACTER.search(host)
+    ):
+        return False
+    if host.startswith("[") or host.endswith("]"):
+        return _valid_bracketed_ipv6(host)
+    return "[" not in host and "]" not in host and ":" not in host
 
 
 def _redact_scp_url(value: str) -> str:
     without_fragment = value.split("#", 1)[0]
     match = _SCP_URL.fullmatch(without_fragment)
-    if match is None or without_fragment.count("@") != 1 or "\\" in without_fragment:
+    if (
+        match is None
+        or without_fragment.count("@") != 1
+        or not _valid_scp_host(match.group("host"))
+    ):
         return REDACTED_URL
     raw_path, query_separator, raw_query = match.group("path").partition("?")
     if not raw_path:
@@ -142,11 +241,21 @@ def _looks_like_scp_git(value: str) -> bool:
     return "/" in path or path.casefold().endswith(".git")
 
 
-def _detach_trailing_prose_punctuation(value: str) -> tuple[str, str]:
+def _detach_trailing_prose_punctuation(
+    value: str,
+    opener: str | None,
+) -> tuple[str, str]:
     split_at = len(value)
-    while split_at > 0 and value[split_at - 1] in _TRAILING_PROSE_PUNCTUATION:
+    suffix = ""
+    while split_at > 0 and value[split_at - 1] in _SENTENCE_PUNCTUATION:
         split_at -= 1
-    return value[:split_at], value[split_at:]
+        suffix = value[split_at] + suffix
+    if split_at > 0 and opener is not None:
+        closer = value[split_at - 1]
+        if _PAIRED_CLOSERS.get(closer) == opener:
+            split_at -= 1
+            suffix = closer + suffix
+    return value[:split_at], suffix
 
 
 def redact_url(value: str, *, max_characters: int = MAX_REDACTION_CHARACTERS) -> str:
@@ -155,13 +264,18 @@ def redact_url(value: str, *, max_characters: int = MAX_REDACTION_CHARACTERS) ->
         return REDACTED_URL
     if len(value) > max_characters:
         return REDACTED_URL
-    suspicious = "://" in value or _looks_like_scp_git(value)
+    is_hierarchical_uri = "://" in value
+    suspicious = is_hierarchical_uri or _looks_like_scp_git(value)
     if not suspicious:
         return value
-    if _CONTROL_CHARACTER.search(value) or _has_ambiguous_percent_escape(value):
+    if (
+        _CONTROL_CHARACTER.search(value)
+        or _UNSAFE_URI_CHARACTER.search(value)
+        or _has_ambiguous_percent_escape(value)
+    ):
         return REDACTED_URL
     try:
-        if "://" in value:
+        if is_hierarchical_uri:
             return _redact_standard_url(value)
         return _redact_scp_url(value)
     except (UnicodeError, ValueError):
@@ -169,6 +283,53 @@ def redact_url(value: str, *, max_characters: int = MAX_REDACTION_CHARACTERS) ->
     except Exception:
         # Evidence redaction is a security boundary: unexpected parser errors fail closed.
         return REDACTED_URL
+
+
+@dataclass(frozen=True, slots=True)
+class _TextRedactionResult:
+    value: str
+    candidates: int
+    complete: bool
+
+
+def _candidate_end(value: str, start: int) -> int:
+    index = start
+    while index < len(value) and not value[index].isspace():
+        index += 1
+    return index
+
+
+def _redact_text_with_usage(value: str, *, max_candidates: int) -> _TextRedactionResult:
+    result: list[str] = []
+    cursor = 0
+    candidates = 0
+    try:
+        for match in _CANDIDATE_START.finditer(value):
+            if match.start() < cursor:
+                continue
+            opener = value[match.start() - 1] if match.start() > 0 else None
+            if opener not in _PROSE_OPENERS:
+                opener = None
+            end = _candidate_end(value, match.start())
+            candidate, punctuation = _detach_trailing_prose_punctuation(
+                value[match.start() : end], opener
+            )
+            if match.lastgroup == "scp" and not _looks_like_scp_git(candidate):
+                continue
+            if candidates >= max_candidates:
+                result.append(value[cursor : match.start()])
+                result.append(REDACTED_REMAINDER)
+                return _TextRedactionResult("".join(result), candidates, False)
+            result.append(value[cursor : match.start()])
+            result.append(redact_url(candidate, max_characters=len(candidate)))
+            result.append(punctuation)
+            cursor = end
+            candidates += 1
+    except Exception:
+        result.append(REDACTED_REMAINDER)
+        return _TextRedactionResult("".join(result), candidates, False)
+    result.append(value[cursor:])
+    return _TextRedactionResult("".join(result), candidates, True)
 
 
 def redact_text(
@@ -180,76 +341,60 @@ def redact_text(
     """Redact bounded URL candidates while preserving ordinary text exactly."""
     if not isinstance(value, str):
         return REDACTED_REMAINDER
+    if value == REDACTED_REMAINDER:
+        return value
     if not _valid_bound(max_characters) or not _valid_bound(max_candidates):
         return REDACTED_REMAINDER
+    if len(value) > max_characters:
+        return REDACTED_REMAINDER
+    return _redact_text_with_usage(value, max_candidates=max_candidates).value
 
-    bounded = value[:max_characters]
-    was_truncated = len(value) > max_characters
-    result: list[str] = []
-    cursor = 0
-    candidates = 0
-    try:
-        for match in _TEXT_CANDIDATE.finditer(bounded):
-            if candidates >= max_candidates:
-                result.append(bounded[cursor : match.start()])
-                result.append(REDACTED_REMAINDER)
-                return "".join(result)
-            result.append(bounded[cursor : match.start()])
-            candidate, punctuation = _detach_trailing_prose_punctuation(match.group(0))
-            result.append(redact_url(candidate, max_characters=max_characters))
-            result.append(punctuation)
-            cursor = match.end()
-            candidates += 1
-    except Exception:
-        result.append(REDACTED_REMAINDER)
-        return "".join(result)
 
-    result.append(bounded[cursor:])
-    if was_truncated:
-        result.append(REDACTED_REMAINDER)
-    return "".join(result)
+class _AggregateRedactionExhaustedError(Exception):
+    """Internal control flow for one exhausted recursive redaction budget."""
 
 
 @dataclass(slots=True)
 class _ValueWalk:
     remaining_nodes: int
     max_depth: int
-    max_text_characters: int
-    max_text_candidates: int
+    remaining_text_characters: int
+    remaining_text_candidates: int
     active: set[int] = field(default_factory=set)
 
     def visit(self, value: object, depth: int) -> object:
         if depth > self.max_depth or self.remaining_nodes <= 0:
-            return REDACTED_VALUE
+            raise _AggregateRedactionExhaustedError
         self.remaining_nodes -= 1
 
         if isinstance(value, str):
-            return redact_text(
+            if len(value) > self.remaining_text_characters:
+                raise _AggregateRedactionExhaustedError
+            result = _redact_text_with_usage(
                 value,
-                max_characters=self.max_text_characters,
-                max_candidates=self.max_text_candidates,
+                max_candidates=self.remaining_text_candidates,
             )
+            if not result.complete:
+                raise _AggregateRedactionExhaustedError
+            self.remaining_text_characters -= len(value)
+            self.remaining_text_candidates -= result.candidates
+            return result.value
         if value is None or isinstance(value, (bool, int, float)):
             return value
         if isinstance(value, (Mapping, list, tuple)):
             identity = id(value)
             if identity in self.active:
                 return REDACTED_VALUE
+            if len(value) > self.remaining_nodes:
+                raise _AggregateRedactionExhaustedError
             self.active.add(identity)
             try:
                 if isinstance(value, Mapping):
-                    result: dict[object, object] = {}
+                    result_mapping: dict[object, object] = {}
                     for key, nested in value.items():
-                        if self.remaining_nodes <= 0:
-                            result[key] = REDACTED_VALUE
-                        else:
-                            result[key] = self.visit(nested, depth + 1)
-                    return result
-                result_items: list[object] = []
-                for nested in value:
-                    if self.remaining_nodes <= 0:
-                        return REDACTED_VALUE
-                    result_items.append(self.visit(nested, depth + 1))
+                        result_mapping[key] = self.visit(nested, depth + 1)
+                    return result_mapping
+                result_items = [self.visit(nested, depth + 1) for nested in value]
                 return tuple(result_items) if isinstance(value, tuple) else result_items
             finally:
                 self.active.remove(identity)
@@ -264,7 +409,7 @@ def redact_value(
     max_text_characters: int = MAX_REDACTION_CHARACTERS,
     max_text_candidates: int = MAX_REDACTION_CANDIDATES,
 ) -> object:
-    """Recursively sanitize evidence values under explicit depth and node ceilings."""
+    """Recursively sanitize evidence values under aggregate explicit ceilings."""
     bounds = (max_depth, max_nodes, max_text_characters, max_text_candidates)
     if not all(_valid_bound(bound) for bound in bounds):
         return REDACTED_VALUE
@@ -272,8 +417,8 @@ def redact_value(
         return _ValueWalk(
             remaining_nodes=max_nodes,
             max_depth=max_depth,
-            max_text_characters=max_text_characters,
-            max_text_candidates=max_text_candidates,
+            remaining_text_characters=max_text_characters,
+            remaining_text_candidates=max_text_candidates,
         ).visit(value, 0)
     except Exception:
         return REDACTED_VALUE

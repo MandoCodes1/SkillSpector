@@ -22,6 +22,7 @@ MAX_DEPENDENCY_LEDGER_EVENTS: Final = 10_000
 MAX_DEPENDENCY_FILE_BYTES: Final = 1_000_000
 MAX_DEPENDENCY_YAML_ALIASES: Final = 256
 MAX_DEPENDENCY_CONFIG_DEPTH: Final = 64
+MAX_DEPENDENCY_DESTINATION_CHARACTERS: Final = 16_384
 
 
 class DestinationStatus(StrEnum):
@@ -52,6 +53,14 @@ class DependencyWorkResource(StrEnum):
     DEPTH = "depth"
 
 
+class LedgerTruncationClaimStatus(StrEnum):
+    """Outcome of claiming the scan's single reserved truncation row."""
+
+    CLAIMED = "claimed"
+    ALREADY_CLAIMED = "already_claimed"
+    NO_CAPACITY = "no_capacity"
+
+
 def _require_nonnegative_integer(value: object, name: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
@@ -77,6 +86,8 @@ def _normalize_relative_posix_path(path: object) -> str:
 def _require_nonempty_semantic(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > 256:
         raise ValueError(f"{name} must be a bounded non-empty semantic value")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"{name} must not contain control characters")
     if redact_text(value) != value:
         raise ValueError(f"{name} must not contain credential-bearing text")
     return value
@@ -132,7 +143,9 @@ class SourceChange:
             return
         if (
             not isinstance(self.destination, str)
-            or not self.destination
+            or not self.destination.strip()
+            or len(self.destination) > MAX_DEPENDENCY_DESTINATION_CHARACTERS
+            or any(ord(character) < 32 or ord(character) == 127 for character in self.destination)
             or self.destination == "unresolved"
             or redact_url(self.destination) != self.destination
             or redact_text(self.destination) != self.destination
@@ -281,6 +294,8 @@ class DependencyWorkExhaustion:
         object.__setattr__(self, "resource", resource)
         _require_nonnegative_integer(self.observed, "observed")
         _require_nonnegative_integer(self.limit, "limit")
+        if self.observed <= self.limit:
+            raise ValueError("resource exhaustion requires an observation above its limit")
 
     def ledger_metrics(self) -> dict[str, int]:
         """Project the resource count into compatible inspection-ledger metrics."""
@@ -339,6 +354,7 @@ class DependencyWorkBudget:
         self._used[DependencyWorkResource.FINDING_OUTPUT_RECORDS] = existing_findings
         self._used[DependencyWorkResource.LEDGER_EVENTS] = existing_ledger
         self._truncation_slot_available = existing_ledger < MAX_DEPENDENCY_LEDGER_EVENTS
+        self._truncation_slot_claimed = False
         self._file_budgets: dict[str, DependencyFileBudget] = {}
 
     @classmethod
@@ -432,16 +448,19 @@ class DependencyWorkBudget:
         self._used[resource] = current + value
         return None
 
-    def claim_reserved_truncation_event(self) -> DependencyWorkExhaustion | None:
+    def claim_reserved_truncation_event(self) -> LedgerTruncationClaimStatus:
         """Claim the scan's one reserved truncation row, if physical capacity exists."""
         resource = DependencyWorkResource.LEDGER_EVENTS
         current = self._used[resource]
         limit = _SCAN_LIMITS[resource]
+        if self._truncation_slot_claimed:
+            return LedgerTruncationClaimStatus.ALREADY_CLAIMED
         if not self._truncation_slot_available or current >= limit:
-            return DependencyWorkExhaustion(resource, current + 1, limit)
+            return LedgerTruncationClaimStatus.NO_CAPACITY
         self._used[resource] = current + 1
         self._truncation_slot_available = False
-        return None
+        self._truncation_slot_claimed = True
+        return LedgerTruncationClaimStatus.CLAIMED
 
 
 @dataclass(slots=True)
@@ -510,5 +529,5 @@ class DependencyFileBudget:
     def charge_ledger_events(self, count: int) -> DependencyWorkExhaustion | None:
         return self._root.charge_ledger_events(count)
 
-    def claim_reserved_truncation_event(self) -> DependencyWorkExhaustion | None:
+    def claim_reserved_truncation_event(self) -> LedgerTruncationClaimStatus:
         return self._root.claim_reserved_truncation_event()
