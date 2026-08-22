@@ -40,6 +40,7 @@ _NPM_INTERPOLATION: Final = re.compile(r"\$\{[^{}]+\}")
 _PIP_INTERPOLATION: Final = re.compile(r"%\([^)]+\)s")
 _PIP_ASSIGNMENT: Final = re.compile(r"^\s*([^:=\s][^:=]*?)\s*([=:])\s*(.*)$")
 _PIP_SECTION: Final = re.compile(r"^\s*\[([^]]+)]\s*(?:[#;].*)?$")
+_PIP_OPTIONS: Final = ("index-url", "extra-index-url")
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +159,39 @@ def _normalize_literal(value: str) -> tuple[str, int, int] | None:
     if trimmed[-1] in {'"', "'"}:
         return None
     return trimmed, left, left + len(trimmed)
+
+
+def _normalize_pip_option(value: str) -> str:
+    normalized = value.strip()
+    if normalized.startswith("--") and not normalized.startswith("---"):
+        normalized = normalized[2:]
+    return normalized.casefold().replace("_", "-")
+
+
+def _normalize_pip_section(value: str) -> str:
+    return value.strip().casefold().replace("_", "-")
+
+
+class _PipConfigParser(configparser.ConfigParser):
+    def optionxform(self, optionstr: str) -> str:
+        return _normalize_pip_option(optionstr)
+
+
+def _normalized_pip_parser_text(lines: Sequence[str]) -> str:
+    normalized_lines: list[str] = []
+    for line in lines:
+        section = _PIP_SECTION.fullmatch(line)
+        if section is None:
+            normalized_lines.append(line)
+            continue
+        raw_name = section.group(1).strip()
+        normalized_name = (
+            raw_name if raw_name == configparser.DEFAULTSECT else _normalize_pip_section(raw_name)
+        )
+        normalized_lines.append(
+            f"{line[: section.start(1)]}{normalized_name}{line[section.end(1) :]}"
+        )
+    return "\n".join(normalized_lines)
 
 
 def _canonical_destination(ecosystem: DependencyEcosystem, value: str) -> bool:
@@ -318,6 +352,22 @@ def _pip_fragments(
     return fragments
 
 
+def _pip_fragments_match_value(
+    fragments: Sequence[_ValueFragment],
+    configured_value: str,
+    raw: bytes,
+) -> bool:
+    normalized = _normalize_literal(configured_value)
+    if normalized is None:
+        return False
+    literal, _start, _end = normalized
+    configured_tokens = re.findall(r"\S+", literal)
+    occurrence_tokens = [
+        raw[fragment.start_byte : fragment.end_byte].decode("utf-8") for fragment in fragments
+    ]
+    return configured_tokens == occurrence_tokens
+
+
 def _parse_pip(
     path: str,
     text: str,
@@ -327,10 +377,11 @@ def _parse_pip(
     lines = _physical_lines(text)
     offsets = _line_offsets(text)
     section: str | None = None
-    current_key: tuple[str, str] | None = None
+    section_seen = False
+    current_key: tuple[str | None, str] | None = None
     current_fragments: list[_ValueFragment] | None = None
     current_indent: int | None = None
-    effective: dict[tuple[str, str], list[_ValueFragment]] = {}
+    occurrences: dict[tuple[str | None, str], list[_ValueFragment]] = {}
 
     for line_number, line in enumerate(lines, start=1):
         stripped = line.strip()
@@ -342,7 +393,13 @@ def _parse_pip(
                 return DependencySourceParseResult(
                     limitations=(_limitation(path, raw, exhaustion),)
                 )
-            section = section_match.group(1).strip().casefold().replace("_", "-")
+            raw_section = section_match.group(1).strip()
+            section = (
+                None
+                if raw_section == configparser.DEFAULTSECT
+                else _normalize_pip_section(raw_section)
+            )
+            section_seen = True
             current_key = None
             current_fragments = None
             current_indent = None
@@ -364,7 +421,7 @@ def _parse_pip(
             if fragments is None:
                 return DependencySourceParseResult(limitations=(_limitation(path, raw),))
             current_fragments.extend(fragments)
-            effective[current_key] = current_fragments
+            occurrences[current_key] = current_fragments
             continue
         assignment = _PIP_ASSIGNMENT.fullmatch(line)
         current_key = None
@@ -372,10 +429,10 @@ def _parse_pip(
         current_indent = None
         if assignment is None:
             continue
-        normalized_key = assignment.group(1).strip().lower().replace("_", "-")
-        if normalized_key not in {"index-url", "extra-index-url"}:
+        normalized_key = _normalize_pip_option(assignment.group(1))
+        if normalized_key not in _PIP_OPTIONS:
             continue
-        if section is None:
+        if not section_seen:
             return DependencySourceParseResult(limitations=(_limitation(path, raw),))
         if exhaustion := budget.charge_config_nodes(1):
             return DependencySourceParseResult(limitations=(_limitation(path, raw, exhaustion),))
@@ -392,47 +449,61 @@ def _parse_pip(
         current_key = (section, normalized_key)
         current_fragments = fragments or []
         current_indent = indent
-        effective[current_key] = current_fragments
+        occurrences[current_key] = current_fragments
 
-    if any(not fragments for fragments in effective.values()):
+    if any(not fragments for fragments in occurrences.values()):
         return DependencySourceParseResult(limitations=(_limitation(path, raw),))
 
-    parser = configparser.ConfigParser(
+    parser = _PipConfigParser(
         interpolation=None,
         strict=False,
         delimiters=("=", ":"),
     )
     try:
-        parser.read_string(text)
+        parser.read_string(_normalized_pip_parser_text(lines))
     except configparser.Error:
         return DependencySourceParseResult(limitations=(_limitation(path, raw),))
 
     candidates: list[_Candidate] = []
-    for (raw_section, normalized_key), fragments in effective.items():
-        for fragment in fragments:
-            candidates.append(
-                _Candidate(
-                    ecosystem=DependencyEcosystem.PIP,
-                    surface=DependencySourceSurface.PIP_CONFIG,
-                    operation=(
-                        DependencySourceOperation.REPLACE
-                        if normalized_key == "index-url"
-                        else DependencySourceOperation.ADD
-                    ),
-                    scope=(
-                        DependencySourceScope.GLOBAL
-                        if raw_section == "global"
-                        else DependencySourceScope.COMMAND
-                    ),
-                    span=SourceSpan(
-                        path,
-                        fragment.start_byte,
-                        fragment.end_byte,
-                        fragment.line,
-                        fragment.line,
-                    ),
+    for concrete_section in parser.sections():
+        effective_values = dict(parser.items(concrete_section, raw=True))
+        for normalized_key in _PIP_OPTIONS:
+            configured_value = effective_values.get(normalized_key)
+            if configured_value is None:
+                continue
+            fragments = occurrences.get((concrete_section, normalized_key))
+            if fragments is None:
+                fragments = occurrences.get((None, normalized_key))
+            if fragments is None or not _pip_fragments_match_value(
+                fragments,
+                configured_value,
+                raw,
+            ):
+                return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+            for fragment in fragments:
+                candidates.append(
+                    _Candidate(
+                        ecosystem=DependencyEcosystem.PIP,
+                        surface=DependencySourceSurface.PIP_CONFIG,
+                        operation=(
+                            DependencySourceOperation.REPLACE
+                            if normalized_key == "index-url"
+                            else DependencySourceOperation.ADD
+                        ),
+                        scope=(
+                            DependencySourceScope.GLOBAL
+                            if concrete_section == "global"
+                            else DependencySourceScope.COMMAND
+                        ),
+                        span=SourceSpan(
+                            path,
+                            fragment.start_byte,
+                            fragment.end_byte,
+                            fragment.line,
+                            fragment.line,
+                        ),
+                    )
                 )
-            )
     candidates.sort(key=lambda candidate: candidate.span.start_byte)
     return _changes_from_candidates(candidates, path=path, raw=raw, budget=budget)
 

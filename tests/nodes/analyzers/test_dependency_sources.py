@@ -236,6 +236,142 @@ def test_pip_same_indent_options_are_assignments_not_continuation_tokens() -> No
 
 
 @pytest.mark.parametrize(
+    ("option", "operation"),
+    [("--index-url", "replace"), ("--EXTRA_INDEX_URL", "add")],
+)
+def test_pip_accepts_exactly_one_leading_double_dash(
+    option: str,
+    operation: str,
+) -> None:
+    analysis = _analyze(
+        {"pip.conf": f"[global]\n{option}=https://packages.example.invalid/simple\n"}
+    )
+
+    assert analysis.limitations == ()
+    assert len(analysis.findings) == 1
+    assert analysis.findings[0].evidence["operation"] == operation
+
+
+@pytest.mark.parametrize("option", ["-index-url", "---index-url", "--trusted-host"])
+def test_pip_rejects_invalid_dash_counts_and_unrelated_options(option: str) -> None:
+    analysis = _analyze(
+        {"pip.conf": f"[global]\n{option}=https://packages.example.invalid/simple\n"}
+    )
+
+    assert analysis.findings == ()
+    assert analysis.limitations == ()
+
+
+def test_pip_double_dash_and_plain_spellings_share_last_value_semantics() -> None:
+    content = (
+        "[global]\n"
+        "index-url=https://first.example.invalid/simple\n"
+        "--INDEX_URL=https://effective.example.invalid/simple\n"
+    )
+
+    analysis = _analyze({"pip.conf": content})
+
+    assert analysis.limitations == ()
+    assert [finding.start_line for finding in analysis.findings] == [3]
+    assert analysis.findings[0].evidence["destination"] == (
+        "https://effective.example.invalid/REDACTED_PATH"
+    )
+
+
+def test_pip_double_dash_value_has_an_exact_utf8_byte_span() -> None:
+    module = importlib.import_module("skillspector.dependency_sources")
+    prefix = "# multibyte é\r\n[global]\r\n--INDEX_URL = "
+    destination = "https://packages.example.invalid/simple"
+    content = f"{prefix}{destination}\r\n"
+
+    parsed = module._parse_file(
+        "pip.conf",
+        content,
+        content.encode(),
+        DependencyWorkBudget().for_file("pip.conf"),
+    )
+
+    assert parsed.limitations == ()
+    assert len(parsed.changes) == 1
+    assert (parsed.changes[0].span.start_byte, parsed.changes[0].span.end_byte) == (
+        len(prefix.encode()),
+        len(f"{prefix}{destination}".encode()),
+    )
+
+
+def test_pip_default_only_does_not_create_an_effective_concrete_source() -> None:
+    analysis = _analyze(
+        {"pip.conf": ("[DEFAULT]\nindex-url=https://packages.example.invalid/simple\n")}
+    )
+
+    assert analysis.findings == ()
+    assert analysis.limitations == ()
+
+
+def test_pip_concrete_override_suppresses_an_inherited_default() -> None:
+    content = (
+        "[DEFAULT]\n"
+        "index-url=https://packages.example.invalid/simple\n"
+        "[global]\n"
+        "index-url=https://pypi.org/simple\n"
+    )
+
+    analysis = _analyze({"pip.conf": content})
+
+    assert analysis.findings == ()
+    assert analysis.limitations == ()
+
+
+@pytest.mark.parametrize(
+    ("section", "scope"),
+    [("global", "global"), ("install", "command")],
+)
+def test_pip_inherited_default_uses_concrete_scope_and_default_occurrence(
+    section: str,
+    scope: str,
+) -> None:
+    content = (
+        f"[DEFAULT]\nindex-url=https://packages.example.invalid/simple\n[{section}]\ntimeout=30\n"
+    )
+
+    analysis = _analyze({"pip.conf": content})
+
+    assert analysis.limitations == ()
+    assert len(analysis.findings) == 1
+    finding = analysis.findings[0]
+    assert finding.evidence["scope"] == scope
+    assert finding.start_line == 2
+
+
+def test_pip_default_inheritance_and_overrides_remain_independent_per_section() -> None:
+    content = (
+        "[DEFAULT]\n"
+        "index-url=https://default.example.invalid/simple\n"
+        "extra-index-url=https://extra.example.invalid/simple\n"
+        "[global]\n"
+        "index-url=https://pypi.org/simple\n"
+        "[install]\n"
+        "extra-index-url=https://install.example.invalid/simple\n"
+        "[download]\n"
+        "timeout=30\n"
+    )
+
+    analysis = _analyze({"pip.conf": content})
+
+    assert analysis.limitations == ()
+    assert [
+        (finding.start_line, finding.evidence["operation"], finding.evidence["scope"])
+        for finding in analysis.findings
+    ] == [
+        (2, "replace", "command"),
+        (2, "replace", "command"),
+        (3, "add", "global"),
+        (3, "add", "command"),
+        (7, "add", "command"),
+    ]
+
+
+@pytest.mark.parametrize(
     ("path", "content", "expected_start", "expected_end", "expected_line"),
     [
         (
