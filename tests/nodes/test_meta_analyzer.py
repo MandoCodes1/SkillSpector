@@ -202,7 +202,7 @@ def test_documentation_framed_finding_survives_provider_outcome_matrix() -> None
         _assert_preserved_ar2(meta_analyzer(llm_state), original)
 
 
-def test_authoritative_projection_is_invariant_under_hostile_provider_fields() -> None:
+def test_authoritative_projection_is_invariant_across_every_provider_outcome() -> None:
     original = Finding(
         rule_id="SC10",
         message="deterministic dependency source replacement",
@@ -218,9 +218,53 @@ def test_authoritative_projection_is_invariant_under_hostile_provider_fields() -
     )
     batch = Batch(file_path=original.file, content="safe provider copy", findings=[original])
     expected = _authoritative_projection(original, confidence_floor=original.confidence)
-    outcomes = (
-        [],
-        [
+    state: SkillspectorState = {
+        "findings": [original],
+        "use_llm": False,
+        "file_cache": {original.file: "safe canonical content"},
+        "llm_file_cache": {original.file: "safe provider copy"},
+        "manifest": {},
+        "model_config": {},
+    }
+    projected: dict[str, Finding] = {}
+
+    disabled_result = meta_analyzer(state)
+    [projected["disabled"]] = disabled_result["findings"]
+
+    failed_state = dict(state)
+    failed_state["use_llm"] = True
+    with patch("skillspector.nodes.meta_analyzer.LLMMetaAnalyzer") as mock_cls:
+        mock_cls.return_value.get_batches.return_value = [batch]
+        mock_cls.return_value.arun_batches = AsyncMock(side_effect=TimeoutError("provider timeout"))
+        mock_cls.return_value.response_received = False
+        mock_cls.return_value.inference_usage = []
+        failed_result = meta_analyzer(failed_state)
+    [projected["failed"]] = failed_result["findings"]
+
+    provider_outcomes: dict[str, list[dict[str, object]]] = {
+        "empty": [],
+        "confirming": [
+            {
+                "pattern_id": "SC10",
+                "is_vulnerability": True,
+                "confidence": 0.99,
+                "start_line": 3,
+                "_file": "pip.conf",
+                "explanation": "useful provider presentation context",
+                "remediation": "use the canonical registry",
+            }
+        ],
+        "downgrading": [
+            {
+                "pattern_id": "SC10",
+                "is_vulnerability": True,
+                "confidence": 0.0,
+                "start_line": 3,
+                "_file": "pip.conf",
+                "severity": "LOW",
+            }
+        ],
+        "suppressing": [
             {
                 "pattern_id": "SC10",
                 "is_vulnerability": False,
@@ -234,7 +278,7 @@ def test_authoritative_projection_is_invariant_under_hostile_provider_fields() -
                 "evidence": {},
             }
         ],
-        [
+        "rewriting": [
             {
                 "pattern_id": "SC10",
                 "is_vulnerability": True,
@@ -248,7 +292,7 @@ def test_authoritative_projection_is_invariant_under_hostile_provider_fields() -
                 "evidence": {"surface": "hostile"},
             }
         ],
-        [
+        "hostile": [
             {
                 "pattern_id": "HOSTILE",
                 "is_vulnerability": True,
@@ -257,11 +301,26 @@ def test_authoritative_projection_is_invariant_under_hostile_provider_fields() -
                 "_file": "pip.conf",
             }
         ],
-    )
+    }
 
-    for provider_items in outcomes:
+    for outcome, provider_items in provider_outcomes.items():
         [result] = _analyzer().apply_filter([original], [(batch, provider_items)])
-        assert _authoritative_projection(result, confidence_floor=original.confidence) == expected
+        projected[outcome] = result
+
+    assert set(projected) == {
+        "disabled",
+        "failed",
+        "empty",
+        "confirming",
+        "downgrading",
+        "suppressing",
+        "rewriting",
+        "hostile",
+    }
+    for outcome, result in projected.items():
+        assert (
+            _authoritative_projection(result, confidence_floor=original.confidence) == expected
+        ), outcome
 
 
 @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)

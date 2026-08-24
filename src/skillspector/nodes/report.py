@@ -153,14 +153,72 @@ def _sanitize_arbitrary_value(value: object) -> object:
     return REDACTED_VALUE
 
 
+_EVIDENCE_STRING_FIELDS = frozenset(
+    {
+        "actual_behavior_summary",
+        "code_path",
+        "concealment",
+        "container_type",
+        "destination",
+        "destination_status",
+        "ecosystem",
+        "nested_path",
+        "operation",
+        "outer_path",
+        "scope",
+        "surface",
+    }
+)
+_EVIDENCE_STRING_LIST_FIELDS = frozenset({"concealment_reasons", "container_ancestry"})
+_EVIDENCE_INTEGER_FIELDS = frozenset({"code_end_line", "code_start_line", "container_depth"})
+_EVIDENCE_BOOLEAN_FIELDS = frozenset({"local_only"})
+_EVIDENCE_FIELDS = (
+    _EVIDENCE_STRING_FIELDS
+    | _EVIDENCE_STRING_LIST_FIELDS
+    | _EVIDENCE_INTEGER_FIELDS
+    | _EVIDENCE_BOOLEAN_FIELDS
+)
+
+
 def _sanitize_evidence(evidence: Mapping[str, object]) -> dict[str, object]:
-    """Sanitize flat evidence fields and preserve safe container types on failure."""
-    sanitized: dict[str, object] = {}
+    """Sanitize only the fixed finding-evidence schema under one aggregate walk."""
+    if type(evidence) is not dict or len(evidence) > len(_EVIDENCE_FIELDS):
+        return {}
+    if any(type(key) is not str or key not in _EVIDENCE_FIELDS for key in evidence):
+        return {}
+
+    fixed: dict[str, object] = {}
     for key, value in evidence.items():
-        safe_key = _sanitize_text(str(key)) or ""
-        if safe_key:
-            sanitized[safe_key] = _sanitize_arbitrary_value(value)
-    return sanitized
+        if key in _EVIDENCE_STRING_FIELDS:
+            fixed[key] = _clean_text(value) if type(value) is str else REDACTED_VALUE
+        elif key in _EVIDENCE_STRING_LIST_FIELDS:
+            fixed[key] = value if isinstance(value, (list, tuple)) else []
+        elif key in _EVIDENCE_INTEGER_FIELDS:
+            if value is not None and type(value) is not int:
+                return {}
+            fixed[key] = value
+        elif key in _EVIDENCE_BOOLEAN_FIELDS:
+            if type(value) is not bool:
+                return {}
+            fixed[key] = value
+
+    redacted = redact_value(CodeOwnedMapping(cast(Mapping[object, object], fixed)))
+    if not isinstance(redacted, CodeOwnedMapping):
+        return {}
+    unwrapped = _unwrap_code_owned(redacted)
+    if not isinstance(unwrapped, dict):
+        return {}
+
+    for key in _EVIDENCE_STRING_FIELDS & unwrapped.keys():
+        if not isinstance(unwrapped[key], str):
+            unwrapped[key] = REDACTED_VALUE
+    for key in _EVIDENCE_STRING_LIST_FIELDS & unwrapped.keys():
+        value = unwrapped[key]
+        if not isinstance(value, list) or not all(type(item) is str for item in value):
+            unwrapped[key] = []
+        else:
+            unwrapped[key] = [_clean_text(item) or "" for item in value]
+    return unwrapped
 
 
 _OCCURRENCE_FIELDS = frozenset(

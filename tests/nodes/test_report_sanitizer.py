@@ -26,6 +26,7 @@ from skillspector.nodes.report import _clean_text, _sanitize_finding, report
 from skillspector.sarif_models import validate_sarif_report
 from skillspector.state import SkillspectorState
 from skillspector.suppression import Baseline, SuppressionRule
+from skillspector.url_redaction import MAX_REDACTION_NODES
 
 
 def _dirty_finding() -> Finding:
@@ -166,15 +167,80 @@ def test_report_redacts_credentials_across_every_public_artifact(fmt: str) -> No
         payload = json.loads(body)
         evidence = payload["issues"][0]["evidence"]
         assert isinstance(evidence, dict)
-        assert isinstance(evidence["nested_untrusted"], dict)
-        assert isinstance(evidence["history"], list)
-        assert isinstance(evidence["history"][1], dict)
+        assert evidence == {}
     if fmt == "sarif":
         payload = json.loads(body)
         validate_sarif_report(payload)
         evidence = payload["runs"][0]["results"][0]["properties"]["evidence"]
         assert isinstance(evidence, dict)
-        assert isinstance(evidence["nested_untrusted"], dict)
+        assert evidence == {}
+
+
+def test_report_evidence_with_arbitrary_top_level_key_fails_closed() -> None:
+    sentinel = "task7-arbitrary-evidence-secret"
+    raw_url = f"https://user:{sentinel}@packages.example.invalid/private"
+    finding = Finding(
+        rule_id="SC10",
+        message="dependency source replacement",
+        evidence={"destination": raw_url, "attacker_key": raw_url},
+    )
+
+    sanitized = _sanitize_finding(finding)
+
+    assert sanitized.evidence == {}
+    assert sentinel not in str(sanitized.evidence)
+
+
+def test_report_evidence_depth_exhaustion_fails_closed() -> None:
+    nested: object = "nested"
+    for _ in range(32):
+        nested = [nested]
+    finding = Finding(
+        rule_id="SC9",
+        message="concealed artifact",
+        evidence={"concealment_reasons": nested},
+    )
+
+    sanitized = _sanitize_finding(finding)
+
+    assert sanitized.evidence == {}
+
+
+def test_report_evidence_node_exhaustion_fails_closed() -> None:
+    finding = Finding(
+        rule_id="SC9",
+        message="concealed artifact",
+        evidence={"concealment_reasons": ["ordinary"] * MAX_REDACTION_NODES},
+    )
+
+    sanitized = _sanitize_finding(finding)
+
+    assert sanitized.evidence == {}
+
+
+def test_report_known_evidence_schema_preserves_list_and_string_types() -> None:
+    sentinel = "task7-known-evidence-secret"
+    raw_url = f"https://user:{sentinel}@packages.example.invalid/private"
+    finding = Finding(
+        rule_id="SC9",
+        message="concealed dependency source",
+        evidence={
+            "destination": raw_url,
+            "concealment_reasons": [raw_url],
+            "container_depth": 2,
+            "local_only": True,
+        },
+    )
+
+    sanitized = _sanitize_finding(finding)
+
+    assert type(sanitized.evidence) is dict
+    assert isinstance(sanitized.evidence["destination"], str)
+    assert isinstance(sanitized.evidence["concealment_reasons"], list)
+    assert all(isinstance(item, str) for item in sanitized.evidence["concealment_reasons"])
+    assert sanitized.evidence["container_depth"] == 2
+    assert sanitized.evidence["local_only"] is True
+    assert sentinel not in str(sanitized.evidence)
 
 
 def test_report_baseline_score_and_recommendation_use_canonical_pre_redaction_finding() -> None:
