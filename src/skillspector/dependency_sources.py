@@ -1670,6 +1670,8 @@ def _parse_cargo(
             if current in seen:
                 return DependencySourceParseResult(limitations=(_limitation(path, raw),))
             seen.add(current)
+            if current in sources and current in registries:
+                return DependencySourceParseResult(limitations=(_limitation(path, raw),))
             target = sources.get(current)
             if target is not None:
                 target_kind, target_value, _target_span = target
@@ -1781,7 +1783,7 @@ def _xml_semantic_records(
             current_path = tuple(frame.name for frame in frames)
             frame = frames[-1]
             if frame.name == "url" and len(frames) >= 2 and frames[-2].accepted:
-                frames[-2].urls.append((element.text, frame.had_child))
+                frames[-2].urls.append((element.text, frame.had_child or bool(element.attrib)))
             if frame.accepted:
                 if len(frame.urls) != 1:
                     invalid_relevant = True

@@ -1514,6 +1514,43 @@ def test_cargo_two_hop_fan_in_emits_each_replacement_and_target_only_once() -> N
 
 
 @pytest.mark.parametrize(
+    ("source_target", "registry_url"),
+    [
+        (
+            "registry='https://source.example.invalid/index'",
+            "https://registry.example.invalid/index",
+        ),
+        (
+            "registry='https://github.com/rust-lang/crates.io-index'",
+            "sparse+https://index.crates.io/",
+        ),
+        (
+            "directory='vendor'",
+            "https://registry.example.invalid/index",
+        ),
+    ],
+    ids=("configured-registry", "canonical-destinations", "inert-local-source"),
+)
+def test_cargo_replace_target_collision_between_source_and_registry_is_a_limitation(
+    source_target: str,
+    registry_url: str,
+) -> None:
+    content = (
+        "[source.origin]\nreplace-with='collision'\n"
+        f"[source.collision]\n{source_target}\n"
+        f"[registries.collision]\nindex='{registry_url}'\n"
+    )
+
+    analysis = _analyze({".cargo/config.toml": content})
+
+    _assert_single_parse_limitation(
+        analysis,
+        path=".cargo/config.toml",
+        end_line=7,
+    )
+
+
+@pytest.mark.parametrize(
     "content",
     [
         "[source.a]\nreplace-with='missing'\n",
@@ -1709,6 +1746,26 @@ def test_maven_missing_empty_duplicate_unsupported_or_malformed_urls_are_limitat
         path=path,
         end_line=content.encode().count(b"\n") + 1,
     )
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    [
+        'unexpected="value"',
+        'xmlns:private="urn:test" private:unexpected="value"',
+    ],
+    ids=("plain", "namespaced"),
+)
+def test_maven_rejects_attributes_on_accepted_url(attribute: str) -> None:
+    content = (
+        f"<settings><mirrors><mirror><url {attribute}>"
+        "https://packages.example.invalid/m2"
+        "</url></mirror></mirrors></settings>\n"
+    )
+
+    analysis = _analyze({"settings.xml": content})
+
+    _assert_single_parse_limitation(analysis, path="settings.xml", end_line=2)
 
 
 @pytest.mark.parametrize(
