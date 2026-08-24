@@ -311,7 +311,7 @@
     },
     {
       "id": "cargo-vendored-sources",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "inert",
       "files": {
@@ -321,7 +321,7 @@
     },
     {
       "id": "cargo-replace-with-registry-table",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -331,10 +331,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "cargo",
-          "surface": "Cargo source.replace-with",
+          "surface": "cargo-config",
           "operation": "replace",
-          "scope": "crates-io",
-          "destination": "sparse+https://packages.example.invalid/index/",
+          "scope": "source",
+          "destination": "sparse+https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": ".cargo/config.toml",
           "start_line": 2
@@ -342,10 +342,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "cargo",
-          "surface": "Cargo registry index",
+          "surface": "cargo-config",
           "operation": "add",
-          "scope": "mirror",
-          "destination": "sparse+https://packages.example.invalid/index/",
+          "scope": "registry",
+          "destination": "sparse+https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": ".cargo/config.toml",
           "start_line": 5
@@ -354,7 +354,7 @@
     },
     {
       "id": "maven-distribution-management",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "inert",
       "files": {
@@ -386,7 +386,7 @@
     },
     {
       "id": "line-anchor-maven-url",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -396,10 +396,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "maven",
-          "surface": "settings.xml mirror",
+          "surface": "maven-config",
           "operation": "replace",
-          "scope": "*",
-          "destination": "https://packages.example.invalid/maven2",
+          "scope": "mirror",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "settings.xml",
           "start_line": 7

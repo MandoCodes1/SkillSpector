@@ -163,7 +163,12 @@ def test_dependency_ecosystem_has_fixed_pr2_parser_categories(
 
 @pytest.mark.parametrize(
     ("value", "member_name"),
-    [(".npmrc", "NPMRC"), ("pip config", "PIP_CONFIG")],
+    [
+        (".npmrc", "NPMRC"),
+        ("pip config", "PIP_CONFIG"),
+        ("cargo-config", "CARGO_CONFIG"),
+        ("maven-config", "MAVEN_CONFIG"),
+    ],
 )
 def test_dependency_surface_has_fixed_direct_config_categories(
     value: str,
@@ -174,6 +179,26 @@ def test_dependency_surface_has_fixed_direct_config_categories(
     member = getattr(api.DependencySourceSurface, member_name)
 
     assert api.DependencySourceSurface(value) is member
+
+
+@pytest.mark.parametrize(
+    ("value", "member_name"),
+    [
+        ("source", "SOURCE"),
+        ("registry", "REGISTRY"),
+        ("mirror", "MIRROR"),
+        ("repository", "REPOSITORY"),
+    ],
+)
+def test_dependency_scope_has_fixed_cargo_and_maven_categories(
+    value: str,
+    member_name: str,
+) -> None:
+    api = _api()
+
+    member = getattr(api.DependencySourceScope, member_name)
+
+    assert api.DependencySourceScope(value) is member
 
 
 @pytest.mark.parametrize(

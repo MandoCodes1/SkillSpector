@@ -48,7 +48,7 @@
     },
     {
       "id": "control-maven-compact-mirror",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -58,10 +58,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "maven",
-          "surface": "settings.xml mirror",
+          "surface": "maven-config",
           "operation": "replace",
-          "scope": "*",
-          "destination": "https://evil.example.invalid/simple",
+          "scope": "mirror",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "settings.xml",
           "start_line": 2
@@ -92,7 +92,7 @@
     },
     {
       "id": "control-cargo-registry",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -102,10 +102,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "cargo",
-          "surface": "Cargo registry index",
+          "surface": "cargo-config",
           "operation": "add",
-          "scope": "evil",
-          "destination": "https://evil.example.invalid/simple",
+          "scope": "registry",
+          "destination": "https://evil.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": ".cargo/config.toml",
           "start_line": 2
@@ -426,7 +426,7 @@
     },
     {
       "id": "control-cargo-source-replacement-toml",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -436,10 +436,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "cargo",
-          "surface": "Cargo source.replace-with",
+          "surface": "cargo-config",
           "operation": "replace",
-          "scope": "crates-io",
-          "destination": "sparse+https://packages.example.invalid/index/",
+          "scope": "source",
+          "destination": "sparse+https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": ".cargo/config.toml",
           "start_line": 2
@@ -447,10 +447,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "cargo",
-          "surface": "Cargo source registry",
+          "surface": "cargo-config",
           "operation": "add",
-          "scope": "mirror",
-          "destination": "sparse+https://packages.example.invalid/index/",
+          "scope": "registry",
+          "destination": "sparse+https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": ".cargo/config.toml",
           "start_line": 5
@@ -459,7 +459,7 @@
     },
     {
       "id": "control-cargo-source-replacement-extensionless",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -469,10 +469,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "cargo",
-          "surface": "Cargo source.replace-with",
+          "surface": "cargo-config",
           "operation": "replace",
-          "scope": "crates-io",
-          "destination": "sparse+https://packages.example.invalid/index/",
+          "scope": "source",
+          "destination": "sparse+https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": ".cargo/config",
           "start_line": 2
@@ -480,10 +480,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "cargo",
-          "surface": "Cargo source registry",
+          "surface": "cargo-config",
           "operation": "add",
-          "scope": "mirror",
-          "destination": "sparse+https://packages.example.invalid/index/",
+          "scope": "registry",
+          "destination": "sparse+https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": ".cargo/config",
           "start_line": 5
@@ -492,7 +492,7 @@
     },
     {
       "id": "control-maven-namespaced-mirror",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -502,10 +502,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "maven",
-          "surface": "settings.xml mirror",
+          "surface": "maven-config",
           "operation": "replace",
-          "scope": "central",
-          "destination": "https://packages.example.invalid/maven2",
+          "scope": "mirror",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "settings.xml",
           "start_line": 6
@@ -514,7 +514,7 @@
     },
     {
       "id": "control-maven-commented-repository",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "inert",
       "files": {
@@ -524,7 +524,7 @@
     },
     {
       "id": "control-maven-plugin-repository",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-1",
       "expected_outcome": "finding",
       "files": {
@@ -534,10 +534,10 @@
         {
           "severity": "HIGH",
           "ecosystem": "maven",
-          "surface": "Maven repository",
+          "surface": "maven-config",
           "operation": "add",
-          "scope": "p",
-          "destination": "https://packages.example.invalid/m2",
+          "scope": "repository",
+          "destination": "https://packages.example.invalid/REDACTED_PATH",
           "destination_status": "resolved",
           "file": "pom.xml",
           "start_line": 5

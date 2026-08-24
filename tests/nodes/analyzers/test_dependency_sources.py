@@ -15,6 +15,7 @@ from skillspector.artifacts import ArtifactDisposition, ArtifactRecord, classify
 from skillspector.dependency_source_types import (
     MAX_DEPENDENCY_CONFIG_DEPTH,
     MAX_DEPENDENCY_CONFIG_NODES,
+    MAX_DEPENDENCY_FILE_BYTES,
     MAX_DEPENDENCY_RETAINED_LITERAL_BYTES,
     MAX_DEPENDENCY_SOURCE_CHANGES,
     MAX_DEPENDENCY_SOURCE_RECORDS,
@@ -1365,3 +1366,718 @@ def test_structured_numeric_conversion_failure_is_a_localized_limitation(
     analysis = _analyze({path: content})
 
     _assert_single_parse_limitation(analysis, path=path, end_line=2)
+
+
+@pytest.mark.parametrize("path", [".cargo/config", ".cargo/config.toml"])
+def test_cargo_resolves_replacement_and_emits_each_exact_configured_occurrence(
+    path: str,
+) -> None:
+    content = (
+        "# decoy sparse+https://decoy.example.invalid/index/\n"
+        "[source.crates-io]\n"
+        'replace-with = "mirror"\n'
+        "\n[registries.mirror]\n"
+        'index = "sparse+https://packages.example.invalid/index/"\n'
+    )
+
+    analysis = _analyze({path: content})
+
+    assert analysis.limitations == ()
+    assert _finding_projection(analysis) == [
+        {
+            "ecosystem": "cargo",
+            "surface": "cargo-config",
+            "operation": "replace",
+            "scope": "source",
+            "destination": "sparse+https://packages.example.invalid/REDACTED_PATH",
+            "destination_status": "resolved",
+            "file": path,
+            "start_line": 3,
+            "end_line": 3,
+        },
+        {
+            "ecosystem": "cargo",
+            "surface": "cargo-config",
+            "operation": "add",
+            "scope": "registry",
+            "destination": "sparse+https://packages.example.invalid/REDACTED_PATH",
+            "destination_status": "resolved",
+            "file": path,
+            "start_line": 6,
+            "end_line": 6,
+        },
+    ]
+
+    module = importlib.import_module("skillspector.dependency_sources")
+    parsed = module._parse_file(
+        path,
+        content,
+        content.encode(),
+        DependencyWorkBudget().for_file(path),
+    )
+    assert [
+        content.encode()[change.span.start_byte : change.span.end_byte] for change in parsed.changes
+    ] == [
+        b'"mirror"',
+        b'"sparse+https://packages.example.invalid/index/"',
+    ]
+
+
+def test_maven_reports_only_direct_project_repositories_not_false_positive_decoys() -> None:
+    content = (
+        "<project>\n"
+        "  <!-- <repositories><repository><url>https://comment.example.invalid/m2</url>"
+        "</repository></repositories> -->\n"
+        "  <distributionManagement>\n"
+        "    <repository><url>https://release.example.invalid/m2</url></repository>\n"
+        "    <snapshotRepository><url>https://snapshot.example.invalid/m2</url>"
+        "</snapshotRepository>\n"
+        "    <repository><pluginRepositories><pluginRepository>"
+        "<url>https://nested-plugin.example.invalid/m2</url>"
+        "</pluginRepository></pluginRepositories></repository>\n"
+        "  </distributionManagement>\n"
+        "  <pluginRepositories><pluginRepository>\n"
+        "    <url>https://plugins.example.invalid/m2</url>\n"
+        "  </pluginRepository></pluginRepositories>\n"
+        "</project>\n"
+    )
+
+    analysis = _analyze({"pom.xml": content})
+
+    assert analysis.limitations == ()
+    assert _finding_projection(analysis) == [
+        {
+            "ecosystem": "maven",
+            "surface": "maven-config",
+            "operation": "add",
+            "scope": "repository",
+            "destination": "https://plugins.example.invalid/REDACTED_PATH",
+            "destination_status": "resolved",
+            "file": "pom.xml",
+            "start_line": 9,
+            "end_line": 9,
+        }
+    ]
+
+
+def test_cargo_standalone_sources_and_registries_keep_distinct_equal_url_occurrences() -> None:
+    content = (
+        "# café\r\n"
+        "[source.first-private-name]\r\n"
+        'registry = "https://same.example.invalid/index"\r\n'
+        "[registries.second-private-name]\r\n"
+        'index = "https://same.example.invalid/index"\r\n'
+    )
+
+    analysis = _analyze({".cargo/config.toml": content})
+
+    assert analysis.limitations == ()
+    assert [finding.start_line for finding in analysis.findings] == [3, 5]
+    assert {finding.evidence["surface"] for finding in analysis.findings} == {"cargo-config"}
+    assert {finding.evidence["operation"] for finding in analysis.findings} == {"add"}
+    assert {finding.evidence["scope"] for finding in analysis.findings} == {"registry"}
+    assert len(analysis.findings) == 2
+    assert "first-private-name" not in repr(analysis)
+    assert "second-private-name" not in repr(analysis)
+
+
+def test_cargo_two_hop_fan_in_emits_each_replacement_and_target_only_once() -> None:
+    content = (
+        "[source.first-private-name]\nreplace-with='middle-private-name'\n"
+        "[source.second-private-name]\nreplace-with='middle-private-name'\n"
+        "[source.middle-private-name]\nreplace-with='target-private-name'\n"
+        "[registries.target-private-name]\n"
+        "index='sparse+https://packages.example.invalid/index/'\n"
+    )
+
+    analysis = _analyze({".cargo/config.toml": content})
+
+    assert analysis.limitations == ()
+    assert [finding.evidence["operation"] for finding in analysis.findings] == [
+        "replace",
+        "replace",
+        "replace",
+        "add",
+    ]
+    assert [finding.start_line for finding in analysis.findings] == [2, 4, 6, 8]
+    assert {finding.evidence["scope"] for finding in analysis.findings} == {
+        "source",
+        "registry",
+    }
+    for private_name in (
+        "first-private-name",
+        "second-private-name",
+        "middle-private-name",
+        "target-private-name",
+    ):
+        assert private_name not in repr(analysis)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[source.a]\nreplace-with='missing'\n",
+        "[source.a]\nreplace-with='b'\n[source.b]\nreplace-with='a'\n",
+        "[source.a]\nreplace-with=''\n",
+        "[source.a]\nreplace-with=1\n",
+        "[source.a]\nregistry=''\n",
+        "[source.a]\nregistry='   '\n",
+        "[registries.a]\nindex=1\n",
+        "[registries.a]\nindex='   '\n",
+        "[source.a]\nregistry='https://one.example.invalid'\nregistry='https://two.example.invalid'\n",
+        "[source.a]\nreplace-with='b'\nregistry='https://one.example.invalid'\n",
+        "[source.a]\ndirectory='vendor'\ngit='https://git.example.invalid/repo'\n",
+        "[source.a\nregistry='https://one.example.invalid'\n",
+    ],
+)
+def test_cargo_ambiguous_or_malformed_relevant_configuration_is_a_limitation(
+    content: str,
+) -> None:
+    analysis = _analyze({".cargo/config.toml": content})
+
+    _assert_single_parse_limitation(
+        analysis,
+        path=".cargo/config.toml",
+        end_line=content.encode().count(b"\n") + 1,
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[source.a]\ndirectory='vendor'\n",
+        "[source.a]\nlocal-registry='vendor/index'\n",
+        "[source.a]\ngit='https://git.example.invalid/repo'\n",
+        (
+            "[source.custom]\n"
+            "registry='https://github.com/rust-lang/crates.io-index/'\n"
+            "[registries.sparse]\nindex='SPARSE+HTTPS://INDEX.CRATES.IO'\n"
+            "[source.origin]\nreplace-with='custom'\n"
+        ),
+    ],
+)
+def test_cargo_local_targets_and_exact_canonical_destinations_are_inert(content: str) -> None:
+    analysis = _analyze({".cargo/config": content})
+
+    assert analysis.findings == ()
+    assert analysis.limitations == ()
+
+
+def test_cargo_credentials_and_attacker_identifiers_never_cross_public_boundaries() -> None:
+    identifier = "private-registry-identifier-7f3c"
+    secret = "cargo-secret-4f387"
+    content = (
+        f"[registries.{identifier}]\n"
+        f'index="sparse+https://alice:{secret}@packages.example.invalid/private?token={secret}"\n'
+    )
+
+    analysis = _analyze({".cargo/config.toml": content})
+
+    assert len(analysis.findings) == 1
+    assert analysis.limitations == ()
+    assert secret not in repr(analysis)
+    assert identifier not in repr(analysis)
+    assert analysis.findings[0].evidence["destination"] == (
+        "sparse+https://packages.example.invalid/REDACTED_PATH"
+    )
+
+
+def test_maven_settings_accepts_only_mirrors_and_profile_repository_paths() -> None:
+    content = (
+        '<settings xmlns="urn:test">\n'
+        "  <mirrors><mirror><id>private-mirror-id</id><mirrorOf>private-pattern</mirrorOf>\n"
+        "    <url>https://mirror.example.invalid/m2</url></mirror></mirrors>\n"
+        "  <profiles><profile><id>private-profile-id</id>\n"
+        "    <repositories><repository><url>https://repo.example.invalid/m2</url>"
+        "</repository></repositories>\n"
+        "    <pluginRepositories><pluginRepository>\n"
+        "      <url>https://plugins.example.invalid/m2</url>\n"
+        "    </pluginRepository></pluginRepositories>\n"
+        "  </profile></profiles>\n"
+        "  <repositories><repository><url>https://wrong-depth.example.invalid/m2</url>"
+        "</repository></repositories>\n"
+        "</settings>\n"
+    )
+
+    analysis = _analyze({"settings.xml": content})
+
+    assert analysis.limitations == ()
+    assert [
+        (finding.evidence["operation"], finding.evidence["scope"], finding.start_line)
+        for finding in analysis.findings
+    ] == [
+        ("replace", "mirror", 3),
+        ("add", "repository", 5),
+        ("add", "repository", 7),
+    ]
+    assert {finding.evidence["surface"] for finding in analysis.findings} == {"maven-config"}
+    for private_value in ("private-mirror-id", "private-pattern", "private-profile-id"):
+        assert private_value not in repr(analysis)
+
+
+def test_maven_project_accepts_both_direct_repository_container_types() -> None:
+    content = (
+        "<project>\n"
+        "  <repositories><repository><url>https://repo.example.invalid/m2</url>"
+        "</repository></repositories>\n"
+        "  <pluginRepositories><pluginRepository><url>https://plugins.example.invalid/m2"
+        "</url></pluginRepository></pluginRepositories>\n"
+        "</project>\n"
+    )
+
+    analysis = _analyze({"pom.xml": content})
+
+    assert analysis.limitations == ()
+    assert [finding.start_line for finding in analysis.findings] == [2, 3]
+    assert {finding.evidence["scope"] for finding in analysis.findings} == {"repository"}
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        (
+            "settings.xml",
+            "<project><mirrors><mirror><url>https://wrong.example.invalid/m2</url>"
+            "</mirror></mirrors></project>\n",
+        ),
+        (
+            "pom.xml",
+            "<settings><repositories><repository><url>https://wrong.example.invalid/m2</url>"
+            "</repository></repositories></settings>\n",
+        ),
+        (
+            "pom.xml",
+            "<project><profiles><profile><repositories><repository>"
+            "<url>https://nested.example.invalid/m2</url></repository></repositories>"
+            "</profile></profiles></project>\n",
+        ),
+        (
+            "pom.xml",
+            "<project><!-- <pluginRepositories><pluginRepository><url>"
+            "https://comment.example.invalid/m2</url></pluginRepository>"
+            "</pluginRepositories> --></project>\n",
+        ),
+    ],
+)
+def test_maven_wrong_roots_nested_paths_and_comments_are_inert(
+    path: str,
+    content: str,
+) -> None:
+    analysis = _analyze({path: content})
+
+    assert analysis.findings == ()
+    assert analysis.limitations == ()
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        (
+            "settings.xml",
+            "<settings><mirrors><mirror></mirror></mirrors></settings>\n",
+        ),
+        (
+            "settings.xml",
+            "<settings><mirrors><mirror><url> </url></mirror></mirrors></settings>\n",
+        ),
+        (
+            "settings.xml",
+            "<settings><mirrors><mirror><url>https://one.example.invalid</url>"
+            "<url>https://two.example.invalid</url></mirror></mirrors></settings>\n",
+        ),
+        (
+            "pom.xml",
+            "<project><repositories><repository><url><value>https://x.example.invalid"
+            "</value></url></repository></repositories></project>\n",
+        ),
+        (
+            "pom.xml",
+            "<project><repositories><repository><url>https://x.example.invalid<!--x-->"
+            "</url></repository></repositories></project>\n",
+        ),
+        ("pom.xml", "<project><repositories>\n"),
+    ],
+)
+def test_maven_missing_empty_duplicate_unsupported_or_malformed_urls_are_limitations(
+    path: str,
+    content: str,
+) -> None:
+    analysis = _analyze({path: content})
+
+    _assert_single_parse_limitation(
+        analysis,
+        path=path,
+        end_line=content.encode().count(b"\n") + 1,
+    )
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "<!DOCTYPE x>",
+        "<!ENTITY x 'value'>",
+        "<!-- <!DOCTYPE x> -->",
+        "<!-- <!ENTITY x 'value'> -->",
+        "<![CDATA[<!DOCTYPE x>]]>",
+        "<![CDATA[<!ENTITY x 'value'>]]>",
+    ],
+)
+def test_maven_rejects_raw_dtd_and_entity_markers_everywhere_before_parser_construction(
+    marker: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("skillspector.dependency_sources")
+    calls: list[object] = []
+
+    def unexpected_parser(*args: object, **kwargs: object) -> object:
+        calls.append((args, kwargs))
+        raise AssertionError("XMLPullParser must not be constructed")
+
+    monkeypatch.setattr(module.ET, "XMLPullParser", unexpected_parser)
+    content = f"<settings><value>{marker}</value></settings>\n"
+
+    analysis = _analyze({"settings.xml": content})
+
+    _assert_single_parse_limitation(analysis, path="settings.xml", end_line=2)
+    assert calls == []
+
+
+def test_maven_xml_decoding_canonicality_interpolation_redaction_and_spans() -> None:
+    secret = "maven-secret-4f387"
+    content = (
+        "<settings>\n"
+        "  <mirrors>\n"
+        "    <mirror><url>https://repo.maven.apache.org/maven2&#x2F;</url></mirror>\n"
+        f"    <mirror><url>https://alice:{secret[:5]}&#x2D;{secret[6:]}@packages.example.invalid/private</url></mirror>\n"
+        "    <mirror><url>https://${private.repository}/m2</url></mirror>\n"
+        "  </mirrors>\n"
+        "</settings>\n"
+    )
+
+    analysis = _analyze({"settings.xml": content})
+
+    assert analysis.limitations == ()
+    assert len(analysis.findings) == 2
+    assert [finding.start_line for finding in analysis.findings] == [4, 5]
+    assert analysis.findings[0].evidence["destination"] == (
+        "https://packages.example.invalid/REDACTED_PATH"
+    )
+    assert analysis.findings[1].evidence == {
+        "ecosystem": "maven",
+        "surface": "maven-config",
+        "operation": "replace",
+        "scope": "mirror",
+        "destination": "unresolved",
+        "destination_status": "unresolved",
+    }
+    assert secret not in repr(analysis)
+    assert "private.repository" not in repr(analysis)
+
+    module = importlib.import_module("skillspector.dependency_sources")
+    parsed = module._parse_file(
+        "settings.xml",
+        content,
+        content.encode(),
+        DependencyWorkBudget().for_file("settings.xml"),
+    )
+    assert content.encode()[
+        parsed.changes[0].span.start_byte : parsed.changes[0].span.end_byte
+    ].startswith(b"https://alice:")
+
+
+def test_maven_repeated_url_text_uses_accepted_parent_and_utf8_byte_correlation() -> None:
+    content = (
+        "<project>\r\n"
+        "  <name>café https://same.example.invalid/m2</name>\r\n"
+        "  <!-- https://same.example.invalid/m2 -->\r\n"
+        "  <repositories><repository>\r\n"
+        "    <url>https://same.example.invalid/m2</url>\r\n"
+        "  </repository></repositories>\r\n"
+        "</project>\r\n"
+    )
+
+    analysis = _analyze({"pom.xml": content})
+
+    assert analysis.limitations == ()
+    assert len(analysis.findings) == 1
+    assert analysis.findings[0].start_line == 5
+    module = importlib.import_module("skillspector.dependency_sources")
+    parsed = module._parse_file(
+        "pom.xml",
+        content,
+        content.encode(),
+        DependencyWorkBudget().for_file("pom.xml"),
+    )
+    span = parsed.changes[0].span
+    assert content.encode()[span.start_byte : span.end_byte] == (b"https://same.example.invalid/m2")
+
+
+def test_maven_url_span_excludes_surrounding_xml_whitespace() -> None:
+    content = (
+        "<settings><mirrors><mirror><url> \r\n"
+        "  https://packages.example.invalid/m2\t </url></mirror></mirrors></settings>\n"
+    )
+    module = importlib.import_module("skillspector.dependency_sources")
+
+    parsed = module._parse_file(
+        "settings.xml",
+        content,
+        content.encode(),
+        DependencyWorkBudget().for_file("settings.xml"),
+    )
+
+    assert parsed.limitations == ()
+    assert len(parsed.changes) == 1
+    span = parsed.changes[0].span
+    assert (span.start_line, span.end_line) == (2, 2)
+    assert content.encode()[span.start_byte : span.end_byte] == (
+        b"https://packages.example.invalid/m2"
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        (
+            ".cargo/config.toml",
+            "[registries.x]\nindex='https://github.com/rust-lang/crates.io-index?query=1'\n",
+        ),
+        (
+            ".cargo/config.toml",
+            "[registries.x]\nindex='sparse+https://index.crates.io/#fragment'\n",
+        ),
+        (
+            "settings.xml",
+            "<settings><mirrors><mirror><url>https://repo.maven.apache.org:443/maven2/"
+            "</url></mirror></mirrors></settings>\n",
+        ),
+        (
+            "settings.xml",
+            "<settings><mirrors><mirror><url>https://repo.maven.apache.org/MAVEN2/"
+            "</url></mirror></mirrors></settings>\n",
+        ),
+    ],
+)
+def test_cargo_and_maven_canonical_origin_variants_remain_noncanonical(
+    path: str,
+    content: str,
+) -> None:
+    analysis = _analyze({path: content})
+
+    assert len(analysis.findings) == 1
+    assert analysis.limitations == ()
+
+
+@pytest.mark.parametrize(
+    ("path", "raw"),
+    [
+        (".cargo/config.toml", b"[registries.x]\nindex='https://x.invalid'\xff\n"),
+        ("settings.xml", b"<settings>\xff</settings>\n"),
+    ],
+)
+def test_cargo_and_maven_invalid_utf8_are_content_free_limitations(
+    path: str,
+    raw: bytes,
+) -> None:
+    analysis = _analyze(
+        {},
+        components=[path],
+        raw_file_cache={path: raw},
+        local_file_cache={path: raw.decode("utf-8", errors="replace")},
+        artifact_inventory=[classify_artifact(path, raw)],
+    )
+
+    limitation = _assert_single_parse_limitation(
+        analysis,
+        path=path,
+        end_line=raw.count(b"\n") + 1,
+    )
+    assert "x.invalid" not in repr(limitation)
+
+
+@pytest.mark.parametrize("family", ["cargo", "maven"])
+def test_cargo_and_maven_physical_byte_limit_is_exact_and_one_over(family: str) -> None:
+    if family == "cargo":
+        prefix = "[registries.x]\nindex='https://packages.example.invalid/index'\n#"
+        suffix = "\n"
+        path = ".cargo/config.toml"
+    else:
+        prefix = "<settings><!--"
+        suffix = "--></settings>"
+        path = "settings.xml"
+    exact = (
+        prefix
+        + "x" * (MAX_DEPENDENCY_FILE_BYTES - len(prefix.encode()) - len(suffix.encode()))
+        + suffix
+    )
+    one_over = exact + ("#" if family == "cargo" else " ")
+
+    exact_analysis = _analyze({path: exact})
+    over_analysis = _analyze({path: one_over})
+
+    assert exact_analysis.limitations == ()
+    limitation = _assert_single_parse_limitation(
+        over_analysis,
+        path=path,
+        end_line=1 if family == "maven" else 4,
+    )
+    assert limitation.ledger_metrics() == {
+        "observed_bytes": MAX_DEPENDENCY_FILE_BYTES + 1,
+        "limit_bytes": MAX_DEPENDENCY_FILE_BYTES,
+    }
+
+
+def test_maven_physical_limit_rejects_before_parser_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("skillspector.dependency_sources")
+    calls: list[object] = []
+
+    def unexpected_parser(*args: object, **kwargs: object) -> object:
+        calls.append((args, kwargs))
+        raise AssertionError("XMLPullParser must not be constructed")
+
+    monkeypatch.setattr(module.ET, "XMLPullParser", unexpected_parser)
+    content = "<settings/>\n"
+    inventory = classify_artifact("settings.xml", content.encode())
+    inventory["size_bytes"] = MAX_DEPENDENCY_FILE_BYTES + 1
+
+    analysis = _analyze({"settings.xml": content}, artifact_inventory=[inventory])
+
+    _assert_single_parse_limitation(analysis, path="settings.xml", end_line=2)
+    assert calls == []
+
+
+def test_cargo_physical_limit_rejects_before_toml_parser_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("skillspector.dependency_sources")
+    calls: list[str] = []
+
+    def unexpected_loads(text: str) -> object:
+        calls.append(text)
+        raise AssertionError("tomllib must not be called")
+
+    monkeypatch.setattr(module.tomllib, "loads", unexpected_loads)
+    content = "[registries.x]\nindex='https://x.example.invalid'\n"
+    inventory = classify_artifact(".cargo/config.toml", content.encode())
+    inventory["size_bytes"] = MAX_DEPENDENCY_FILE_BYTES + 1
+
+    analysis = _analyze({".cargo/config.toml": content}, artifact_inventory=[inventory])
+
+    _assert_single_parse_limitation(analysis, path=".cargo/config.toml", end_line=3)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("family", "path", "content", "nodes"),
+    [
+        (
+            "cargo",
+            ".cargo/config.toml",
+            "[registries.x]\nindex='https://packages.example.invalid/index'\n",
+            7,
+        ),
+        (
+            "maven",
+            "settings.xml",
+            "<settings><mirrors><mirror><url>https://packages.example.invalid/m2</url>"
+            "</mirror></mirrors></settings>\n",
+            4,
+        ),
+    ],
+)
+def test_cargo_and_maven_node_budget_is_exact_and_one_over(
+    family: str,
+    path: str,
+    content: str,
+    nodes: int,
+) -> None:
+    exact_budget = DependencyWorkBudget()
+    assert exact_budget.charge_config_nodes(MAX_DEPENDENCY_CONFIG_NODES - nodes) is None
+    assert _analyze({path: content}, budget=exact_budget).limitations == ()
+
+    over_budget = DependencyWorkBudget()
+    assert over_budget.charge_config_nodes(MAX_DEPENDENCY_CONFIG_NODES - nodes + 1) is None
+    limitation = _assert_single_parse_limitation(
+        _analyze({path: content}, budget=over_budget),
+        path=path,
+        end_line=content.encode().count(b"\n") + 1,
+    )
+    assert limitation.ledger_metrics() == {
+        "observed_records": MAX_DEPENDENCY_CONFIG_NODES + 1,
+        "limit_records": MAX_DEPENDENCY_CONFIG_NODES,
+    }
+
+
+@pytest.mark.parametrize("family", ["cargo", "maven"])
+def test_cargo_and_maven_depth_limit_is_exact_and_one_over(family: str) -> None:
+    if family == "cargo":
+        path = ".cargo/config.toml"
+
+        def nested(depth: int) -> str:
+            return f"[{'.'.join(f'a{index}' for index in range(depth - 1))}]\nvalue=1\n"
+    else:
+        path = "settings.xml"
+
+        def nested(depth: int) -> str:
+            inner = "<value/>"
+            for index in range(depth - 2):
+                inner = f"<n{index}>{inner}</n{index}>"
+            return f"<settings>{inner}</settings>\n"
+
+    assert _analyze({path: nested(MAX_DEPENDENCY_CONFIG_DEPTH)}).limitations == ()
+    limitation = _assert_single_parse_limitation(
+        _analyze({path: nested(MAX_DEPENDENCY_CONFIG_DEPTH + 1)}),
+        path=path,
+        end_line=2 if family == "maven" else 3,
+    )
+    assert limitation.ledger_metrics() == {
+        "observed_depth": MAX_DEPENDENCY_CONFIG_DEPTH + 1,
+        "limit_depth": MAX_DEPENDENCY_CONFIG_DEPTH,
+    }
+
+
+@pytest.mark.parametrize(
+    ("resource", "family"),
+    [
+        ("records", "cargo"),
+        ("retained", "cargo"),
+        ("changes", "cargo"),
+        ("records", "maven"),
+        ("retained", "maven"),
+        ("changes", "maven"),
+    ],
+)
+def test_cargo_and_maven_semantic_budget_is_exact_and_one_over(
+    resource: str,
+    family: str,
+) -> None:
+    literal = "https://packages.example.invalid/m2"
+    if family == "cargo":
+        path = ".cargo/config.toml"
+        content = f"[registries.x]\nindex='{literal}'\n"
+    else:
+        path = "settings.xml"
+        content = f"<settings><mirrors><mirror><url>{literal}</url></mirror></mirrors></settings>\n"
+
+    def budget_with_remaining(remaining: int) -> DependencyWorkBudget:
+        budget = DependencyWorkBudget()
+        if resource == "records":
+            assert budget.charge_source_records(MAX_DEPENDENCY_SOURCE_RECORDS - remaining) is None
+        elif resource == "retained":
+            assert (
+                budget.charge_retained_literal_bytes(
+                    MAX_DEPENDENCY_RETAINED_LITERAL_BYTES - len(literal.encode()) + (1 - remaining)
+                )
+                is None
+            )
+        else:
+            assert budget.reserve_source_changes(MAX_DEPENDENCY_SOURCE_CHANGES - remaining) is None
+        return budget
+
+    assert _analyze({path: content}, budget=budget_with_remaining(1)).limitations == ()
+    over = _analyze({path: content}, budget=budget_with_remaining(0))
+    assert over.findings == ()
+    assert len(over.limitations) == 1
+    assert over.limitations[0].ledger_metrics()

@@ -9,9 +9,10 @@ import configparser
 import json
 import re
 import tomllib
+import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Final
+from typing import Final, cast
 from urllib.parse import urlsplit
 
 import yaml  # type: ignore[import-untyped]
@@ -53,18 +54,22 @@ _PIP_BASENAMES: Final = frozenset({"pip.conf", "pip.ini"})
 _YARN_V1_BASENAMES: Final = frozenset({".yarnrc"})
 _YARN_YAML_BASENAMES: Final = frozenset({".yarnrc.yml", ".yarnrc.yaml"})
 _PYTHON_PROJECT_BASENAMES: Final = frozenset({"pyproject.toml", "uv.toml"})
+_MAVEN_BASENAMES: Final = frozenset({"settings.xml", "pom.xml"})
+_CARGO_FILENAMES: Final = frozenset({"config", "config.toml"})
 _RECOGNIZED_BASENAMES: Final = (
     _NPM_BASENAMES
     | _PIP_BASENAMES
     | _YARN_V1_BASENAMES
     | _YARN_YAML_BASENAMES
     | _PYTHON_PROJECT_BASENAMES
+    | _MAVEN_BASENAMES
 )
 _NPM_SCOPED_REGISTRY: Final = re.compile(r"^@[^:\s]+:registry$", re.IGNORECASE)
 _YARN_SCOPED_REGISTRY: Final = re.compile(r"^@[^:\s]+:registry$")
 _NPM_INTERPOLATION: Final = re.compile(r"\$\{[^{}]+\}")
 _PIP_INTERPOLATION: Final = re.compile(r"%\([^)]+\)s")
 _PDM_INTERPOLATION: Final = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+_MAVEN_INTERPOLATION: Final = re.compile(r"\$\{[^{}]+\}")
 _PIP_ASSIGNMENT: Final = re.compile(r"^\s*([^:=\s][^:=]*?)\s*([=:])\s*(.*)$")
 _PIP_SECTION: Final = re.compile(r"^\s*\[([^]]+)]\s*(?:[#;].*)?$")
 _PIP_OPTIONS: Final = ("index-url", "extra-index-url")
@@ -75,6 +80,13 @@ _CANONICAL_DEFAULTS: Final[dict[DependencyEcosystem, frozenset[str]]] = {
     DependencyEcosystem.POETRY: frozenset({"https://pypi.org/simple/"}),
     DependencyEcosystem.PDM: frozenset({"https://pypi.org/simple/"}),
     DependencyEcosystem.UV: frozenset({"https://pypi.org/simple/"}),
+    DependencyEcosystem.CARGO: frozenset(
+        {
+            "https://github.com/rust-lang/crates.io-index",
+            "sparse+https://index.crates.io/",
+        }
+    ),
+    DependencyEcosystem.MAVEN: frozenset({"https://repo.maven.apache.org/maven2/"}),
 }
 _MISSING: Final = object()
 _WRONG_SHAPE: Final = object()
@@ -122,8 +134,41 @@ class _TomlTableCursor:
     url_span: SourceSpan | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _XmlSemanticRecord:
+    parent_path: tuple[str, ...]
+    destination: str
+    operation: DependencySourceOperation
+    scope: DependencySourceScope
+
+
+@dataclass(slots=True)
+class _XmlFrame:
+    name: str
+    element: ET.Element
+    accepted: bool
+    urls: list[tuple[str | None, bool]] = field(default_factory=list)
+    had_child: bool = False
+
+
+@dataclass(slots=True)
+class _XmlLexicalFrame:
+    name: str
+    inner_start: int
+    has_markup: bool = False
+
+
 def _basename(path: str) -> str:
     return path.rsplit("/", 1)[-1]
+
+
+def _is_cargo_path(path: str) -> bool:
+    parts = path.split("/")
+    return len(parts) >= 2 and parts[-2] == ".cargo" and parts[-1] in _CARGO_FILENAMES
+
+
+def _is_recognized_path(path: str) -> bool:
+    return _basename(path) in _RECOGNIZED_BASENAMES or _is_cargo_path(path)
 
 
 def _line_count(raw: bytes | None) -> int:
@@ -242,8 +287,7 @@ def _canonical_destination(ecosystem: DependencyEcosystem, value: str) -> bool:
     try:
         parsed = urlsplit(value)
         if (
-            parsed.scheme.lower() != "https"
-            or parsed.username is not None
+            parsed.username is not None
             or parsed.password is not None
             or parsed.port is not None
             or parsed.hostname is None
@@ -262,7 +306,7 @@ def _canonical_destination(ecosystem: DependencyEcosystem, value: str) -> bool:
         if (
             parsed.scheme.casefold() == canonical.scheme.casefold()
             and parsed.hostname.casefold() == canonical_hostname.casefold()
-            and parsed.path in {canonical.path, canonical.path.removesuffix("/")}
+            and parsed.path.removesuffix("/") == canonical.path.removesuffix("/")
         ):
             return True
     return False
@@ -278,6 +322,7 @@ def _destination(
         DependencyEcosystem.NPM: _NPM_INTERPOLATION,
         DependencyEcosystem.PIP: _PIP_INTERPOLATION,
         DependencyEcosystem.PDM: _PDM_INTERPOLATION,
+        DependencyEcosystem.MAVEN: _MAVEN_INTERPOLATION,
     }.get(ecosystem)
     if interpolation is not None and interpolation.search(raw_destination):
         return "unresolved", DestinationStatus.UNRESOLVED
@@ -331,9 +376,9 @@ def _changes_from_candidates(
         for candidate in candidates:
             raw_destination = candidate.destination
             if raw_destination is None:
-                raw_destination = raw[
-                    candidate.span.start_byte : candidate.span.end_byte
-                ].decode("utf-8")
+                raw_destination = raw[candidate.span.start_byte : candidate.span.end_byte].decode(
+                    "utf-8"
+                )
             retained_literal_bytes += len(raw_destination.encode("utf-8"))
             normalized = _destination(candidate.ecosystem, raw_destination)
             if normalized is not None:
@@ -1471,6 +1516,477 @@ def _parse_python_project(
     )
 
 
+def _toml_direct_value_cursors(
+    path: str,
+    text: str,
+    relevant_roots: frozenset[str],
+    relevant_keys: frozenset[str],
+) -> dict[tuple[tuple[str, ...], str], SourceSpan] | None:
+    cursors: dict[tuple[tuple[str, ...], str], SourceSpan] = {}
+    current_table: tuple[str, ...] | None = None
+    byte_offsets = _char_to_byte_offsets(text)
+    position = 0
+    multiline_delimiter: str | None = None
+    while position < len(text):
+        line_end = text.find("\n", position)
+        if line_end < 0:
+            line_end = len(text)
+        physical_end = (
+            line_end - 1 if line_end > position and text[line_end - 1] == "\r" else line_end
+        )
+        line = text[position:physical_end]
+        stripped = line.lstrip()
+        leading = len(line) - len(stripped)
+        starts_in_multiline_string = multiline_delimiter is not None
+        if not starts_in_multiline_string and stripped.startswith("[["):
+            current_table = None
+        elif not starts_in_multiline_string and stripped.startswith("["):
+            close = _toml_find_unquoted(stripped, "]")
+            current_table = None
+            if close is None:
+                return None
+            table_path = _toml_key_parts(stripped[1:close])
+            if table_path is not None and len(table_path) == 2 and table_path[0] in relevant_roots:
+                current_table = table_path
+        elif (
+            not starts_in_multiline_string
+            and current_table is not None
+            and stripped
+            and not stripped.startswith("#")
+        ):
+            equals = _toml_find_unquoted(stripped, "=")
+            if equals is not None:
+                key_parts = _toml_key_parts(stripped[:equals])
+                if key_parts is not None and len(key_parts) == 1 and key_parts[0] in relevant_keys:
+                    value_start = position + leading + equals + 1
+                    while value_start < len(text) and text[value_start] in " \t":
+                        value_start += 1
+                    value_end = _toml_value_extent(text, value_start)
+                    cursor_key = (current_table, key_parts[0])
+                    if cursor_key in cursors or value_end <= value_start:
+                        return None
+                    cursors[cursor_key] = SourceSpan(
+                        path,
+                        byte_offsets[value_start],
+                        byte_offsets[value_end],
+                        text.count("\n", 0, value_start) + 1,
+                        text.count("\n", 0, value_end) + 1,
+                    )
+                    position = value_end
+                    next_newline = text.find("\n", position)
+                    position = len(text) if next_newline < 0 else next_newline + 1
+                    continue
+        multiline_delimiter = _toml_multiline_string_state(line, multiline_delimiter)
+        position = len(text) if line_end == len(text) else line_end + 1
+    return cursors
+
+
+def _parse_cargo(
+    path: str,
+    text: str,
+    raw: bytes,
+    budget: DependencyFileBudget,
+) -> DependencySourceParseResult:
+    try:
+        document = tomllib.loads(text)
+    except (tomllib.TOMLDecodeError, ValueError, OverflowError, RecursionError):
+        return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+    if exhaustion := _toml_structural_check(document, budget):
+        return DependencySourceParseResult(limitations=(_limitation(path, raw, exhaustion),))
+    cursors = _toml_direct_value_cursors(
+        path,
+        text,
+        frozenset({"source", "registries"}),
+        frozenset({"replace-with", "registry", "directory", "local-registry", "git", "index"}),
+    )
+    if cursors is None:
+        return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+
+    source_root = document.get("source", _MISSING)
+    registry_root = document.get("registries", _MISSING)
+    if source_root is not _MISSING and not isinstance(source_root, dict):
+        return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+    if registry_root is not _MISSING and not isinstance(registry_root, dict):
+        return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+    sources: dict[str, tuple[str, str, SourceSpan]] = {}
+    registries: dict[str, tuple[str, SourceSpan]] = {}
+    candidates: list[_Candidate] = []
+    source_kinds = ("replace-with", "registry", "directory", "local-registry", "git")
+
+    for name, record in source_root.items() if isinstance(source_root, dict) else ():
+        if not name or not isinstance(record, dict):
+            return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+        configured = [kind for kind in source_kinds if kind in record]
+        if len(configured) > 1:
+            return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+        if not configured:
+            continue
+        kind = configured[0]
+        value = record[kind]
+        span = cursors.get((("source", name), kind))
+        if not isinstance(value, str) or not value.strip() or span is None:
+            return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+        sources[name] = (kind, value, span)
+        if kind == "registry":
+            candidates.append(
+                _Candidate(
+                    ecosystem=DependencyEcosystem.CARGO,
+                    surface=DependencySourceSurface.CARGO_CONFIG,
+                    operation=DependencySourceOperation.ADD,
+                    scope=DependencySourceScope.REGISTRY,
+                    span=span,
+                    destination=value,
+                )
+            )
+
+    for name, record in registry_root.items() if isinstance(registry_root, dict) else ():
+        if not name or not isinstance(record, dict):
+            return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+        if "index" not in record:
+            continue
+        value = record["index"]
+        span = cursors.get((("registries", name), "index"))
+        if not isinstance(value, str) or not value.strip() or span is None:
+            return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+        registries[name] = (value, span)
+        candidates.append(
+            _Candidate(
+                ecosystem=DependencyEcosystem.CARGO,
+                surface=DependencySourceSurface.CARGO_CONFIG,
+                operation=DependencySourceOperation.ADD,
+                scope=DependencySourceScope.REGISTRY,
+                span=span,
+                destination=value,
+            )
+        )
+
+    for source_name, (kind, target_name, replace_span) in sources.items():
+        if kind != "replace-with":
+            continue
+        seen = {source_name}
+        current = target_name
+        destination: str | None = None
+        while True:
+            if current in seen:
+                return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+            seen.add(current)
+            target = sources.get(current)
+            if target is not None:
+                target_kind, target_value, _target_span = target
+                if target_kind == "replace-with":
+                    current = target_value
+                    continue
+                if target_kind == "registry":
+                    destination = target_value
+                break
+            registry = registries.get(current)
+            if registry is not None:
+                destination = registry[0]
+                break
+            return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+        if destination is not None:
+            candidates.append(
+                _Candidate(
+                    ecosystem=DependencyEcosystem.CARGO,
+                    surface=DependencySourceSurface.CARGO_CONFIG,
+                    operation=DependencySourceOperation.REPLACE,
+                    scope=DependencySourceScope.SOURCE,
+                    span=replace_span,
+                    destination=destination,
+                )
+            )
+
+    candidates.sort(key=lambda item: item.span.start_byte)
+    return _changes_from_candidates(
+        candidates,
+        path=path,
+        raw=raw,
+        budget=budget,
+        atomic=True,
+    )
+
+
+_MAVEN_PARENT_SEMANTICS: Final[
+    dict[tuple[str, ...], tuple[DependencySourceOperation, DependencySourceScope]]
+] = {
+    ("settings", "mirrors", "mirror"): (
+        DependencySourceOperation.REPLACE,
+        DependencySourceScope.MIRROR,
+    ),
+    ("settings", "profiles", "profile", "repositories", "repository"): (
+        DependencySourceOperation.ADD,
+        DependencySourceScope.REPOSITORY,
+    ),
+    ("settings", "profiles", "profile", "pluginRepositories", "pluginRepository"): (
+        DependencySourceOperation.ADD,
+        DependencySourceScope.REPOSITORY,
+    ),
+    ("project", "repositories", "repository"): (
+        DependencySourceOperation.ADD,
+        DependencySourceScope.REPOSITORY,
+    ),
+    ("project", "pluginRepositories", "pluginRepository"): (
+        DependencySourceOperation.ADD,
+        DependencySourceScope.REPOSITORY,
+    ),
+}
+
+
+def _xml_local_name(tag: object) -> str | None:
+    if not isinstance(tag, str):
+        return None
+    return tag.rsplit("}", 1)[-1].rsplit(":", 1)[-1]
+
+
+def _xml_semantic_records(
+    path: str,
+    text: str,
+    raw: bytes,
+    budget: DependencyFileBudget,
+) -> tuple[list[_XmlSemanticRecord] | None, bool, DependencySourceParseResult | None]:
+    parser = ET.XMLPullParser(events=("start", "end"))
+    frames: list[_XmlFrame] = []
+    records: list[_XmlSemanticRecord] = []
+    root_name: str | None = None
+    invalid_relevant = False
+
+    def consume_events() -> DependencyWorkExhaustion | bool | None:
+        nonlocal root_name, invalid_relevant
+        for raw_event in parser.read_events():
+            event, element = cast(tuple[str, ET.Element], raw_event)
+            if event == "start":
+                name = _xml_local_name(element.tag)
+                if name is None:
+                    return True
+                if exhaustion := budget.charge_config_nodes(1):
+                    return exhaustion
+                depth = len(frames) + 1
+                if exhaustion := budget.observe_depth(depth):
+                    return exhaustion
+                if frames:
+                    frames[-1].had_child = True
+                else:
+                    root_name = name
+                parent_path = tuple(frame.name for frame in frames) + (name,)
+                frames.append(
+                    _XmlFrame(
+                        name=name,
+                        element=element,
+                        accepted=parent_path in _MAVEN_PARENT_SEMANTICS,
+                    )
+                )
+                continue
+            if not frames or frames[-1].element is not element:
+                return True
+            current_path = tuple(frame.name for frame in frames)
+            frame = frames[-1]
+            if frame.name == "url" and len(frames) >= 2 and frames[-2].accepted:
+                frames[-2].urls.append((element.text, frame.had_child))
+            if frame.accepted:
+                if len(frame.urls) != 1:
+                    invalid_relevant = True
+                else:
+                    value, unsupported = frame.urls[0]
+                    normalized = value.strip() if isinstance(value, str) else ""
+                    if unsupported or not normalized:
+                        invalid_relevant = True
+                    else:
+                        operation, scope = _MAVEN_PARENT_SEMANTICS[current_path]
+                        records.append(
+                            _XmlSemanticRecord(current_path, normalized, operation, scope)
+                        )
+            frames.pop()
+            if frames:
+                try:
+                    frames[-1].element.remove(element)
+                except ValueError:
+                    return True
+            element.clear()
+        return None
+
+    try:
+        for position in range(0, len(text), 4096):
+            parser.feed(text[position : position + 4096])
+            failure = consume_events()
+            if failure is not None:
+                if isinstance(failure, DependencyWorkExhaustion):
+                    return (
+                        None,
+                        False,
+                        DependencySourceParseResult(limitations=(_limitation(path, raw, failure),)),
+                    )
+                return (
+                    None,
+                    False,
+                    DependencySourceParseResult(limitations=(_limitation(path, raw),)),
+                )
+        parser.close()
+        failure = consume_events()
+        if failure is not None:
+            if isinstance(failure, DependencyWorkExhaustion):
+                return (
+                    None,
+                    False,
+                    DependencySourceParseResult(limitations=(_limitation(path, raw, failure),)),
+                )
+            return None, False, DependencySourceParseResult(limitations=(_limitation(path, raw),))
+    except (ET.ParseError, ValueError, OverflowError, RecursionError):
+        return None, False, DependencySourceParseResult(limitations=(_limitation(path, raw),))
+    if frames:
+        return None, False, DependencySourceParseResult(limitations=(_limitation(path, raw),))
+    expected_root = "settings" if _basename(path) == "settings.xml" else "project"
+    applicable = root_name == expected_root
+    if not applicable:
+        return [], False, None
+    if invalid_relevant:
+        return None, True, DependencySourceParseResult(limitations=(_limitation(path, raw),))
+    return records, True, None
+
+
+def _xml_tag_end(raw: bytes, start: int) -> int | None:
+    quote: int | None = None
+    index = start
+    while index < len(raw):
+        character = raw[index]
+        if quote is not None:
+            if character == quote:
+                quote = None
+        elif character in {ord('"'), ord("'")}:
+            quote = character
+        elif character == ord(">"):
+            return index + 1
+        index += 1
+    return None
+
+
+def _xml_raw_local_name(token: bytes) -> str | None:
+    raw_name = token.strip().split(None, 1)[0].rstrip(b"/") if token.strip() else b""
+    if not raw_name:
+        return None
+    try:
+        return raw_name.rsplit(b":", 1)[-1].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _xml_url_spans(path: str, raw: bytes) -> list[tuple[tuple[str, ...], SourceSpan, bool]] | None:
+    stack: list[_XmlLexicalFrame] = []
+    spans: list[tuple[tuple[str, ...], SourceSpan, bool]] = []
+    index = 0
+    while index < len(raw):
+        marker = raw.find(b"<", index)
+        if marker < 0:
+            break
+        if raw.startswith(b"<!--", marker):
+            end = raw.find(b"-->", marker + 4)
+            if end < 0:
+                return None
+            if stack and stack[-1].name == "url":
+                stack[-1].has_markup = True
+            index = end + 3
+            continue
+        if raw.startswith(b"<![CDATA[", marker):
+            end = raw.find(b"]]>", marker + 9)
+            if end < 0:
+                return None
+            if stack and stack[-1].name == "url":
+                stack[-1].has_markup = True
+            index = end + 3
+            continue
+        if raw.startswith(b"<?", marker):
+            end = raw.find(b"?>", marker + 2)
+            if end < 0:
+                return None
+            if stack and stack[-1].name == "url":
+                stack[-1].has_markup = True
+            index = end + 2
+            continue
+        tag_end = _xml_tag_end(raw, marker + 1)
+        if tag_end is None:
+            return None
+        token = raw[marker + 1 : tag_end - 1]
+        if token.startswith(b"/"):
+            name = _xml_raw_local_name(token[1:])
+            if name is None or not stack or stack[-1].name != name:
+                return None
+            frame = stack.pop()
+            parent_path = tuple(item.name for item in stack)
+            if name == "url" and parent_path in _MAVEN_PARENT_SEMANTICS:
+                span_start = frame.inner_start
+                span_end = marker
+                while span_start < span_end and raw[span_start] in b" \t\r\n":
+                    span_start += 1
+                while span_end > span_start and raw[span_end - 1] in b" \t\r\n":
+                    span_end -= 1
+                spans.append(
+                    (
+                        parent_path,
+                        SourceSpan(
+                            path,
+                            span_start,
+                            span_end,
+                            raw.count(b"\n", 0, span_start) + 1,
+                            raw.count(b"\n", 0, span_end) + 1,
+                        ),
+                        frame.has_markup,
+                    )
+                )
+        elif token.startswith(b"!"):
+            return None
+        else:
+            name = _xml_raw_local_name(token)
+            if name is None:
+                return None
+            if stack and stack[-1].name == "url":
+                stack[-1].has_markup = True
+            self_closing = token.rstrip().endswith(b"/")
+            if not self_closing:
+                stack.append(_XmlLexicalFrame(name=name, inner_start=tag_end))
+        index = tag_end
+    return spans if not stack else None
+
+
+def _parse_maven(
+    path: str,
+    text: str,
+    raw: bytes,
+    budget: DependencyFileBudget,
+) -> DependencySourceParseResult:
+    if b"<!DOCTYPE" in raw or b"<!ENTITY" in raw:
+        return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+    records, applicable, failure = _xml_semantic_records(path, text, raw, budget)
+    if failure is not None:
+        return failure
+    if not applicable:
+        return DependencySourceParseResult()
+    if records is None:
+        return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+    lexical = _xml_url_spans(path, raw)
+    if lexical is None or len(lexical) != len(records):
+        return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+    candidates: list[_Candidate] = []
+    for record, (parent_path, span, has_markup) in zip(records, lexical, strict=True):
+        if has_markup or parent_path != record.parent_path:
+            return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+        candidates.append(
+            _Candidate(
+                ecosystem=DependencyEcosystem.MAVEN,
+                surface=DependencySourceSurface.MAVEN_CONFIG,
+                operation=record.operation,
+                scope=record.scope,
+                span=span,
+                destination=record.destination,
+            )
+        )
+    return _changes_from_candidates(
+        candidates,
+        path=path,
+        raw=raw,
+        budget=budget,
+        atomic=True,
+    )
+
+
 def _parse_file(
     path: str,
     text: str,
@@ -1488,6 +2004,10 @@ def _parse_file(
         return _parse_yarn_v1(path, text, raw, budget)
     if basename in _YARN_YAML_BASENAMES:
         return _parse_yarn_yaml(path, text, raw, budget)
+    if _is_cargo_path(path):
+        return _parse_cargo(path, text, raw, budget)
+    if basename in _MAVEN_BASENAMES:
+        return _parse_maven(path, text, raw, budget)
     return _parse_python_project(
         path,
         text,
@@ -1519,7 +2039,7 @@ def analyze_dependency_sources(
     changes: list[SourceChange] = []
     limitations: list[DependencySourceLimitation] = []
     for path in sorted(component_paths):
-        if not isinstance(path, str) or _basename(path) not in _RECOGNIZED_BASENAMES:
+        if not isinstance(path, str) or not _is_recognized_path(path):
             continue
         raw = raw_file_cache.get(path)
         safe_raw = raw if isinstance(raw, bytes) else None
