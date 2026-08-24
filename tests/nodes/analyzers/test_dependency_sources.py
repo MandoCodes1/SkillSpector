@@ -21,6 +21,7 @@ from skillspector.dependency_source_types import (
     MAX_DEPENDENCY_YAML_ALIASES,
     DependencySourceLimitationReason,
     DependencyWorkBudget,
+    DependencyWorkResource,
 )
 
 
@@ -915,6 +916,17 @@ def test_yarn_yaml_recursive_alias_is_a_limitation() -> None:
     _assert_single_parse_limitation(analysis, path=".yarnrc.yml", end_line=3)
 
 
+def test_yarn_yaml_rejects_explicitly_tagged_relevant_key_reached_through_alias() -> None:
+    content = (
+        "key: &relevant !!str npmRegistryServer\n"
+        "*relevant: https://packages.example.invalid/simple\n"
+    )
+
+    analysis = _analyze({".yarnrc.yml": content})
+
+    _assert_single_parse_limitation(analysis, path=".yarnrc.yml", end_line=3)
+
+
 def test_yarn_yaml_node_budget_is_charged_once_before_construction() -> None:
     # Root mapping, key scalar, and value scalar are the three node-producing events.
     exact_budget = DependencyWorkBudget()
@@ -1158,6 +1170,35 @@ def test_python_project_multiline_url_span_covers_its_own_value_token() -> None:
     )
 
 
+def test_python_project_ignores_table_and_key_syntax_inside_multiline_string() -> None:
+    content = (
+        'description = """\n'
+        "[[tool.poetry.source]]\n"
+        'url = "https://decoy.example.invalid/simple"\n'
+        '"""\n'
+        "[[tool.poetry.source]]\n"
+        'name = "real"\n'
+        'url = "https://packages.example.invalid/simple"\n'
+    )
+
+    analysis = _analyze({"pyproject.toml": content})
+
+    assert analysis.limitations == ()
+    assert _finding_projection(analysis) == [
+        {
+            "ecosystem": "poetry",
+            "surface": "python-project-config",
+            "operation": "replace",
+            "scope": "project",
+            "destination": "https://packages.example.invalid/REDACTED_PATH",
+            "destination_status": "resolved",
+            "file": "pyproject.toml",
+            "start_line": 7,
+            "end_line": 7,
+        }
+    ]
+
+
 def test_toml_config_node_budget_is_exact_and_one_over() -> None:
     content = '[[index]]\nurl="https://packages.example.invalid/simple"\n'
     exact_budget = DependencyWorkBudget()
@@ -1279,3 +1320,48 @@ def test_python_source_budget_one_over_discards_partial_file_results(resource: s
     assert analysis.findings == ()
     assert len(analysis.limitations) == 1
     assert analysis.limitations[0].ledger_metrics()
+
+
+def test_atomic_structured_file_discard_does_not_leak_output_budget_reservations() -> None:
+    budget = DependencyWorkBudget()
+    prior = MAX_DEPENDENCY_SOURCE_CHANGES - 1
+    assert budget.reserve_source_changes(prior) is None
+    content = (
+        '[[index]]\nurl="https://one.example.invalid/simple"\n'
+        '[[index]]\nurl="https://two.example.invalid/simple"\n'
+    )
+
+    analysis = _analyze({"uv.toml": content}, budget=budget)
+
+    _assert_single_parse_limitation(analysis, path="uv.toml", end_line=5)
+    assert {
+        resource: budget.used(resource)
+        for resource in (
+            DependencyWorkResource.SOURCE_RECORDS,
+            DependencyWorkResource.RETAINED_LITERAL_BYTES,
+            DependencyWorkResource.EMITTED_CHANGES,
+            DependencyWorkResource.FINDING_OUTPUT_RECORDS,
+        )
+    } == {
+        DependencyWorkResource.SOURCE_RECORDS: 0,
+        DependencyWorkResource.RETAINED_LITERAL_BYTES: 0,
+        DependencyWorkResource.EMITTED_CHANGES: prior,
+        DependencyWorkResource.FINDING_OUTPUT_RECORDS: prior,
+    }
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        (".yarnrc.yml", "unrelated: " + "1" * 5_000 + "\n"),
+        ("pyproject.toml", "unrelated = " + "1" * 5_000 + "\n"),
+    ],
+    ids=("yaml", "toml"),
+)
+def test_structured_numeric_conversion_failure_is_a_localized_limitation(
+    path: str,
+    content: str,
+) -> None:
+    analysis = _analyze({path: content})
+
+    _assert_single_parse_limitation(analysis, path=path, end_line=2)

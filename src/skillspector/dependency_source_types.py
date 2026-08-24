@@ -494,6 +494,38 @@ class DependencyWorkBudget:
         self._used[findings] = next_findings
         return None
 
+    def reserve_source_batch(
+        self,
+        *,
+        source_records: int,
+        retained_literal_bytes: int,
+        emitted_changes: int,
+    ) -> DependencyWorkExhaustion | None:
+        """Atomically reserve every output counter for one structured source file."""
+        requested = {
+            DependencyWorkResource.SOURCE_RECORDS: _require_nonnegative_integer(
+                source_records, "source_records"
+            ),
+            DependencyWorkResource.RETAINED_LITERAL_BYTES: _require_nonnegative_integer(
+                retained_literal_bytes, "retained_literal_bytes"
+            ),
+            DependencyWorkResource.EMITTED_CHANGES: _require_nonnegative_integer(
+                emitted_changes, "emitted_changes"
+            ),
+            DependencyWorkResource.FINDING_OUTPUT_RECORDS: _require_nonnegative_integer(
+                emitted_changes, "emitted_changes"
+            ),
+        }
+        next_used: dict[DependencyWorkResource, int] = {}
+        for resource, count in requested.items():
+            observed = self._used[resource] + count
+            limit = _SCAN_LIMITS[resource]
+            if observed > limit:
+                return DependencyWorkExhaustion(resource, observed, limit)
+            next_used[resource] = observed
+        self._used.update(next_used)
+        return None
+
     def charge_ledger_events(self, count: int) -> DependencyWorkExhaustion | None:
         """Reserve normal ledger rows without consuming the truncation slot."""
         value = _require_nonnegative_integer(count, "count")
@@ -584,6 +616,19 @@ class DependencyFileBudget:
 
     def reserve_source_changes(self, count: int = 1) -> DependencyWorkExhaustion | None:
         return self._root.reserve_source_changes(count)
+
+    def reserve_source_batch(
+        self,
+        *,
+        source_records: int,
+        retained_literal_bytes: int,
+        emitted_changes: int,
+    ) -> DependencyWorkExhaustion | None:
+        return self._root.reserve_source_batch(
+            source_records=source_records,
+            retained_literal_bytes=retained_literal_bytes,
+            emitted_changes=emitted_changes,
+        )
 
     def charge_ledger_events(self, count: int) -> DependencyWorkExhaustion | None:
         return self._root.charge_ledger_events(count)

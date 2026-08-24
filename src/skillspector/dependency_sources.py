@@ -325,6 +325,43 @@ def _changes_from_candidates(
     budget: DependencyFileBudget,
     atomic: bool = False,
 ) -> DependencySourceParseResult:
+    if atomic:
+        prepared: list[tuple[_Candidate, str, DestinationStatus]] = []
+        retained_literal_bytes = 0
+        for candidate in candidates:
+            raw_destination = candidate.destination
+            if raw_destination is None:
+                raw_destination = raw[
+                    candidate.span.start_byte : candidate.span.end_byte
+                ].decode("utf-8")
+            retained_literal_bytes += len(raw_destination.encode("utf-8"))
+            normalized = _destination(candidate.ecosystem, raw_destination)
+            if normalized is not None:
+                prepared.append((candidate, *normalized))
+        exhaustion = budget.reserve_source_batch(
+            source_records=len(candidates),
+            retained_literal_bytes=retained_literal_bytes,
+            emitted_changes=len(prepared),
+        )
+        if exhaustion is not None:
+            return DependencySourceParseResult(
+                limitations=(_limitation(path, raw, exhaustion),),
+            )
+        return DependencySourceParseResult(
+            changes=tuple(
+                SourceChange(
+                    ecosystem=candidate.ecosystem,
+                    surface=candidate.surface,
+                    operation=candidate.operation,
+                    scope=candidate.scope,
+                    destination=destination,
+                    destination_status=status,
+                    span=candidate.span,
+                )
+                for candidate, destination, status in prepared
+            )
+        )
+
     changes: list[SourceChange] = []
     for candidate in candidates:
         change, exhaustion = _candidate_change(candidate, raw, budget)
@@ -789,7 +826,14 @@ def _yaml_event_tree(
                         {},
                         DependencySourceParseResult(limitations=(_limitation(path, raw),)),
                     )
-    except (ScannerError, ParserError, yaml.YAMLError):
+    except (
+        ScannerError,
+        ParserError,
+        yaml.YAMLError,
+        ValueError,
+        OverflowError,
+        RecursionError,
+    ):
         return None, {}, DependencySourceParseResult(limitations=(_limitation(path, raw),))
     if stack:
         return None, {}, DependencySourceParseResult(limitations=(_limitation(path, raw),))
@@ -845,15 +889,27 @@ def _yaml_key(node: _YamlNode, anchors: Mapping[str, _YamlNode]) -> str | None:
     return resolved.value if resolved is not None and resolved.kind == "scalar" else None
 
 
-def _yaml_has_explicit_tag(node: _YamlNode) -> bool:
-    if node.tag is not None:
-        return True
-    for item in node.items:
-        if isinstance(item, tuple):
-            if _yaml_has_explicit_tag(item[0]) or _yaml_has_explicit_tag(item[1]):
-                return True
-        elif isinstance(item, _YamlNode) and _yaml_has_explicit_tag(item):
+def _yaml_has_explicit_tag(
+    node: _YamlNode,
+    anchors: Mapping[str, _YamlNode],
+) -> bool:
+    stack = [node]
+    seen: set[int] = set()
+    while stack:
+        resolved = _yaml_resolve(stack.pop(), anchors)
+        if resolved is None:
             return True
+        identity = id(resolved)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if resolved.tag is not None:
+            return True
+        for item in resolved.items:
+            if isinstance(item, tuple):
+                stack.extend(item)
+            elif isinstance(item, _YamlNode):
+                stack.append(item)
     return False
 
 
@@ -944,7 +1000,7 @@ def _parse_yarn_yaml(
 
     try:
         loaded = yaml.safe_load(text)
-    except yaml.YAMLError:
+    except (yaml.YAMLError, ValueError, OverflowError, RecursionError):
         return DependencySourceParseResult(limitations=(_limitation(path, raw),))
     loaded_check = _bounded_loaded_object(loaded, budget)
     if loaded_check is True:
@@ -965,7 +1021,7 @@ def _parse_yarn_yaml(
         key = _yaml_key(key_node, anchors)
         if key not in {"npmRegistryServer", "npmScopes"}:
             continue
-        if key in top_seen or _yaml_has_explicit_tag(key_node):
+        if key in top_seen or _yaml_has_explicit_tag(key_node, anchors):
             return DependencySourceParseResult(limitations=(_limitation(path, raw),))
         top_seen.add(key)
         if key == "npmRegistryServer":
@@ -986,8 +1042,8 @@ def _parse_yarn_yaml(
         if (
             scopes is None
             or scopes.kind != "mapping"
-            or _yaml_has_explicit_tag(value_node)
-            or _yaml_has_explicit_tag(scopes)
+            or _yaml_has_explicit_tag(value_node, anchors)
+            or _yaml_has_explicit_tag(scopes, anchors)
         ):
             return DependencySourceParseResult(limitations=(_limitation(path, raw),))
         scope_pairs = _yaml_pairs(scopes)
@@ -1008,8 +1064,8 @@ def _parse_yarn_yaml(
             if (
                 scope_mapping is None
                 or scope_mapping.kind != "mapping"
-                or _yaml_has_explicit_tag(scope_key_node)
-                or _yaml_has_explicit_tag(scope_value_node)
+                or _yaml_has_explicit_tag(scope_key_node, anchors)
+                or _yaml_has_explicit_tag(scope_value_node, anchors)
             ):
                 return DependencySourceParseResult(limitations=(_limitation(path, raw),))
             field_pairs = _yaml_pairs(scope_mapping)
@@ -1021,7 +1077,7 @@ def _parse_yarn_yaml(
                 if field_name == "<<" or field_name is None:
                     return DependencySourceParseResult(limitations=(_limitation(path, raw),))
                 if field_name == "npmRegistryServer":
-                    if registry_nodes or _yaml_has_explicit_tag(field_key_node):
+                    if registry_nodes or _yaml_has_explicit_tag(field_key_node, anchors):
                         return DependencySourceParseResult(limitations=(_limitation(path, raw),))
                     registry_nodes.append(field_value_node)
             if registry_nodes:
@@ -1157,6 +1213,46 @@ def _toml_value_extent(text: str, start: int) -> int:
     return end
 
 
+def _toml_multiline_string_state(line: str, delimiter: str | None) -> str | None:
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(line):
+        if delimiter is not None:
+            if delimiter == '"""' and line[index] == "\\":
+                index += 2
+                continue
+            if line.startswith(delimiter, index):
+                delimiter = None
+                index += 3
+                continue
+            index += 1
+            continue
+        if quote == '"' and escaped:
+            escaped = False
+            index += 1
+            continue
+        if quote == '"' and line[index] == "\\":
+            escaped = True
+            index += 1
+            continue
+        if quote is not None:
+            if line[index] == quote:
+                quote = None
+            index += 1
+            continue
+        if line[index] == "#":
+            break
+        if line.startswith(('"""', "'''"), index):
+            delimiter = line[index : index + 3]
+            index += 3
+            continue
+        if line[index] in {'"', "'"}:
+            quote = line[index]
+        index += 1
+    return delimiter
+
+
 def _toml_url_cursors(
     path: str,
     text: str,
@@ -1168,6 +1264,7 @@ def _toml_url_cursors(
     current: _TomlTableCursor | None = None
     byte_offsets = _char_to_byte_offsets(text)
     position = 0
+    multiline_delimiter: str | None = None
     while position < len(text):
         line_end = text.find("\n", position)
         if line_end < 0:
@@ -1178,7 +1275,8 @@ def _toml_url_cursors(
         line = text[position:physical_end]
         stripped = line.lstrip()
         leading = len(line) - len(stripped)
-        if stripped.startswith("[["):
+        starts_in_multiline_string = multiline_delimiter is not None
+        if not starts_in_multiline_string and stripped.startswith("[["):
             close = stripped.find("]]", 2)
             if close < 0:
                 return None
@@ -1187,9 +1285,14 @@ def _toml_url_cursors(
             if table_path in relevant_paths:
                 current = _TomlTableCursor(table_path)
                 cursors[table_path].append(current)
-        elif stripped.startswith("["):
+        elif not starts_in_multiline_string and stripped.startswith("["):
             current = None
-        elif current is not None and stripped and not stripped.startswith("#"):
+        elif (
+            not starts_in_multiline_string
+            and current is not None
+            and stripped
+            and not stripped.startswith("#")
+        ):
             equals = _toml_find_unquoted(stripped, "=")
             if equals is not None and _toml_key_parts(stripped[:equals]) == ("url",):
                 value_start = position + leading + equals + 1
@@ -1211,6 +1314,7 @@ def _toml_url_cursors(
                 next_newline = text.find("\n", position)
                 position = len(text) if next_newline < 0 else next_newline + 1
                 continue
+        multiline_delimiter = _toml_multiline_string_state(line, multiline_delimiter)
         position = len(text) if line_end == len(text) else line_end + 1
     return cursors
 
@@ -1278,7 +1382,7 @@ def _parse_python_project(
 ) -> DependencySourceParseResult:
     try:
         document = tomllib.loads(text)
-    except tomllib.TOMLDecodeError:
+    except (tomllib.TOMLDecodeError, ValueError, OverflowError, RecursionError):
         return DependencySourceParseResult(limitations=(_limitation(path, raw),))
     if exhaustion := _toml_structural_check(document, budget):
         return DependencySourceParseResult(limitations=(_limitation(path, raw, exhaustion),))
