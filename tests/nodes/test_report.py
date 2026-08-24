@@ -110,6 +110,15 @@ class TestComputeRiskScoreBasic:
         assert band == "HIGH"
         assert recommendation == "DO_NOT_INSTALL"
 
+    def test_sc10_high_finding_remains_advisory_caution(self) -> None:
+        findings = [_finding("SC10", "HIGH", confidence=1.0, file=".npmrc")]
+
+        score, band, recommendation = _compute_risk_score(findings, False)
+
+        assert score == 25
+        assert band == "MEDIUM"
+        assert recommendation == "CAUTION"
+
     def test_unknown_severity_defaults_to_low_points(self) -> None:
         f = _finding("R1", "LOW")
         f.severity = ""

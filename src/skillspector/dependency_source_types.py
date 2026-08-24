@@ -281,6 +281,22 @@ class DependencySourceLimitation:
 
 
 @dataclass(frozen=True, slots=True)
+class DependencySourceSpan:
+    """Sanitized whole-file or localized line range for integration accounting."""
+
+    path: str
+    start_line: int
+    end_line: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", _normalize_relative_posix_path(self.path))
+        start_line = _require_nonnegative_integer(self.start_line, "start_line")
+        end_line = _require_nonnegative_integer(self.end_line, "end_line")
+        if start_line < 1 or end_line < start_line:
+            raise ValueError("span line range must be positive and inclusive")
+
+
+@dataclass(frozen=True, slots=True)
 class DependencySourceParseResult:
     """Sanitized parser or adapter output."""
 
@@ -304,16 +320,31 @@ class DependencySourceAnalysis:
 
     findings: tuple[Finding, ...] = ()
     limitations: tuple[DependencySourceLimitation, ...] = ()
+    applicable_spans: tuple[DependencySourceSpan, ...] = ()
+    inspected_spans: tuple[DependencySourceSpan, ...] = ()
+    ledger_exhaustion: DependencyWorkExhaustion | None = None
 
     def __post_init__(self) -> None:
         findings = tuple(self.findings)
         limitations = tuple(self.limitations)
+        applicable_spans = tuple(self.applicable_spans)
+        inspected_spans = tuple(self.inspected_spans)
         if not all(isinstance(finding, Finding) for finding in findings):
             raise ValueError("findings must contain Finding values")
         if not all(isinstance(item, DependencySourceLimitation) for item in limitations):
             raise ValueError("limitations must contain DependencySourceLimitation values")
+        if not all(isinstance(item, DependencySourceSpan) for item in applicable_spans):
+            raise ValueError("applicable_spans must contain DependencySourceSpan values")
+        if not all(isinstance(item, DependencySourceSpan) for item in inspected_spans):
+            raise ValueError("inspected_spans must contain DependencySourceSpan values")
+        if self.ledger_exhaustion is not None and not isinstance(
+            self.ledger_exhaustion, DependencyWorkExhaustion
+        ):
+            raise ValueError("ledger_exhaustion must be DependencyWorkExhaustion")
         object.__setattr__(self, "findings", findings)
         object.__setattr__(self, "limitations", limitations)
+        object.__setattr__(self, "applicable_spans", applicable_spans)
+        object.__setattr__(self, "inspected_spans", inspected_spans)
 
 
 def finding_from_source_change(change: SourceChange) -> Finding:

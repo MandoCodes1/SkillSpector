@@ -39,6 +39,7 @@ from skillspector.dependency_source_types import (
     DependencySourceOperation,
     DependencySourceParseResult,
     DependencySourceScope,
+    DependencySourceSpan,
     DependencySourceSurface,
     DependencyWorkBudget,
     DependencyWorkExhaustion,
@@ -73,6 +74,15 @@ _MAVEN_INTERPOLATION: Final = re.compile(r"\$\{[^{}]+\}")
 _PIP_ASSIGNMENT: Final = re.compile(r"^\s*([^:=\s][^:=]*?)\s*([=:])\s*(.*)$")
 _PIP_SECTION: Final = re.compile(r"^\s*\[([^]]+)]\s*(?:[#;].*)?$")
 _PIP_OPTIONS: Final = ("index-url", "extra-index-url")
+_SHELL_SUFFIXES: Final = frozenset({".sh", ".bash", ".zsh", ".ksh", ".envrc"})
+_SHELL_NAMES: Final = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
+_MARKDOWN_SHELL_INFO: Final = _SHELL_NAMES | frozenset(
+    {"shell", "console", "terminal", "shell-session"}
+)
+_SHELL_SHEBANG: Final = re.compile(
+    r"^#!(?:/[^\s]*/(?:sh|bash|dash|zsh|ksh)|/usr/bin/env(?:[ \t]+-S)?[ \t]+(?:sh|bash|dash|zsh|ksh))(?:[ \t]|$)"
+)
+_MARKDOWN_FENCE_OPEN: Final = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\r\n]*)$")
 _CANONICAL_DEFAULTS: Final[dict[DependencyEcosystem, frozenset[str]]] = {
     DependencyEcosystem.NPM: frozenset({"https://registry.npmjs.org/"}),
     DependencyEcosystem.YARN: frozenset({"https://registry.yarnpkg.com/"}),
@@ -214,6 +224,98 @@ def _inventory_size(record: ArtifactRecord | None) -> int:
 def _physical_lines(text: str) -> list[str]:
     """Split only on LF while removing the CR that belongs to a CRLF boundary."""
     return [part[:-1] if part.endswith("\r") else part for part in text.split("\n")]
+
+
+def _whole_file_span(path: str, raw: bytes | None) -> DependencySourceSpan:
+    return DependencySourceSpan(path=path, start_line=1, end_line=_line_count(raw))
+
+
+def _is_shell_shebang(line: str) -> bool:
+    return _SHELL_SHEBANG.match(line) is not None
+
+
+def _markdown_executable_ranges(lines: list[str]) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    index = 0
+    while index < len(lines):
+        opener = _MARKDOWN_FENCE_OPEN.match(lines[index])
+        if opener is None:
+            index += 1
+            continue
+        fence = opener.group(1)
+        info = opener.group(2).strip()
+        token = info.split(maxsplit=1)[0].casefold() if info else ""
+        closer = re.compile(rf"^ {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$")
+        end_index = index + 1
+        while end_index < len(lines) and closer.match(lines[end_index]) is None:
+            end_index += 1
+        content_end = min(end_index, len(lines))
+        relevant = token in _MARKDOWN_SHELL_INFO
+        if not info:
+            first_content = next(
+                (line for line in lines[index + 1 : content_end] if line.strip()),
+                "",
+            )
+            relevant = (
+                _is_shell_shebang(first_content)
+                or first_content.startswith("$ ")
+                or first_content.startswith("# ")
+            )
+        if relevant:
+            ranges.append((index + 1, min(end_index + 1, len(lines))))
+        index = end_index + 1 if end_index < len(lines) else len(lines)
+    return ranges
+
+
+def _make_recipe_ranges(lines: list[str]) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].startswith("\t"):
+            index += 1
+            continue
+        start = index
+        index += 1
+        while index < len(lines) and (
+            lines[index].startswith("\t") or lines[index - 1].rstrip().endswith("\\")
+        ):
+            index += 1
+        ranges.append((start + 1, index))
+    return ranges
+
+
+def _executable_surface_ranges(
+    path: str,
+    text: str,
+    raw: bytes,
+    executable_paths: frozenset[str],
+) -> list[DependencySourceSpan]:
+    """Identify bounded executable shapes without interpreting command semantics."""
+    lines = _physical_lines(text)
+    basename = _basename(path)
+    lower_path = path.casefold()
+    whole_file = (1, _line_count(raw))
+    ranges: list[tuple[int, int]] = []
+
+    if (
+        any(lower_path.endswith(suffix) for suffix in _SHELL_SUFFIXES)
+        or (lines and _is_shell_shebang(lines[0]))
+        or path in executable_paths
+    ):
+        ranges.append(whole_file)
+    elif (basename == "Dockerfile" or basename.startswith("Dockerfile.")) and any(
+        re.match(r"^[ \t]*RUN(?:[ \t]|$)", line, re.IGNORECASE) for line in lines
+    ):
+        ranges.append(whole_file)
+    elif basename in {"Makefile", "makefile", "GNUmakefile"} or basename.endswith(".mk"):
+        ranges.extend(_make_recipe_ranges(lines))
+    elif lower_path.endswith((".md", ".markdown", ".mdown", ".mkd")):
+        ranges.extend(_markdown_executable_ranges(lines))
+
+    return [
+        DependencySourceSpan(path=path, start_line=start_line, end_line=end_line)
+        for start_line, end_line in dict.fromkeys(ranges)
+    ]
 
 
 def _line_offsets(text: str) -> list[int]:
@@ -2026,8 +2128,14 @@ def analyze_dependency_sources(
     raw_file_cache: Mapping[str, bytes],
     artifact_inventory: Iterable[ArtifactRecord],
     budget: DependencyWorkBudget,
+    executable_paths: frozenset[str] = frozenset(),
 ) -> DependencySourceAnalysis:
-    """Analyze recognized direct config artifacts named by the component inventory."""
+    """Analyze direct configs and disclose structurally executable unscanned surfaces."""
+    if not isinstance(executable_paths, frozenset):
+        raise ValueError("executable_paths must be an immutable set")
+    normalized_executable_paths = frozenset(
+        DependencySourceSpan(path=path, start_line=1, end_line=1).path for path in executable_paths
+    )
     inventory_by_path: dict[str, list[ArtifactRecord]] = {}
     for record in artifact_inventory:
         path = record.get("path")
@@ -2038,8 +2146,61 @@ def analyze_dependency_sources(
     uv_directories = {
         path.rpartition("/")[0] for path in component_paths if _basename(path) == "uv.toml"
     }
+    applicable_spans = tuple(
+        _whole_file_span(
+            path,
+            raw_file_cache.get(path) if isinstance(raw_file_cache.get(path), bytes) else None,
+        )
+        for path in sorted(component_paths)
+        if _is_recognized_path(path)
+    )
+    coverage_limitations: list[DependencySourceLimitation] = []
+    for path in sorted(component_paths):
+        raw = raw_file_cache.get(path)
+        if not isinstance(raw, bytes):
+            continue
+        records = inventory_by_path.get(path, [])
+        if len(records) != 1 or not _is_complete_text_record(records[0], len(raw)):
+            continue
+        try:
+            decoded = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            continue
+        cached = local_file_cache.get(path)
+        if not isinstance(cached, str) or cached != decoded:
+            continue
+        for span in _executable_surface_ranges(
+            path,
+            decoded,
+            raw,
+            normalized_executable_paths,
+        ):
+            coverage_limitations.append(
+                DependencySourceLimitation(
+                    reason=DependencySourceLimitationReason.UNSCANNED_EXECUTABLE_CONTENT,
+                    path=span.path,
+                    start_line=span.start_line,
+                    end_line=span.end_line,
+                )
+            )
+    coverage_limitations = list(
+        {
+            (item.reason, item.path, item.start_line, item.end_line): item
+            for item in coverage_limitations
+        }.values()
+    )
+    required_ledger_rows = len(applicable_spans) + len(coverage_limitations)
+    if exhaustion := budget.charge_ledger_events(required_ledger_rows):
+        budget.claim_reserved_truncation_event()
+        return DependencySourceAnalysis(
+            limitations=tuple(coverage_limitations),
+            applicable_spans=applicable_spans,
+            ledger_exhaustion=exhaustion,
+        )
+
     changes: list[SourceChange] = []
-    limitations: list[DependencySourceLimitation] = []
+    limitations: list[DependencySourceLimitation] = list(coverage_limitations)
+    inspected_spans: list[DependencySourceSpan] = []
     for path in sorted(component_paths):
         if not isinstance(path, str) or not _is_recognized_path(path):
             continue
@@ -2079,8 +2240,12 @@ def analyze_dependency_sources(
         )
         changes.extend(parsed.changes)
         limitations.extend(parsed.limitations)
+        if not parsed.limitations:
+            inspected_spans.append(_whole_file_span(path, safe_raw))
 
     return DependencySourceAnalysis(
         findings=tuple(finding_from_source_change(change) for change in changes),
         limitations=tuple(limitations),
+        applicable_spans=applicable_spans,
+        inspected_spans=tuple(inspected_spans),
     )
