@@ -128,6 +128,8 @@ def test_encoded_malformed_nested_or_mixed_candidates_are_whole_masked(raw: str)
 @pytest.mark.parametrize(
     "text",
     [
+        "a//b",
+        "// comment",
         "ordinary // comment",
         "path a//b remains ordinary",
         "email dev@example.invalid remains ordinary",
@@ -218,6 +220,27 @@ def test_embedded_scheme_relative_candidates_are_whole_masked(raw: str, expected
         reason=None,
     )
     assert "scheme-relative-secret" not in result.value
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "<url>//user:round2-scheme-relative-secret@host.invalid/round2-private-path</url>",
+        "url(//user:round2-scheme-relative-secret@host.invalid/round2-private-path)",
+    ],
+    ids=("element-markup", "functional-markup"),
+)
+def test_markup_embedded_scheme_relative_candidates_are_whole_masked(raw: str) -> None:
+    result = api.redact_text_result(raw)
+
+    assert result == api.TextRedactionResult(
+        value=api.REDACTED_URL,
+        complete=True,
+        candidates=1,
+        reason=None,
+    )
+    assert "round2-scheme-relative-secret" not in result.value
+    assert "round2-private-path" not in result.value
 
 
 class _SyntheticMatch:

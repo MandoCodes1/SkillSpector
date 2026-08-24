@@ -43,7 +43,7 @@ _PAIRED_CLOSERS: Final = {
 }
 _SENTENCE_PUNCTUATION: Final = frozenset(".,")
 _SCHEME_RELATIVE_MARKER = re.compile(
-    r"(?:^[\(\[\{<\"'`]?|\s[\(\[\{<\"'`]?|=[\(\[\{<\"'`]*|:[\(\[\{<\"'`]+)//"
+    r"(?:^[\(\[\{<\"'`]?|\s[\(\[\{<\"'`]?|=[\(\[\{<\"'`]*|:[\(\[\{<\"'`]+|[>(])//"
 )
 
 

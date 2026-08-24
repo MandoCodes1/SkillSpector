@@ -396,6 +396,94 @@ def test_async_embedded_scheme_relative_prompt_never_reaches_provider_raw() -> N
     assert "[REDACTED_URL]" in submitted[0]
 
 
+@pytest.mark.parametrize(
+    "template",
+    [
+        "<url>//user:{sentinel}@packages.example.invalid/{private_path}</url>",
+        "url(//user:{sentinel}@packages.example.invalid/{private_path})",
+    ],
+    ids=("element-markup", "functional-markup"),
+)
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_sync_markup_embedded_scheme_relative_prompt_never_reaches_provider_raw(
+    template: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = "round2-sync-scheme-relative-secret"
+    private_path = "round2-sync-private-path"
+    analyzer = _PromptBoundaryAnalyzer(base_prompt="inspect", model="test/model")
+    batch = Batch(
+        file_path="pip.conf",
+        content=template.format(sentinel=sentinel, private_path=private_path),
+    )
+    submitted: list[str] = []
+
+    def capture(_llm: object, prompt: str, _collector: object) -> AIMessage:
+        submitted.append(prompt)
+        return AIMessage(content="ok")
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="skillspector"),
+        patch("skillspector.llm_analyzer_base._invoke_with_usage", side_effect=capture),
+    ):
+        outcome = analyzer.run_batches_detailed([batch])
+
+    assert len(outcome.successful) == 1
+    assert outcome.failures == []
+    assert len(submitted) == 1
+    assert sentinel not in submitted[0]
+    assert private_path not in submitted[0]
+    assert "[REDACTED_URL]" in submitted[0]
+    assert sentinel not in caplog.text
+    assert private_path not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "<url>//user:{sentinel}@packages.example.invalid/{private_path}</url>",
+        "url(//user:{sentinel}@packages.example.invalid/{private_path})",
+    ],
+    ids=("element-markup", "functional-markup"),
+)
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_async_markup_embedded_scheme_relative_prompt_never_reaches_provider_raw(
+    template: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sentinel = "round2-async-scheme-relative-secret"
+    private_path = "round2-async-private-path"
+    analyzer = _PromptBoundaryAnalyzer(base_prompt="inspect", model="test/model")
+    batch = Batch(
+        file_path="pip.conf",
+        content=template.format(sentinel=sentinel, private_path=private_path),
+    )
+    submitted: list[str] = []
+
+    async def capture(_llm: object, prompt: str, _collector: object) -> AIMessage:
+        submitted.append(prompt)
+        return AIMessage(content="ok")
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="skillspector"),
+        patch(
+            "skillspector.llm_analyzer_base._ainvoke_with_usage",
+            new_callable=AsyncMock,
+            side_effect=capture,
+        ),
+    ):
+        outcome = run_async(analyzer.arun_batches_detailed([batch], max_concurrency=1))
+
+    assert len(outcome.successful) == 1
+    assert outcome.failures == []
+    assert len(submitted) == 1
+    assert sentinel not in submitted[0]
+    assert private_path not in submitted[0]
+    assert "[REDACTED_URL]" in submitted[0]
+    assert sentinel not in caplog.text
+    assert private_path not in caplog.text
+
+
 @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
 def test_sync_incomplete_prompt_redaction_makes_zero_calls_and_zero_retries() -> None:
     sentinel = "task7-sync-incomplete-secret"

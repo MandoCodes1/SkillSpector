@@ -961,6 +961,38 @@ def test_build_context_redacts_embedded_scheme_relative_url_before_provider_cach
     assert sentinel in result["local_file_cache"]["pip.conf"]
 
 
+@pytest.mark.parametrize(
+    "template",
+    [
+        "<url>//user:{sentinel}@packages.example.invalid/{private_path}</url>",
+        "url(//user:{sentinel}@packages.example.invalid/{private_path})",
+    ],
+    ids=("element-markup", "functional-markup"),
+)
+def test_build_context_redacts_markup_embedded_scheme_relative_url_before_provider_cache(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    template: str,
+) -> None:
+    sentinel = "round2-build-context-scheme-relative-secret"
+    private_path = "round2-build-context-private-path"
+    raw = template.format(sentinel=sentinel, private_path=private_path)
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    (tmp_path / "pip.conf").write_text(f"index-url={raw}\n", encoding="utf-8")
+
+    with caplog.at_level(logging.DEBUG, logger="skillspector"):
+        result = build_context({"skill_path": str(tmp_path)})
+
+    provider_projection = json.dumps(result["llm_file_cache"], sort_keys=True)
+    assert sentinel not in provider_projection
+    assert private_path not in provider_projection
+    assert "[REDACTED_URL]" in result["llm_file_cache"]["pip.conf"]
+    assert raw in result["local_file_cache"]["pip.conf"]
+    assert result["llm_redaction_incomplete_paths"] == []
+    assert sentinel not in caplog.text
+    assert private_path not in caplog.text
+
+
 def test_build_context_omits_visible_artifact_when_url_redaction_is_incomplete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
