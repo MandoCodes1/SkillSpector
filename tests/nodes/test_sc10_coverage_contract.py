@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +117,16 @@ def _display_location(exception: dict[str, object]) -> str:
     if isinstance(start_line, int):
         location += f":{start_line}" + (f"-{end_line}" if end_line else "")
     return location
+
+
+def _expected_work_id(
+    analyzer_id: str,
+    path: str,
+    start_line: int | None,
+    end_line: int | None,
+) -> str:
+    canonical = "\x1f".join((analyzer_id, path, str(start_line), str(end_line)))
+    return f"work-{sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
 def _normalized_terminal(serialized: str) -> str:
@@ -231,69 +242,95 @@ def test_prose_only_markdown_remains_safe_and_complete(tmp_path: Path) -> None:
 def test_direct_config_rows_are_distinct_from_overlapping_executable_coverage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    path = "archive.zip!/project/.npmrc"
+    paths = (".npmrc", "archive.zip!/project/.npmrc")
+    content = "registry=https://user:password@packages.example.invalid/private?token=secret\n"
     response = _supply_chain_response(
         monkeypatch,
-        {path: "registry=https://user:password@packages.example.invalid/private?token=secret\n"},
+        dict.fromkeys(paths, content),
         component_metadata=[
             {
                 "path": path,
                 "executable": True,
                 "attacker_controlled": "must-not-be-emitted",
             }
+            for path in paths
         ],
     )
 
     findings = response["findings"]
-    assert len(findings) == 1
-    assert findings[0].rule_id == "SC10"
+    assert [
+        (
+            finding.rule_id,
+            finding.file,
+            finding.start_line,
+            finding.end_line,
+            finding.severity,
+            finding.evidence["destination"],
+        )
+        for finding in findings
+    ] == [
+        (
+            "SC10",
+            path,
+            1,
+            1,
+            "HIGH",
+            "https://packages.example.invalid/REDACTED_PATH",
+        )
+        for path in paths
+    ]
     rows = [
         row
         for row in response["inspection_ledger"]
         if row.get("analyzer_id") in {"dependency_sources", "dependency_source_coverage"}
     ]
-    assert [
-        (
-            row["analyzer_id"],
-            row["path"],
-            row["start_line"],
-            row["end_line"],
-            row["outcome"],
-            row.get("reason_code"),
-            row["emitted_finding_ids"],
-        )
-        for row in rows
-    ] == [
-        (
-            "dependency_sources",
-            path,
-            1,
-            2,
-            LedgerOutcome.COMPLETED,
-            None,
-            [findings[0].finding_id],
-        ),
-        (
-            "dependency_source_coverage",
-            path,
+    rows_by_identity = {(row["analyzer_id"], row["path"]): row for row in rows}
+    assert len(rows) == len(rows_by_identity) == 4
+    expected_work_ids = {
+        (analyzer_id, path): _expected_work_id(analyzer_id, path, 1, 2)
+        for analyzer_id in ("dependency_sources", "dependency_source_coverage")
+        for path in paths
+    }
+    assert {identity: row["work_id"] for identity, row in rows_by_identity.items()} == (
+        expected_work_ids
+    )
+    assert len({row["work_id"] for row in response["inspection_ledger"]}) == len(
+        response["inspection_ledger"]
+    )
+    for finding in findings:
+        direct = rows_by_identity[("dependency_sources", finding.file)]
+        coverage = rows_by_identity[("dependency_source_coverage", finding.file)]
+        assert (
+            direct["start_line"],
+            direct["end_line"],
+            direct["outcome"],
+            direct.get("reason_code"),
+            direct["emitted_finding_ids"],
+        ) == (1, 2, LedgerOutcome.COMPLETED, None, [finding.finding_id])
+        assert (
+            coverage["start_line"],
+            coverage["end_line"],
+            coverage["outcome"],
+            coverage["reason_code"],
+            coverage["emitted_finding_ids"],
+        ) == (
             1,
             2,
             LedgerOutcome.PARTIAL,
             LedgerReason.UNSCANNED_EXECUTABLE_CONTENT,
             [],
-        ),
-    ]
-    assert len({row["work_id"] for row in rows}) == 2
+        )
     assert "password" not in repr(rows)
     assert "secret" not in repr(rows)
     assert "must-not-be-emitted" not in repr(rows)
-    assert (
-        sum(
-            findings[0].finding_id in row["emitted_finding_ids"]
-            for row in response["inspection_ledger"]
+    for finding in findings:
+        assert (
+            sum(
+                finding.finding_id in row["emitted_finding_ids"]
+                for row in response["inspection_ledger"]
+            )
+            == 1
         )
-        == 1
-    )
     statuses = response["analyzer_status_events"]
     assert [status["analyzer_id"] for status in statuses].count("dependency_sources") == 1
     assert [status["analyzer_id"] for status in statuses].count("dependency_source_coverage") == 1
@@ -357,23 +394,78 @@ def _seed_ledger(count: int) -> list[dict[str, Any]]:
 def test_sc10_ledger_overflow_uses_canonical_marker_and_finalizes_partial(
     monkeypatch: pytest.MonkeyPatch, existing_count: int
 ) -> None:
+    path = ".npmrc"
+    content = "registry=https://packages.example.invalid/simple\n"
+    control = _supply_chain_response(monkeypatch, {path: content})
+    assert [
+        (
+            finding.rule_id,
+            finding.file,
+            finding.start_line,
+            finding.end_line,
+            finding.severity,
+            finding.evidence["destination"],
+        )
+        for finding in control["findings"]
+    ] == [
+        (
+            "SC10",
+            path,
+            1,
+            1,
+            "HIGH",
+            "https://packages.example.invalid/REDACTED_PATH",
+        )
+    ]
+    direct_work_id = _expected_work_id("dependency_sources", path, 1, 2)
+    control_direct = [
+        row
+        for row in control["inspection_ledger"]
+        if row.get("analyzer_id") == "dependency_sources"
+    ]
+    assert len(control_direct) == 1
+    assert control_direct[0]["work_id"] == direct_work_id
+    assert control_direct[0]["emitted_finding_ids"] == [control["findings"][0].finding_id]
+
     response = _supply_chain_response(
         monkeypatch,
-        {"scripts/setup.sh": "echo setup\n"},
+        {path: content},
         existing_ledger=_seed_ledger(existing_count),
     )
 
+    assert response["findings"] == []
     ledger = response["inspection_ledger"]
     assert len(ledger) == MAX_INSPECTION_LEDGER_EVENTS
     assert ledger[-1]["phase"] == "ledger_output"
     assert ledger[-1]["reason_code"] is LedgerReason.OUTPUT_LIMIT
+    marker_path = path if existing_count == 9_999 else "seed/9999.txt"
+    assert ledger[-1]["path"] == marker_path
+    assert ledger[-1]["work_id"] == _expected_work_id(
+        "system:ledger_output", marker_path, None, None
+    )
     assert ledger[-1]["observed_records"] == MAX_INSPECTION_LEDGER_EVENTS + 1
     assert ledger[-1]["limit_records"] == MAX_INSPECTION_LEDGER_EVENTS
-    assert not any(row.get("analyzer_id") == "dependency_source_coverage" for row in ledger)
-
-    completeness, _effective_ids = finalize_ledger(
+    assert not any(row.get("analyzer_id") == "dependency_sources" for row in ledger)
+    assert not any(row["emitted_finding_ids"] for row in ledger)
+    source_status = next(
+        status
+        for status in response["analyzer_status_events"]
+        if status["analyzer_id"] == "dependency_sources"
+    )
+    assert source_status["status"] == "degraded"
+    assert source_status["reason_code"] is LedgerReason.OUTPUT_LIMIT
+    assert source_status["planned_work"] == [
         {
-            "components": ["scripts/setup.sh"],
+            "work_id": direct_work_id,
+            "path": path,
+            "start_line": 1,
+            "end_line": 2,
+        }
+    ]
+
+    completeness, effective_ids = finalize_ledger(
+        {
+            "components": [path],
             "findings": response["findings"],
             "inspection_ledger": ledger,
             "analyzer_status_events": response["analyzer_status_events"],
@@ -381,10 +473,11 @@ def test_sc10_ledger_overflow_uses_canonical_marker_and_finalizes_partial(
             "effective_finding_ids": [],
         }
     )
+    assert effective_ids == []
     assert completeness["status"] == "partial"
     assert completeness["is_complete"] is False
     assert completeness["execution_successful"] is True
     assert not any(
-        row["reason_code"] == LedgerReason.UNACCOUNTED_WORK
+        row["reason_code"] in {LedgerReason.UNACCOUNTED_WORK, LedgerReason.FINDING_ACCOUNTING_ERROR}
         for row in completeness["ledger_exceptions"]
     )
