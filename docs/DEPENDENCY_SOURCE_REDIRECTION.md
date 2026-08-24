@@ -21,8 +21,9 @@ SC10 inspects only the following direct configuration surfaces:
 | Maven | `settings.xml`, `pom.xml` | Settings mirrors and profile repositories/plugin repositories; direct project repositories/plugin repositories |
 
 For Maven, `distributionManagement` descendants are outside this rule's direct-source scope.
-For Cargo, directory, local-registry, and Git source targets are inert unless an applicable
-replacement chain resolves to a supported registry destination.
+For Cargo, directory, local-registry, and Git source targets are outside SC10's reporting scope.
+A `replace-with` chain is reported only when it resolves to a `[source.*].registry` or
+`[registries.*].index` destination.
 
 The analyzer suppresses an unchanged canonical public default. It compares only the exact
 built-in ecosystem defaults, with scheme and host case normalization and an optional trailing
