@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 from pathlib import Path
 from time import monotonic
@@ -941,6 +942,25 @@ def test_build_context_redacts_visible_config_urls_before_provider_cache(tmp_pat
     assert result["llm_redaction_incomplete_paths"] == []
 
 
+def test_build_context_redacts_embedded_scheme_relative_url_before_provider_cache(
+    tmp_path: Path,
+) -> None:
+    sentinel = "task9-build-context-scheme-relative-secret"
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    (tmp_path / "pip.conf").write_text(
+        "[global]\n"
+        f"index-url=//user:{sentinel}@packages.example.invalid/private?token={sentinel}\n",
+        encoding="utf-8",
+    )
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    provider_projection = json.dumps(result["llm_file_cache"], sort_keys=True)
+    assert sentinel not in provider_projection
+    assert "[REDACTED_URL]" in result["llm_file_cache"]["pip.conf"]
+    assert sentinel in result["local_file_cache"]["pip.conf"]
+
+
 def test_build_context_omits_visible_artifact_when_url_redaction_is_incomplete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -973,6 +993,66 @@ def test_build_context_omits_visible_artifact_when_url_redaction_is_incomplete(
     assert "pip.conf" not in result["llm_components"]
     assert result["llm_redaction_incomplete_paths"] == ["pip.conf"]
     assert sentinel in result["local_file_cache"]["pip.conf"]
+
+
+def test_component_metadata_stat_failure_redacts_credential_shaped_path_in_debug_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import skillspector.nodes.build_context as build_context_module
+
+    sentinel = "task9-stat-log-secret"
+    path = f"registry=//user:{sentinel}@host.invalid/private"
+    target = tmp_path / path
+    real_stat = Path.stat
+
+    def fail_target_stat(self: Path, *args: object, **kwargs: object) -> os.stat_result:
+        if self == target:
+            raise OSError("stat failed")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fail_target_stat)
+
+    with caplog.at_level(logging.DEBUG, logger="skillspector"):
+        build_context_module._build_component_metadata(
+            tmp_path,
+            [path],
+            {path: "safe content"},
+        )
+
+    assert sentinel not in caplog.text
+    assert path not in caplog.text
+
+
+@pytest.mark.parametrize("failure_kind", ["open", "os"], ids=("open-error", "os-error"))
+def test_cache_read_failures_redact_credential_shaped_path_in_debug_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_kind: str,
+) -> None:
+    import skillspector.nodes.build_context as build_context_module
+
+    sentinel = "task9-read-log-secret"
+    path = f"registry=//user:{sentinel}@host.invalid/private"
+    target = tmp_path / path
+    target.parent.mkdir(parents=True)
+    target.write_text("safe content\n", encoding="utf-8")
+
+    def fail_read(file_path: Path, *, max_bytes: int | None = None) -> bytes:
+        del max_bytes
+        if failure_kind == "open":
+            raise build_context_module._FileOpenError(file_path, PermissionError("denied"))
+        raise OSError("read failed")
+
+    monkeypatch.setattr(build_context_module, "_read_bytes_no_follow", fail_read)
+
+    with caplog.at_level(logging.DEBUG, logger="skillspector"):
+        build_context_module._read_file_cache(tmp_path, [path])
+
+    assert sentinel not in caplog.text
+    assert path not in caplog.text
 
 
 def test_build_context_reports_read_error_without_fake_empty_content(

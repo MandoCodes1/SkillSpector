@@ -186,6 +186,69 @@ def test_text_discovers_single_component_and_encoded_scp_candidates(
     assert api.redact_text(raw) == expected
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "registry=//user:scheme-relative-secret@host.invalid/private?token=hidden",
+            api.REDACTED_URL,
+        ),
+        (
+            '{"registry":"//user:scheme-relative-secret@host.invalid/private?token=hidden"}',
+            api.REDACTED_URL,
+        ),
+        (
+            '{"registry": "//user:scheme-relative-secret@host.invalid/private?token=hidden"}',
+            f'{{"registry": {api.REDACTED_URL}',
+        ),
+        (
+            'src="//user:scheme-relative-secret@host.invalid/private?token=hidden"',
+            api.REDACTED_URL,
+        ),
+    ],
+    ids=("assignment", "compact-json", "spaced-json", "source-markup"),
+)
+def test_embedded_scheme_relative_candidates_are_whole_masked(raw: str, expected: str) -> None:
+    result = api.redact_text_result(raw)
+
+    assert result == api.TextRedactionResult(
+        value=expected,
+        complete=True,
+        candidates=1,
+        reason=None,
+    )
+    assert "scheme-relative-secret" not in result.value
+
+
+class _SyntheticMatch:
+    def end(self) -> int:
+        return len("https://")
+
+
+class _CountingMarkerPattern:
+    def __init__(self) -> None:
+        self.visits = 0
+
+    def finditer(self, _value: str) -> Iterator[_SyntheticMatch]:
+        for _index in range(10_000):
+            self.visits += 1
+            yield _SyntheticMatch()
+
+
+def test_dense_marker_count_stops_at_remaining_candidate_budget_plus_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pattern = _CountingMarkerPattern()
+    monkeypatch.setattr(api, "_HIERARCHICAL_MARKER", pattern)
+
+    result = api.redact_text_result("https://host.invalid/path", max_candidates=1)
+
+    assert result.complete is False
+    assert result.reason is api.TextRedactionIncompleteReason.CANDIDATE_LIMIT
+    assert result.candidates == 0
+    assert pattern.visits == 2
+
+
 def test_multiple_candidates_in_one_token_are_whole_masked_or_exhaust_the_remainder() -> None:
     raw = "https://one.invalid/x,https://two.invalid/y"
 

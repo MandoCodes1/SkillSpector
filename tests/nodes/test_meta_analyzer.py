@@ -347,6 +347,56 @@ def test_sync_provider_prompt_is_redacted_immediately_before_invocation() -> Non
 
 
 @patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_sync_embedded_scheme_relative_prompt_never_reaches_provider_raw() -> None:
+    sentinel = "task9-sync-scheme-relative-secret"
+    analyzer = _PromptBoundaryAnalyzer(base_prompt="inspect", model="test/model")
+    batch = Batch(
+        file_path="pip.conf",
+        content=(f"index-url=//user:{sentinel}@packages.example.invalid/private?token={sentinel}"),
+    )
+    submitted: list[str] = []
+
+    def capture(_llm: object, prompt: str, _collector: object) -> AIMessage:
+        submitted.append(prompt)
+        return AIMessage(content="ok")
+
+    with patch("skillspector.llm_analyzer_base._invoke_with_usage", side_effect=capture):
+        outcome = analyzer.run_batches_detailed([batch])
+
+    assert len(outcome.successful) == 1
+    assert len(submitted) == 1
+    assert sentinel not in submitted[0]
+    assert "[REDACTED_URL]" in submitted[0]
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
+def test_async_embedded_scheme_relative_prompt_never_reaches_provider_raw() -> None:
+    sentinel = "task9-async-scheme-relative-secret"
+    analyzer = _PromptBoundaryAnalyzer(base_prompt="inspect", model="test/model")
+    batch = Batch(
+        file_path="pip.conf",
+        content=(f"index-url=//user:{sentinel}@packages.example.invalid/private?token={sentinel}"),
+    )
+    submitted: list[str] = []
+
+    async def capture(_llm: object, prompt: str, _collector: object) -> AIMessage:
+        submitted.append(prompt)
+        return AIMessage(content="ok")
+
+    with patch(
+        "skillspector.llm_analyzer_base._ainvoke_with_usage",
+        new_callable=AsyncMock,
+        side_effect=capture,
+    ):
+        outcome = run_async(analyzer.arun_batches_detailed([batch], max_concurrency=1))
+
+    assert len(outcome.successful) == 1
+    assert len(submitted) == 1
+    assert sentinel not in submitted[0]
+    assert "[REDACTED_URL]" in submitted[0]
+
+
+@patch(MOCK_PATCH_TARGET, _mock_get_chat_model)
 def test_sync_incomplete_prompt_redaction_makes_zero_calls_and_zero_retries() -> None:
     sentinel = "task7-sync-incomplete-secret"
     analyzer = _PromptBoundaryAnalyzer(base_prompt="inspect", model="test/model")

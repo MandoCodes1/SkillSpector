@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib
+from bisect import bisect_left
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -86,6 +87,26 @@ def _assert_single_parse_limitation(analysis: Any, *, path: str, end_line: int) 
     assert limitation.reason is DependencySourceLimitationReason.PARSE_INCOMPLETE
     assert (limitation.path, limitation.start_line, limitation.end_line) == (path, 1, end_line)
     return limitation
+
+
+def _install_line_lookup_spies(
+    module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, int]:
+    calls = {"builds": 0, "lookups": 0}
+
+    def newline_offsets(value: str | bytes) -> tuple[int, ...]:
+        calls["builds"] += 1
+        marker: str | int = ord("\n") if isinstance(value, bytes) else "\n"
+        return tuple(index for index, character in enumerate(value) if character == marker)
+
+    def line_number_at(offsets: tuple[int, ...], offset: int) -> int:
+        calls["lookups"] += 1
+        return bisect_left(offsets, offset) + 1
+
+    monkeypatch.setattr(module, "_newline_offsets", newline_offsets, raising=False)
+    monkeypatch.setattr(module, "_line_number_at", line_number_at, raising=False)
+    return calls
 
 
 def test_analysis_exposes_applicable_and_inspected_config_spans() -> None:
@@ -1039,6 +1060,17 @@ def test_yarn_yaml_rejects_explicitly_tagged_relevant_key_reached_through_alias(
     _assert_single_parse_limitation(analysis, path=".yarnrc.yml", end_line=3)
 
 
+def test_yarn_yaml_rejects_tagged_relevant_root_but_keeps_unrelated_tagged_root_inert() -> None:
+    relevant = _analyze(
+        {".yarnrc.yml": "!!map {npmRegistryServer: https://packages.example.invalid/simple}\n"}
+    )
+    unrelated = _analyze({".yarnrc.yml": "!!map {unrelated: value}\n"})
+
+    _assert_single_parse_limitation(relevant, path=".yarnrc.yml", end_line=2)
+    assert unrelated.findings == ()
+    assert unrelated.limitations == ()
+
+
 def test_yarn_yaml_node_budget_is_charged_once_before_construction() -> None:
     # Root mapping, key scalar, and value scalar are the three node-producing events.
     exact_budget = DependencyWorkBudget()
@@ -1622,6 +1654,91 @@ def test_cargo_two_hop_fan_in_emits_each_replacement_and_target_only_once() -> N
         "target-private-name",
     ):
         assert private_name not in repr(analysis)
+
+
+class _LookupCountingDict(dict[str, object]):
+    def __init__(self, values: Mapping[str, object]) -> None:
+        super().__init__(values)
+        self.lookups = 0
+
+    def __contains__(self, key: object) -> bool:
+        self.lookups += 1
+        return super().__contains__(key)
+
+    def get(self, key: str, default: object = None) -> object:
+        self.lookups += 1
+        return super().get(key, default)
+
+
+def test_cargo_replacement_resolution_uses_linear_memoized_lookups_near_output_limit() -> None:
+    module = importlib.import_module("skillspector.dependency_sources")
+    chain_length = MAX_DEPENDENCY_SOURCE_CHANGES - 1
+    destination = "sparse+https://packages.example.invalid/index/"
+    span = module.SourceSpan(".cargo/config.toml", 0, 1, 1, 1)
+    sources = _LookupCountingDict(
+        {
+            f"source-{index}": (
+                "replace-with",
+                f"source-{index + 1}" if index + 1 < chain_length else "target",
+                span,
+            )
+            for index in range(chain_length)
+        }
+    )
+    registries = _LookupCountingDict({"target": (destination, span)})
+    resolver = getattr(module, "_resolve_cargo_replacements", None)
+
+    assert callable(resolver), "Cargo replacement chains need one memoized resolver"
+    resolved = resolver(sources, registries)
+
+    assert resolved == {f"source-{index}": destination for index in range(chain_length)}
+    assert sources.lookups + registries.lookups <= chain_length * 8
+
+
+@pytest.mark.parametrize("family", ["python-toml", "cargo-toml", "maven-xml"])
+def test_structured_source_span_line_lookups_are_precomputed_and_linear_near_change_limit(
+    family: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("skillspector.dependency_sources")
+    record_count = MAX_DEPENDENCY_SOURCE_CHANGES - 1
+    calls = _install_line_lookup_spies(module, monkeypatch)
+
+    if family == "python-toml":
+        content = "".join(
+            f"[[index]]\nurl='https://host-{index}.example.invalid/simple'\n"
+            for index in range(record_count)
+        )
+        cursors = module._toml_url_cursors("uv.toml", content, frozenset({("index",)}))
+        assert cursors is not None
+        assert len(cursors[("index",)]) == record_count
+    elif family == "cargo-toml":
+        content = "".join(
+            f"[registries.registry-{index}]\nindex='https://host-{index}.example.invalid/index'\n"
+            for index in range(record_count)
+        )
+        cursors = module._toml_direct_value_cursors(
+            ".cargo/config.toml",
+            content,
+            frozenset({"registries"}),
+            frozenset({"index"}),
+        )
+        assert cursors is not None
+        assert len(cursors) == record_count
+    else:
+        content = (
+            "<project><repositories>"
+            + "".join(
+                f"<repository><url>https://host-{index}.example.invalid/m2</url></repository>"
+                for index in range(record_count)
+            )
+            + "</repositories></project>"
+        )
+        cursors = module._xml_url_spans("pom.xml", content.encode("utf-8"))
+        assert cursors is not None
+        assert len(cursors) == record_count
+
+    assert calls == {"builds": 1, "lookups": record_count * 2}
 
 
 @pytest.mark.parametrize(

@@ -10,6 +10,7 @@ import json
 import re
 import tomllib
 import xml.etree.ElementTree as ET
+from bisect import bisect_left
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final, cast
@@ -847,6 +848,18 @@ def _char_to_byte_offsets(text: str) -> list[int]:
     return offsets
 
 
+def _newline_offsets(value: str | bytes) -> tuple[int, ...]:
+    """Index LF boundaries once for bounded source-span correlation."""
+    if isinstance(value, bytes):
+        return tuple(index for index, character in enumerate(value) if character == ord("\n"))
+    return tuple(index for index, character in enumerate(value) if character == "\n")
+
+
+def _line_number_at(newline_offsets: tuple[int, ...], offset: int) -> int:
+    """Return the one-based physical line containing a half-open source offset."""
+    return bisect_left(newline_offsets, offset) + 1
+
+
 def _yaml_attach_node(
     node: _YamlNode,
     stack: list[_YamlFrame],
@@ -1136,6 +1149,12 @@ def _parse_yarn_yaml(
     if root_pairs is None:
         return DependencySourceParseResult(limitations=(_limitation(path, raw),))
 
+    has_relevant_root_key = any(
+        _yaml_key(key, anchors) in {"npmRegistryServer", "npmScopes"} for key, _value in root_pairs
+    )
+    if root.tag is not None and has_relevant_root_key:
+        return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+
     if any(
         _yaml_key(key, anchors) is None
         and any(
@@ -1410,6 +1429,7 @@ def _toml_url_cursors(
     }
     current: _TomlTableCursor | None = None
     byte_offsets = _char_to_byte_offsets(text)
+    newline_offsets = _newline_offsets(text)
     position = 0
     multiline_delimiter: str | None = None
     while position < len(text):
@@ -1446,8 +1466,8 @@ def _toml_url_cursors(
                 while value_start < len(text) and text[value_start] in " \t":
                     value_start += 1
                 value_end = _toml_value_extent(text, value_start)
-                start_line = text.count("\n", 0, value_start) + 1
-                end_line = text.count("\n", 0, value_end) + 1
+                start_line = _line_number_at(newline_offsets, value_start)
+                end_line = _line_number_at(newline_offsets, value_end)
                 if current.url_span is not None or value_end <= value_start:
                     return None
                 current.url_span = SourceSpan(
@@ -1627,6 +1647,7 @@ def _toml_direct_value_cursors(
     cursors: dict[tuple[tuple[str, ...], str], SourceSpan] = {}
     current_table: tuple[str, ...] | None = None
     byte_offsets = _char_to_byte_offsets(text)
+    newline_offsets = _newline_offsets(text)
     position = 0
     multiline_delimiter: str | None = None
     while position < len(text):
@@ -1671,8 +1692,8 @@ def _toml_direct_value_cursors(
                         path,
                         byte_offsets[value_start],
                         byte_offsets[value_end],
-                        text.count("\n", 0, value_start) + 1,
-                        text.count("\n", 0, value_end) + 1,
+                        _line_number_at(newline_offsets, value_start),
+                        _line_number_at(newline_offsets, value_end),
                     )
                     position = value_end
                     next_newline = text.find("\n", position)
@@ -1681,6 +1702,52 @@ def _toml_direct_value_cursors(
         multiline_delimiter = _toml_multiline_string_state(line, multiline_delimiter)
         position = len(text) if line_end == len(text) else line_end + 1
     return cursors
+
+
+def _resolve_cargo_replacements(
+    sources: Mapping[str, tuple[str, str, SourceSpan]],
+    registries: Mapping[str, tuple[str, SourceSpan]],
+) -> dict[str, str | None] | None:
+    """Resolve every Cargo replacement once, memoizing shared chain suffixes."""
+    memo: dict[str, str | None] = {}
+    resolved_sources: dict[str, str | None] = {}
+    for source_name, (kind, target_name, _span) in sources.items():
+        if kind != "replace-with":
+            continue
+        seen = {source_name}
+        traversed: list[str] = []
+        current = target_name
+        while True:
+            if current in seen:
+                return None
+            seen.add(current)
+
+            source = sources.get(current, _MISSING)
+            registry = registries.get(current, _MISSING)
+            if source is not _MISSING and registry is not _MISSING:
+                return None
+            if current in memo:
+                destination = memo[current]
+                break
+
+            traversed.append(current)
+            if source is not _MISSING:
+                target_kind, target_value, _target_span = cast(tuple[str, str, SourceSpan], source)
+                if target_kind == "replace-with":
+                    current = target_value
+                    continue
+                destination = target_value if target_kind == "registry" else None
+                break
+            if registry is not _MISSING:
+                destination = cast(tuple[str, SourceSpan], registry)[0]
+                break
+            return None
+
+        for traversed_name in traversed:
+            memo[traversed_name] = destination
+        memo[source_name] = destination
+        resolved_sources[source_name] = destination
+    return resolved_sources
 
 
 def _parse_cargo(
@@ -1762,32 +1829,13 @@ def _parse_cargo(
             )
         )
 
-    for source_name, (kind, target_name, replace_span) in sources.items():
+    resolved_sources = _resolve_cargo_replacements(sources, registries)
+    if resolved_sources is None:
+        return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+    for source_name, (kind, _target_name, replace_span) in sources.items():
         if kind != "replace-with":
             continue
-        seen = {source_name}
-        current = target_name
-        destination: str | None = None
-        while True:
-            if current in seen:
-                return DependencySourceParseResult(limitations=(_limitation(path, raw),))
-            seen.add(current)
-            if current in sources and current in registries:
-                return DependencySourceParseResult(limitations=(_limitation(path, raw),))
-            target = sources.get(current)
-            if target is not None:
-                target_kind, target_value, _target_span = target
-                if target_kind == "replace-with":
-                    current = target_value
-                    continue
-                if target_kind == "registry":
-                    destination = target_value
-                break
-            registry = registries.get(current)
-            if registry is not None:
-                destination = registry[0]
-                break
-            return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+        destination = resolved_sources[source_name]
         if destination is not None:
             candidates.append(
                 _Candidate(
@@ -1976,6 +2024,7 @@ def _xml_raw_local_name(token: bytes) -> str | None:
 def _xml_url_spans(path: str, raw: bytes) -> list[tuple[tuple[str, ...], SourceSpan, bool]] | None:
     stack: list[_XmlLexicalFrame] = []
     spans: list[tuple[tuple[str, ...], SourceSpan, bool]] = []
+    newline_offsets = _newline_offsets(raw)
     index = 0
     while index < len(raw):
         marker = raw.find(b"<", index)
@@ -2029,8 +2078,8 @@ def _xml_url_spans(path: str, raw: bytes) -> list[tuple[tuple[str, ...], SourceS
                             path,
                             span_start,
                             span_end,
-                            raw.count(b"\n", 0, span_start) + 1,
-                            raw.count(b"\n", 0, span_end) + 1,
+                            _line_number_at(newline_offsets, span_start),
+                            _line_number_at(newline_offsets, span_end),
                         ),
                         frame.has_markup,
                     )

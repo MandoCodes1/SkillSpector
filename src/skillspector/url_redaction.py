@@ -42,7 +42,9 @@ _PAIRED_CLOSERS: Final = {
     "`": "`",
 }
 _SENTENCE_PUNCTUATION: Final = frozenset(".,")
-_SCHEME_RELATIVE_TOKEN = re.compile(r"(?:^|\s)[\(\[\{<\"'`]?//")
+_SCHEME_RELATIVE_MARKER = re.compile(
+    r"(?:^[\(\[\{<\"'`]?|\s[\(\[\{<\"'`]?|=[\(\[\{<\"'`]*|:[\(\[\{<\"'`]+)//"
+)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -154,27 +156,51 @@ def _safe_path(path: str) -> str | None:
     return f"/{REDACTED_PATH}"
 
 
-def _marker_count(value: str) -> int:
+def _marker_count(value: str, *, max_count: int) -> int:
     if value == "//":
         return 0
-    hierarchical = list(_HIERARCHICAL_MARKER.finditer(value))
-    count = len(hierarchical)
-    if value.startswith("//"):
+    stop_after = max_count + 1
+    count = 0
+    hierarchical_count = 0
+    scheme_relative_count = 0
+    first_authority_start: int | None = None
+
+    for match in _HIERARCHICAL_MARKER.finditer(value):
+        hierarchical_count += 1
         count += 1
+        if first_authority_start is None:
+            first_authority_start = match.end()
+        if count >= stop_after:
+            return stop_after
+
+    for match in _SCHEME_RELATIVE_MARKER.finditer(value):
+        scheme_relative_count += 1
+        count += 1
+        if first_authority_start is None:
+            first_authority_start = match.end()
+        if count >= stop_after:
+            return stop_after
+
     if _has_encoded_url_marker(value):
         count += 1
+        if count >= stop_after:
+            return stop_after
 
-    if hierarchical or value.startswith("//"):
+    if hierarchical_count or scheme_relative_count:
         raw_slashes = value.count("//")
-        structural_slashes = len(hierarchical) + (1 if value.startswith("//") else 0)
+        structural_slashes = hierarchical_count + scheme_relative_count
         count += max(0, raw_slashes - structural_slashes)
-        if _has_nested_scp_marker(value, hierarchical[0].end() if hierarchical else 2):
+        if count >= stop_after:
+            return stop_after
+        if first_authority_start is not None and _has_nested_scp_marker(
+            value, first_authority_start
+        ):
             count += 1
     elif _has_encoded_scp_structure(value):
         count += 1
     elif _has_scp_structure(value):
         count += max(1, value.count("@"))
-    return count
+    return min(count, stop_after)
 
 
 def _has_encoded_url_marker(value: str) -> bool:
@@ -258,7 +284,7 @@ def redact_url(value: str, *, max_characters: int = MAX_REDACTION_CHARACTERS) ->
         return REDACTED_URL
 
     try:
-        markers = _marker_count(value)
+        markers = _marker_count(value, max_count=1)
     except Exception:
         return REDACTED_URL
     if markers == 0:
@@ -333,7 +359,7 @@ def _might_contain_candidate(value: str) -> bool:
         "://" in value
         or _has_encoded_url_marker(value)
         or _has_encoded_scp_structure(value)
-        or ("//" in value and _SCHEME_RELATIVE_TOKEN.search(value))
+        or ("//" in value and _SCHEME_RELATIVE_MARKER.search(value))
         or ("@" in value and ":" in value)
     )
 
@@ -346,7 +372,10 @@ def _redact_text(value: str, *, max_candidates: int) -> TextRedactionResult:
         for match in re.finditer(r"\S+", value):
             token = match.group()
             opener, candidate, closer, punctuation = _token_parts(token)
-            signals = _marker_count(candidate)
+            signals = _marker_count(
+                candidate,
+                max_count=max_candidates - candidates,
+            )
             if signals == 0:
                 continue
             if signals > max_candidates - candidates:

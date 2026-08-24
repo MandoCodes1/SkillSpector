@@ -80,7 +80,7 @@ from skillspector.state import (
     transitive_traversal_state,
 )
 from skillspector.structured_skill import extract_structured_skill_context_from_cache
-from skillspector.url_redaction import redact_text_result
+from skillspector.url_redaction import REDACTED_VALUE, redact_text_result
 
 logger = get_logger(__name__)
 
@@ -655,6 +655,12 @@ def _count_lines(file_path: Path) -> int:
         return 0
 
 
+def _safe_log_label(value: object) -> str:
+    """Return a credential-redacted label for an attacker-controlled log field."""
+    result = redact_text_result(str(value))
+    return result.value if result.complete else REDACTED_VALUE
+
+
 def _build_component_metadata(
     skill_dir: Path,
     components: list[str],
@@ -699,7 +705,7 @@ def _build_component_metadata(
             size_bytes = file_stat.st_size
             mode = file_stat.st_mode
         except OSError:
-            logger.debug("Could not stat file: %s", path)
+            logger.debug("Could not stat file: %s", _safe_log_label(path))
             size_bytes = 0
             mode = 0
         data = content.encode("utf-8", errors="replace") if content is not None else b""
@@ -1152,7 +1158,7 @@ def _read_file_cache(
                 )
             )
         except _FileOpenError as exc:
-            logger.debug("Could not read file: %s", path)
+            logger.debug("Could not read file: %s", _safe_log_label(path))
             ledger_events.append(
                 ledger_event(
                     outcome=LedgerOutcome.FAILED,
@@ -1173,7 +1179,7 @@ def _read_file_cache(
                 )
             )
         except OSError as exc:
-            logger.debug("Could not read file: %s", path)
+            logger.debug("Could not read file: %s", _safe_log_label(path))
             ledger_events.append(
                 ledger_event(
                     outcome=LedgerOutcome.FAILED,
