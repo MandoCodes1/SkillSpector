@@ -43,6 +43,11 @@ from skillspector.state import (
     SkillspectorState,
     WorkflowResourceBudget,
 )
+from skillspector.url_redaction import (
+    REDACTED_REMAINDER,
+    TextRedactionIncompleteReason,
+    TextRedactionResult,
+)
 
 _OMS_FIXTURE = Path(__file__).parents[1] / "fixtures" / "oms" / "mcore-split-pr.skill.oms.sig"
 # Pinned from NVIDIA/skills at commit 1f01acfe1aece58ba95d124eafdfb5bb93523db6:
@@ -905,6 +910,69 @@ def test_build_context_inventories_hidden_file_for_local_analysis(tmp_path: Path
     assert not any(
         event.get("reason_code") == "hidden_file" for event in result["inspection_ledger"]
     )
+
+
+def test_build_context_redacts_visible_config_urls_before_provider_cache(tmp_path: Path) -> None:
+    """Visible authored configs cross the URL redactor; hidden configs remain local-only."""
+    sentinel = "task7-visible-credential"
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    (tmp_path / "pip.conf").write_text(
+        "[global]\n"
+        f"index-url = https://user:{sentinel}@packages.example.invalid/private?token={sentinel}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        f'[tool.uv]\nindex-url = "https://user:{sentinel}@python.example.invalid/simple"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / ".npmrc").write_text(
+        f"registry=https://user:{sentinel}@npm.example.invalid/private\n",
+        encoding="utf-8",
+    )
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    provider_projection = json.dumps(result["llm_file_cache"], sort_keys=True)
+    assert sentinel not in provider_projection
+    assert "packages.example.invalid" in provider_projection
+    assert "python.example.invalid" in provider_projection
+    assert ".npmrc" not in result["llm_file_cache"]
+    assert sentinel in result["local_file_cache"][".npmrc"]
+    assert result["llm_redaction_incomplete_paths"] == []
+
+
+def test_build_context_omits_visible_artifact_when_url_redaction_is_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An incomplete visible-artifact redaction is omitted and projected by bounded path."""
+    import skillspector.nodes.build_context as build_context_module
+
+    sentinel = "task7-incomplete-visible-artifact"
+    (tmp_path / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    (tmp_path / "pip.conf").write_text(
+        f"index-url = https://user:{sentinel}@packages.example.invalid/private\n",
+        encoding="utf-8",
+    )
+    real_redactor = build_context_module.redact_text_result
+
+    def bounded_redactor(value: str) -> TextRedactionResult:
+        if sentinel in value:
+            return TextRedactionResult(
+                REDACTED_REMAINDER,
+                False,
+                0,
+                TextRedactionIncompleteReason.CANDIDATE_LIMIT,
+            )
+        return real_redactor(value)
+
+    monkeypatch.setattr(build_context_module, "redact_text_result", bounded_redactor)
+
+    result = build_context({"skill_path": str(tmp_path)})
+
+    assert "pip.conf" not in result["llm_file_cache"]
+    assert "pip.conf" not in result["llm_components"]
+    assert result["llm_redaction_incomplete_paths"] == ["pip.conf"]
+    assert sentinel in result["local_file_cache"]["pip.conf"]
 
 
 def test_build_context_reports_read_error_without_fake_empty_content(

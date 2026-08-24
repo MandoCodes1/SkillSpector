@@ -761,7 +761,7 @@ class TestReportNode:
 
     def test_report_surfaces_transitive_provenance(self) -> None:
         finding = _finding("T1", "HIGH", "child issue", file="dep.py")
-        finding.source_url = "https://github.com/org/dep"
+        finding.source_url = "https://user:task7-source-secret@github.com/org/dep"
         finding.transitive_depth = 2
         state: SkillspectorState = {
             "filtered_findings": [finding],
@@ -772,18 +772,20 @@ class TestReportNode:
         }
 
         markdown = report(state)["report_body"]
-        assert "https://github.com/org/dep" in markdown
+        assert "task7-source-secret" not in markdown
+        assert "https://github.com/REDACTED_PATH" in markdown
         assert "Transitive depth:** 2" in markdown
 
         state["output_format"] = "sarif"
         sarif = report(state)["sarif_report"]
         properties = sarif["runs"][0]["results"][0]["properties"]
-        assert properties["sourceUrl"] == "https://github.com/org/dep"
+        assert properties["sourceUrl"] == "https://github.com/REDACTED_PATH"
         assert properties["transitiveDepth"] == 2
 
         state["output_format"] = "terminal"
         terminal = report(state)["report_body"]
-        assert "https://github.com/org/dep" in terminal
+        assert "task7-source-secret" not in terminal
+        assert "https://github.com/REDACTED_PATH" in terminal
 
     def test_report_keeps_same_path_from_distinct_immutable_sources(self) -> None:
         shared_url = "https://github.com/org/shared"

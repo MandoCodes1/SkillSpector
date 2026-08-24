@@ -6,14 +6,12 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
 
 from skillspector.graph import graph
 
-_ENFORCE_GAPS = os.getenv("SKILLSPECTOR_SC10_GAPS") == "enforce"
 _SKILL = "---\nname: helper\ndescription: Formats ordinary text.\n---\n# Helper\nFormats text.\n"
 _SENTINELS = ("alice", "supersecret", "querysecret", "fragmentsecret")
 _NONCANONICAL_NPMRC = (
@@ -28,17 +26,23 @@ _EXPECTED_SC10 = {
     "surface": ".npmrc",
     "operation": "replace",
     "scope": "global",
-    "destination": "https://REDACTED@packages.example.invalid/private?token=REDACTED&channel=stable",
+    "destination": "https://packages.example.invalid/REDACTED_PATH",
     "destination_status": "resolved",
     "path": ".npmrc",
-    "line": 1,
+    "start_line": 1,
+    "end_line": 1,
+    "confidence": 1.0,
+    "category": "supply-chain",
+    "matched_text": "https://packages.example.invalid/REDACTED_PATH",
+    "evidence": {
+        "ecosystem": "npm",
+        "surface": ".npmrc",
+        "operation": "replace",
+        "scope": "global",
+        "destination": "https://packages.example.invalid/REDACTED_PATH",
+        "destination_status": "resolved",
+    },
 }
-
-
-def _gap_marks(reason: str) -> list[pytest.MarkDecorator]:
-    if _ENFORCE_GAPS:
-        return []
-    return [pytest.mark.xfail(strict=True, reason=reason)]
 
 
 _DIRECT_CONFIGURATION_CASES = [
@@ -46,14 +50,12 @@ _DIRECT_CONFIGURATION_CASES = [
         _NONCANONICAL_NPMRC,
         _EXPECTED_SC10,
         id="credential-bearing-noncanonical-npmrc",
-        marks=_gap_marks("direct configuration SC10 findings are not implemented"),
     )
 ]
 _CANONICAL_DEFAULT_CASES = [
     pytest.param(
         _CANONICAL_NPMRC,
         id="canonical-npm-default",
-        marks=_gap_marks("no real dependency-source analyzer is active yet"),
     )
 ]
 
@@ -87,7 +89,12 @@ def _normalized_sc10(result: dict[str, object]) -> list[dict[str, object]]:
                 "destination": evidence["destination"],
                 "destination_status": evidence["destination_status"],
                 "path": finding.file,
-                "line": finding.start_line,
+                "start_line": finding.start_line,
+                "end_line": finding.end_line,
+                "confidence": finding.confidence,
+                "category": finding.category,
+                "matched_text": finding.matched_text,
+                "evidence": evidence,
             }
         )
     return normalized
@@ -132,7 +139,7 @@ def test_noncanonical_npmrc_has_one_redacted_sc10_across_public_outputs(
         if output_format == "terminal":
             assert "REDACTED" in serialized
             assert "packages.example.invalid" in serialized
-            assert "/private" in serialized
+            assert "REDACTED_PATH" in serialized
         elif output_format == "markdown":
             assert expected["destination"] in serialized
 
@@ -161,8 +168,8 @@ def test_canonical_npm_registry_is_safe_without_sc10(tmp_path: Path, npmrc: str)
     planned_work = analyzer_status["planned_work"]
     assert len(planned_work) == 1
     assert planned_work[0]["path"] == ".npmrc"
-    assert planned_work[0]["start_line"] is None
-    assert planned_work[0]["end_line"] is None
+    assert planned_work[0]["start_line"] == 1
+    assert planned_work[0]["end_line"] == 2
     completed_npmrc_events = [
         event
         for event in result["inspection_ledger"]
