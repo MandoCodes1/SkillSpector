@@ -27,6 +27,8 @@ from skillspector.dependency_source_types import (
     MAX_DEPENDENCY_SHELL_VALUE_BYTES_PER_FILE,
     MAX_DEPENDENCY_SOURCE_MAP_ENTRIES_PER_FILE,
     AssignmentSite,
+    CommandProducerReachability,
+    CommandResolutionKind,
     CommandSite,
     DependencyFileBudget,
     DependencyWorkBudget,
@@ -5682,7 +5684,15 @@ class _ShellLowerer:
                 break
             command = replace(
                 command,
-                site=replace(command.site, argv=argv),
+                site=replace(
+                    command.site,
+                    argv=argv,
+                    argument_spans=tuple(argument.span for argument in arguments),
+                    resolution=CommandResolutionKind(resolution.kind.value),
+                    prefix_assignments=tuple(
+                        assignments[index].site for index in prefix_assignment_indices
+                    ),
+                ),
                 arguments=tuple(arguments),
                 redirects=redirects,
                 prefix_assignments=tuple(
@@ -5774,6 +5784,7 @@ class _ShellLowerer:
                 assignments[assignment_index] = assignment
                 modeled_assignment_indices.add(assignment_index)
                 resolved_declarations.append((assignment_index, assignment))
+            exported_assignments: list[AssignmentSite] = []
             for _assignment_index, assignment in resolved_declarations:
                 previous = self._lookup_binding(frame, assignment.site.name)
                 export_state = (
@@ -5796,6 +5807,11 @@ class _ShellLowerer:
                     draft=draft,
                     updates=updates,
                 )
+                if (
+                    assignment.declaration_keyword == b"export"
+                    and not unsupported_declaration_semantics
+                ):
+                    exported_assignments.append(assignment.site)
 
             if persistent_declaration_mode:
                 persistent_names = {
@@ -5858,6 +5874,15 @@ class _ShellLowerer:
                         draft=draft,
                         updates=updates,
                     )
+                    exported_assignments.append(
+                        AssignmentSite(
+                            unit_id=command.site.unit_id,
+                            provenance=command.site.provenance,
+                            span=export_operand_arguments[0].span,
+                            name=export_name,
+                            value=previous.value,
+                        )
+                    )
                 elif (
                     post_assignment_no_export
                     and export_operands[1].state is StaticValueState.EXACT
@@ -5917,6 +5942,16 @@ class _ShellLowerer:
                             draft=draft,
                             updates=updates,
                         )
+
+            if exported_assignments:
+                command = replace(
+                    command,
+                    site=replace(
+                        command.site,
+                        exported_assignments=tuple(exported_assignments),
+                    ),
+                )
+                commands[command_index] = command
 
             effect_function_ids: tuple[int, ...] = ()
             if (
@@ -6387,6 +6422,7 @@ class _ShellLowerer:
                 provenance=self.unit.provenance,
                 span=command_span,
                 argv=tuple(argument.value for argument in ordered_arguments),
+                argument_spans=tuple(argument.span for argument in ordered_arguments),
             )
             prefix_sites = tuple(prefix_sites_by_command.get(command_draft.node.start_byte, ()))
             commands.append(
@@ -6971,6 +7007,146 @@ def _retain_typed_function_generated_configs(
     return retained
 
 
+def _annotate_command_producer_reachability(
+    root_program: _ShellProgramIR,
+    nested_programs: tuple[_NestedProgramIR, ...],
+    commands: tuple[_CommandIR, ...],
+) -> tuple[_CommandIR, ...]:
+    """Attach conservative function-producer reachability to public command sites."""
+
+    type FunctionKey = tuple[str, int]
+    functions: dict[FunctionKey, _FunctionContext] = {}
+    for program in (root_program, *(nested.program for nested in nested_programs)):
+        for function in program.functions:
+            key = (program.program_id, function.function_id)
+            if key in functions:
+                functions.pop(key, None)
+            else:
+                functions[key] = function
+    names: dict[FunctionKey, bytes] = {
+        key: cast(bytes, function.name.exact_bytes)
+        for key, function in functions.items()
+        if function.name.state is StaticValueState.EXACT
+    }
+    by_name: dict[bytes, set[FunctionKey]] = {}
+    for key, name in names.items():
+        by_name.setdefault(name, set()).add(key)
+
+    def owner(command: _CommandIR) -> FunctionKey | None:
+        if command.function_id is not None:
+            return (command.program_id, command.function_id)
+        if (
+            command.containing_function_program_id is not None
+            and command.containing_function_id is not None
+        ):
+            return (
+                command.containing_function_program_id,
+                command.containing_function_id,
+            )
+        return None
+
+    def command_name(command: _CommandIR) -> bytes | None:
+        value = command.site.argv[0]
+        return cast(bytes, value.exact_bytes) if value.state is StaticValueState.EXACT else None
+
+    def exact_target(command: _CommandIR) -> FunctionKey | None:
+        function_id = command.resolution.function_id
+        if function_id is None:
+            return None
+        local = (command.program_id, function_id)
+        if local in functions:
+            return local
+        name = command_name(command)
+        candidates = (
+            {key for key in by_name.get(name, ()) if key[1] == function_id}
+            if name is not None
+            else set()
+        )
+        return next(iter(candidates)) if len(candidates) == 1 else None
+
+    definite: dict[FunctionKey | None, set[FunctionKey]] = {}
+    possible_names: dict[FunctionKey | None, set[bytes]] = {}
+    dynamic_possible: set[FunctionKey | None] = set()
+    for command in commands:
+        caller = owner(command)
+        if command.resolution.kind is _CommandResolutionKind.FUNCTION:
+            target = exact_target(command)
+            if target is not None:
+                definite.setdefault(caller, set()).add(target)
+            else:
+                call_name = command_name(command)
+                if call_name is None:
+                    dynamic_possible.add(caller)
+                else:
+                    possible_names.setdefault(caller, set()).add(call_name)
+        elif command.resolution.kind is _CommandResolutionKind.AMBIGUOUS:
+            call_name = command_name(command)
+            if call_name is None:
+                dynamic_possible.add(caller)
+            else:
+                possible_names.setdefault(caller, set()).add(call_name)
+
+    active: set[FunctionKey] = set(definite.get(None, ()))
+    ambiguous: set[FunctionKey] = set()
+    active_queue = list(active)
+    ambiguous_queue: list[FunctionKey] = []
+    expanded_possible_names: set[bytes] = set()
+    dynamic_expanded = False
+
+    def mark_ambiguous(target: FunctionKey) -> None:
+        if target not in active and target not in ambiguous:
+            ambiguous.add(target)
+            ambiguous_queue.append(target)
+
+    def expand_possible_targets(caller: FunctionKey | None) -> None:
+        nonlocal dynamic_expanded
+        for call_name in possible_names.get(caller, ()):
+            if call_name in expanded_possible_names:
+                continue
+            expanded_possible_names.add(call_name)
+            for target in by_name.get(call_name, ()):
+                mark_ambiguous(target)
+        if caller in dynamic_possible and not dynamic_expanded:
+            dynamic_expanded = True
+            for target in functions:
+                mark_ambiguous(target)
+
+    expand_possible_targets(None)
+    active_cursor = 0
+    ambiguous_cursor = 0
+    while active_cursor < len(active_queue) or ambiguous_cursor < len(ambiguous_queue):
+        while active_cursor < len(active_queue):
+            caller = active_queue[active_cursor]
+            active_cursor += 1
+            for target in definite.get(caller, ()):
+                if target not in active:
+                    active.add(target)
+                    ambiguous.discard(target)
+                    active_queue.append(target)
+            expand_possible_targets(caller)
+        while ambiguous_cursor < len(ambiguous_queue):
+            caller = ambiguous_queue[ambiguous_cursor]
+            ambiguous_cursor += 1
+            if caller in active:
+                continue
+            for target in definite.get(caller, ()):
+                mark_ambiguous(target)
+            expand_possible_targets(caller)
+
+    annotated: list[_CommandIR] = []
+    for command in commands:
+        command_owner = owner(command)
+        producer = (
+            CommandProducerReachability.ACTIVE
+            if command_owner is None or command_owner in active
+            else CommandProducerReachability.AMBIGUOUS
+            if command_owner in ambiguous
+            else CommandProducerReachability.INERT
+        )
+        annotated.append(replace(command, site=replace(command.site, producer=producer)))
+    return tuple(annotated)
+
+
 def _run_program_queue(
     root_lowerer: _ShellLowerer,
     root_program: _ShellProgramIR,
@@ -7335,6 +7511,11 @@ def _run_program_queue(
 
     ordered_commands = tuple(
         replace(command, order=index) for index, command in enumerate(execution_commands)
+    )
+    ordered_commands = _annotate_command_producer_reachability(
+        root_modeled.program,
+        ordered_nested_programs,
+        ordered_commands,
     )
     generated_configs = _retain_typed_function_generated_configs(
         root_lowerer,

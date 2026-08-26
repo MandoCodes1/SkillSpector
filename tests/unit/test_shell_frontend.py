@@ -903,6 +903,58 @@ def test_generated_target_uses_only_the_modeled_binding_at_its_write_site() -> N
     assert [config.target.exact_bytes for config in result.generated_configs] == [b".npmrc"]
 
 
+def test_public_command_sites_lower_typed_adapter_reachability_facts() -> None:
+    result, _budget, _unit = _analyze(
+        b"export NPM_CONFIG_REGISTRY=https://packages.example.invalid\n"
+        b"PIP_INDEX_URL=https://bare.example.invalid/simple\n"
+        b"export PIP_INDEX_URL\n"
+        b"PIP_INDEX_URL=https://pip.example.invalid/simple pip install thing\n"
+        b"dead() { npm config set registry https://dead.example.invalid; }\n"
+        b"live() { yarn config set registry https://live.example.invalid; }\n"
+        b"live\n"
+        b"npm() { :; }\n"
+        b"npm config set registry https://shadowed.example.invalid\n"
+        b"/usr/bin/npm config set registry https://external.example.invalid\n"
+    )
+
+    assert result.commands
+    assert all(len(command.argument_spans) == len(command.argv) for command in result.commands)
+    export = next(command for command in result.commands if command.exported_assignments)
+    assert [(site.name, site.value.exact_bytes) for site in export.exported_assignments] == [
+        ("NPM_CONFIG_REGISTRY", b"https://packages.example.invalid")
+    ]
+    bare_export = next(
+        site
+        for command in result.commands
+        for site in command.exported_assignments
+        if site.name == "PIP_INDEX_URL"
+    )
+    assert bare_export.value.exact_bytes == b"https://bare.example.invalid/simple"
+    assert bare_export.span.start_line == 3
+    pip = next(command for command in result.commands if command.argv[0].exact_bytes == b"pip")
+    assert [site.name for site in pip.prefix_assignments] == ["PIP_INDEX_URL"]
+    dead = next(
+        command
+        for command in result.commands
+        if command.argv[0].exact_bytes == b"npm"
+        and command.argv[-1].exact_bytes == b"https://dead.example.invalid"
+    )
+    live = next(command for command in result.commands if command.argv[0].exact_bytes == b"yarn")
+    shadowed = next(
+        command
+        for command in result.commands
+        if command.argv[0].exact_bytes == b"npm"
+        and command.argv[-1].exact_bytes == b"https://shadowed.example.invalid"
+    )
+    assert dead.producer is dependency_types.CommandProducerReachability.INERT
+    assert live.producer is dependency_types.CommandProducerReachability.ACTIVE
+    assert shadowed.resolution is dependency_types.CommandResolutionKind.FUNCTION
+    external = next(
+        command for command in result.commands if command.argv[0].exact_bytes == b"/usr/bin/npm"
+    )
+    assert external.resolution is dependency_types.CommandResolutionKind.EXTERNAL
+
+
 @pytest.mark.parametrize("value", [b"foo bar", b"*"])
 def test_unquoted_output_target_expansion_never_proves_one_filename(value: bytes) -> None:
     prefix = b"DIR='" + value + b"'\n"
@@ -1046,6 +1098,163 @@ def test_dynamic_function_calls_without_generated_configs_have_bounded_activatio
 
     assert retained == []
     assert issue_sink.count == imported_count
+
+
+def test_dynamic_command_producer_reachability_is_linear_at_normative_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    count = 10_000
+    unit_id = "0" * 32
+    span = dependency_types.SourceSpan("scripts/bounded-producers.sh", 0, 1, 1, 1)
+    functions = tuple(
+        shell_frontend._FunctionContext(
+            index,
+            dependency_types.StaticValue.exact(b"f" + str(index).encode("ascii")),
+            span,
+            (),
+            None,
+            None,
+            index,
+            index + 1,
+        )
+        for index in range(count)
+    )
+
+    def command(
+        index: int,
+        *,
+        dynamic: bool,
+        function_id: int | None,
+    ) -> shell_frontend._CommandIR:
+        value = (
+            dependency_types.StaticValue.unknown()
+            if dynamic
+            else dependency_types.StaticValue.exact(b"external")
+        )
+        return shell_frontend._CommandIR(
+            dependency_types.CommandSite(
+                unit_id,
+                dependency_types.SiteProvenance.FILE_SUFFIX,
+                span,
+                (value,),
+            ),
+            index,
+            None,
+            function_id,
+            (),
+            (),
+            (),
+            program_id=unit_id,
+            resolution=shell_frontend._CommandResolution(
+                shell_frontend._CommandResolutionKind.AMBIGUOUS
+                if dynamic
+                else shell_frontend._CommandResolutionKind.EXTERNAL
+            ),
+        )
+
+    root_calls = tuple(command(index, dynamic=True, function_id=None) for index in range(count))
+    function_bodies = tuple(
+        command(count + index, dynamic=False, function_id=index) for index in range(count)
+    )
+    commands = root_calls + function_bodies
+    program = shell_frontend._ShellProgramIR(
+        program_id=unit_id,
+        functions=functions,
+        commands=commands,
+    )
+
+    class BoundedSet(set[Any]):
+        updated_items = 0
+
+        def update(self, *others: Any) -> None:
+            type(self).updated_items += sum(len(other) for other in others)
+            if type(self).updated_items > count * 4:
+                raise AssertionError("producer reachability materialized a quadratic edge set")
+            super().update(*others)
+
+    monkeypatch.setattr(shell_frontend, "set", BoundedSet, raising=False)
+
+    annotated = shell_frontend._annotate_command_producer_reachability(program, (), commands)
+
+    assert all(
+        command.site.producer is dependency_types.CommandProducerReachability.ACTIVE
+        for command in annotated[:count]
+    )
+    assert all(
+        command.site.producer is dependency_types.CommandProducerReachability.AMBIGUOUS
+        for command in annotated[count:]
+    )
+    assert BoundedSet.updated_items <= count * 4
+
+
+def test_exact_name_ambiguity_never_materializes_caller_target_cartesian_edges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    count = 1_500
+    unit_id = "0" * 32
+    span = dependency_types.SourceSpan("scripts/same-name-producers.sh", 0, 1, 1, 1)
+    functions = tuple(
+        shell_frontend._FunctionContext(
+            index,
+            dependency_types.StaticValue.exact(b"f"),
+            span,
+            (),
+            None,
+            None,
+            index,
+            index + 1,
+        )
+        for index in range(count)
+    )
+
+    def ambiguous_call(index: int, function_id: int | None) -> shell_frontend._CommandIR:
+        return shell_frontend._CommandIR(
+            dependency_types.CommandSite(
+                unit_id,
+                dependency_types.SiteProvenance.FILE_SUFFIX,
+                span,
+                (dependency_types.StaticValue.exact(b"f"),),
+            ),
+            index,
+            None,
+            function_id,
+            (),
+            (),
+            (),
+            program_id=unit_id,
+            resolution=shell_frontend._CommandResolution(
+                shell_frontend._CommandResolutionKind.AMBIGUOUS
+            ),
+        )
+
+    commands = (ambiguous_call(0, None),) + tuple(
+        ambiguous_call(index + 1, index) for index in range(count)
+    )
+    program = shell_frontend._ShellProgramIR(
+        program_id=unit_id,
+        functions=functions,
+        commands=commands,
+    )
+
+    class BoundedSet(set[Any]):
+        updated_items = 0
+
+        def update(self, *others: Any) -> None:
+            type(self).updated_items += sum(len(other) for other in others)
+            if type(self).updated_items > count * 4:
+                raise AssertionError("producer reachability materialized a Cartesian edge set")
+            super().update(*others)
+
+    monkeypatch.setattr(shell_frontend, "set", BoundedSet, raising=False)
+
+    annotated = shell_frontend._annotate_command_producer_reachability(program, (), commands)
+
+    assert annotated[0].site.producer is dependency_types.CommandProducerReachability.ACTIVE
+    assert all(
+        command.site.producer is dependency_types.CommandProducerReachability.AMBIGUOUS
+        for command in annotated[1:]
+    )
+    assert BoundedSet.updated_items <= count * 4
 
 
 def test_second_on_line_recovery_emits_only_redirect_evidence() -> None:

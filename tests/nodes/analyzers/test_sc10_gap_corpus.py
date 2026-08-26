@@ -87,7 +87,6 @@ PR1_FINDING_IDS = frozenset(
 TRANSITIONED_LIMITATION_ID = "markdown-nonstandard-filename-limitation"
 PUBLIC_CONTROL_ID = re.compile(r"control-(?:[a-z][a-z0-9-]*|executable-[0-9a-f]{12})\Z")
 PUBLIC_IMPORTED_CONTROL_ID = re.compile(r"control-executable-[0-9a-f]{12}\Z")
-FUTURE_ECOSYSTEM_VALUES = {"pnpm"}
 
 
 def _load_documents() -> tuple[dict[str, Any], dict[str, Any]]:
@@ -247,37 +246,25 @@ def test_corpus_schema_and_self_checks() -> None:
                 assert expected["end_line"] > expected["start_line"]
                 assert expected["end_line"] <= physical_line_count
             ecosystem = expected["ecosystem"]
-            assert ecosystem in {item.value for item in DependencyEcosystem} | (
-                FUTURE_ECOSYSTEM_VALUES
-            )
-            if ecosystem in FUTURE_ECOSYSTEM_VALUES:
-                # Task 7 adds the fixed PNPM enum. Until then, validate every
-                # other field against the live PR-1 enums without pretending
-                # that GENERIC represents pnpm.
-                assert ecosystem == "pnpm"
-                DependencySourceSurface(expected["surface"])
-                DependencySourceOperation(expected["operation"])
-                DependencySourceScope(expected["scope"])
-                DestinationStatus(expected["destination_status"])
-            else:
-                projected = finding_from_source_change(
-                    SourceChange(
-                        ecosystem=DependencyEcosystem(ecosystem),
-                        surface=DependencySourceSurface(expected["surface"]),
-                        operation=DependencySourceOperation(expected["operation"]),
-                        scope=DependencySourceScope(expected["scope"]),
-                        destination=expected["destination"],
-                        destination_status=DestinationStatus(expected["destination_status"]),
-                        span=SourceSpan(
-                            path=path,
-                            start_byte=0,
-                            end_byte=0,
-                            start_line=expected["start_line"],
-                            end_line=expected.get("end_line", expected["start_line"]),
-                        ),
-                    )
+            assert ecosystem in {item.value for item in DependencyEcosystem}
+            projected = finding_from_source_change(
+                SourceChange(
+                    ecosystem=DependencyEcosystem(ecosystem),
+                    surface=DependencySourceSurface(expected["surface"]),
+                    operation=DependencySourceOperation(expected["operation"]),
+                    scope=DependencySourceScope(expected["scope"]),
+                    destination=expected["destination"],
+                    destination_status=DestinationStatus(expected["destination_status"]),
+                    span=SourceSpan(
+                        path=path,
+                        start_byte=0,
+                        end_byte=0,
+                        start_line=expected["start_line"],
+                        end_line=expected.get("end_line", expected["start_line"]),
+                    ),
                 )
-                assert _normalized_finding(projected) == expected
+            )
+            assert _normalized_finding(projected) == expected
             if expected["destination_status"] == "resolved":
                 parsed_destination = urlsplit(expected["destination"])
                 assert parsed_destination.username is None

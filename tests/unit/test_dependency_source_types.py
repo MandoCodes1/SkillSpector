@@ -219,6 +219,51 @@ def test_shell_contracts_are_frozen_code_owned_and_privacy_safe() -> None:
         )
 
 
+def test_command_site_exposes_only_typed_execution_facts_with_aligned_spans() -> None:
+    api = _api()
+    unit = _shell_unit(api, raw=b"npm config")
+    prefix = api.AssignmentSite(
+        unit_id=unit.unit_id,
+        provenance=unit.provenance,
+        span=unit.origin_span,
+        name="NPM_CONFIG_REGISTRY",
+        value=api.StaticValue.exact(b"https://packages.example.invalid"),
+    )
+
+    command = api.CommandSite(
+        unit_id=unit.unit_id,
+        provenance=unit.provenance,
+        span=unit.origin_span,
+        argv=(api.StaticValue.exact(b"npm"), api.StaticValue.exact(b"config")),
+        argument_spans=(unit.origin_span, unit.origin_span),
+        resolution=api.CommandResolutionKind.EXTERNAL,
+        producer=api.CommandProducerReachability.ACTIVE,
+        prefix_assignments=(prefix,),
+        exported_assignments=(),
+    )
+
+    assert len(command.argument_spans) == len(command.argv)
+    assert command.prefix_assignments == (prefix,)
+    assert {item.value for item in api.CommandResolutionKind} == {
+        "external",
+        "function",
+        "ambiguous",
+    }
+    assert {item.value for item in api.CommandProducerReachability} == {
+        "active",
+        "inert",
+        "ambiguous",
+    }
+    with pytest.raises(ValueError, match="argument_spans"):
+        api.CommandSite(
+            unit_id=unit.unit_id,
+            provenance=unit.provenance,
+            span=unit.origin_span,
+            argv=(api.StaticValue.exact(b"npm"), api.StaticValue.exact(b"config")),
+            argument_spans=(unit.origin_span,),
+        )
+
+
 def test_shell_unit_ids_are_deterministic_opaque_coordinates_not_content_hashes() -> None:
     api = _api()
     first = _shell_unit(api, raw=b"a")

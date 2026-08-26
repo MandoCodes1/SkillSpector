@@ -54,6 +54,7 @@ class DependencyEcosystem(StrEnum):
 
     NPM = "npm"
     YARN = "yarn"
+    PNPM = "pnpm"
     PIP = "pip"
     POETRY = "poetry"
     PDM = "pdm"
@@ -192,6 +193,22 @@ class StaticValueState(StrEnum):
     EXACT = "exact"
     UNKNOWN = "unknown"
     UNBOUND = "unbound"
+
+
+class CommandResolutionKind(StrEnum):
+    """Whether a command word is proven external or function-resolved."""
+
+    EXTERNAL = "external"
+    FUNCTION = "function"
+    AMBIGUOUS = "ambiguous"
+
+
+class CommandProducerReachability(StrEnum):
+    """Whether the command's enclosing producer is proven to execute."""
+
+    ACTIVE = "active"
+    INERT = "inert"
+    AMBIGUOUS = "ambiguous"
 
 
 class ShellIssueReason(StrEnum):
@@ -557,6 +574,11 @@ class CommandSite:
     provenance: SiteProvenance
     span: SourceSpan
     argv: tuple[StaticValue, ...]
+    argument_spans: tuple[SourceSpan, ...] = ()
+    resolution: CommandResolutionKind = CommandResolutionKind.EXTERNAL
+    producer: CommandProducerReachability = CommandProducerReachability.ACTIVE
+    prefix_assignments: tuple[AssignmentSite, ...] = ()
+    exported_assignments: tuple[AssignmentSite, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_site(self.unit_id, self.provenance, self.span)
@@ -564,6 +586,31 @@ class CommandSite:
         if not argv or not all(isinstance(value, StaticValue) for value in argv):
             raise ValueError("argv must contain at least one StaticValue")
         object.__setattr__(self, "argv", argv)
+        argument_spans = tuple(self.argument_spans) or tuple(self.span for _ in argv)
+        if len(argument_spans) != len(argv) or not all(
+            isinstance(argument_span, SourceSpan) for argument_span in argument_spans
+        ):
+            raise ValueError("argument_spans must align one-to-one with argv")
+        if any(argument_span.path != self.span.path for argument_span in argument_spans):
+            raise ValueError("argument_spans must share the command path")
+        if not isinstance(self.resolution, CommandResolutionKind):
+            raise ValueError("resolution must be code-owned")
+        if not isinstance(self.producer, CommandProducerReachability):
+            raise ValueError("producer must be code-owned")
+        prefix_assignments = tuple(self.prefix_assignments)
+        exported_assignments = tuple(self.exported_assignments)
+        if not all(isinstance(site, AssignmentSite) for site in prefix_assignments):
+            raise ValueError("prefix_assignments must contain AssignmentSite values")
+        if not all(isinstance(site, AssignmentSite) for site in exported_assignments):
+            raise ValueError("exported_assignments must contain AssignmentSite values")
+        if any(
+            site.unit_id != self.unit_id or site.span.path != self.span.path
+            for site in (*prefix_assignments, *exported_assignments)
+        ):
+            raise ValueError("command assignments must share the command unit and path")
+        object.__setattr__(self, "argument_spans", argument_spans)
+        object.__setattr__(self, "prefix_assignments", prefix_assignments)
+        object.__setattr__(self, "exported_assignments", exported_assignments)
 
 
 @dataclass(frozen=True, slots=True)
