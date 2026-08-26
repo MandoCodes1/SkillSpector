@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.metadata
+import inspect
 import os
 import subprocess
 import sys
@@ -53,6 +55,70 @@ def _descendants(node: Any) -> list[Any]:
 def test_installed_parser_distribution_versions_are_exact() -> None:
     assert importlib.metadata.version("tree-sitter") == TREE_SITTER_VERSION
     assert importlib.metadata.version("tree-sitter-bash") == TREE_SITTER_BASH_VERSION
+
+
+def test_sc10_shell_path_has_no_raw_fallback_parser_surface() -> None:
+    frontend = _frontend()
+    adapters = importlib.import_module("skillspector.dependency_command_adapters")
+    executable_sources = {
+        "shell_frontend": inspect.getsource(frontend),
+        "dependency_command_adapters": inspect.getsource(adapters),
+    }
+
+    for module_name, source in executable_sources.items():
+        tree = ast.parse(source)
+        imports = {
+            alias.name.partition(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        imports.update(
+            node.module.partition(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module is not None
+        )
+        function_names = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        attribute_calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+
+        assert "shlex" not in imports, module_name
+        assert "re" not in imports, f"{module_name} must not create regex shell evidence"
+        assert "splitlines" not in attribute_calls, module_name
+        assert not any("tokenizer" in name or "lexer" in name for name in function_names)
+        assert not any(
+            "raw_command" in name or "fallback_command" in name for name in function_names
+        )
+
+    recovery_names = {
+        name
+        for name, _value in inspect.getmembers(frontend._ShellLowerer)
+        if "recover" in name or "recovery" in name or name.startswith("_fallback_")
+    }
+    assert recovery_names == {
+        "_recovery_step",
+        "_recover_cst_anchored_body_argument",
+        "_recover_cst_anchored_heredoc_facts",
+    }
+
+    parse_tree = ast.parse(inspect.getsource(frontend.parse_bash_source))
+    parser_calls = [
+        node
+        for node in ast.walk(parse_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "parse"
+    ]
+    assert len(parser_calls) == 1
+    assert [getattr(argument, "id", None) for argument in parser_calls[0].args] == ["reader"]
+    assert parser_calls[0].keywords == []
 
 
 def test_bash_language_versions_and_minimal_public_api_parse() -> None:
@@ -171,13 +237,16 @@ def test_production_parse_uses_only_a_bounded_callable_reader(
     sentinel_tree = object()
     observed_chunks: list[bytes] = []
     observed_deadlines: list[float | None] = []
+    observed_parse_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     class RecordingParser:
-        def parse(
-            self,
-            reader: Callable[[int, tuple[int, int]], bytes],
-        ) -> object:
+        def parse(self, *args: object, **kwargs: object) -> object:
+            observed_parse_calls.append((args, kwargs))
+            assert kwargs == {}, "production must not pass progress_callback"
+            assert len(args) == 1
+            reader = args[0]
             assert callable(reader)
+            assert not isinstance(reader, bytes), "bytestring parser overload is prohibited"
             first = reader(0, (0, 0))
             observed_chunks.append(first)
             assert reader(len(source), (1000, 0)) == b""
@@ -193,6 +262,7 @@ def test_production_parse_uses_only_a_bounded_callable_reader(
 
     assert result is sentinel_tree
     assert observed_deadlines == [None]
+    assert len(observed_parse_calls) == 1
     assert observed_chunks
     assert len(observed_chunks[0]) == frontend.MAX_TREE_SITTER_READ_BYTES
     assert observed_chunks[0] == source[: frontend.MAX_TREE_SITTER_READ_BYTES]
@@ -270,6 +340,7 @@ def test_reader_deadline_is_classified_as_local_runtime_partial(
     assert caught.value.deadline_tripped is True
 
 
+@pytest.mark.timeout(10)
 def test_public_shell_analysis_propagates_the_production_deadline() -> None:
     frontend = _frontend()
     contracts = importlib.import_module("skillspector.dependency_source_types")

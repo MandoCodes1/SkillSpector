@@ -452,8 +452,9 @@ def test_nul_form_feed_and_lone_cr_are_preserved_without_invented_line_boundarie
     assert result.issues == ()
 
 
-def test_shell_unit_limit_retains_exact_capacity_and_one_resource_issue() -> None:
-    raw = b"".join(b"```bash\nprintf ok\n```\n" for _ in range(257))
+@pytest.mark.timeout(10)
+def test_thousands_of_shell_fences_retain_exact_capacity_and_one_resource_issue() -> None:
+    raw = b"".join(b"```bash\nprintf ok\n```\n" for _ in range(4_096))
     budget = DependencyWorkBudget()
 
     result = _extract("docs/many.md", raw, budget=budget)
@@ -466,6 +467,35 @@ def test_shell_unit_limit_retains_exact_capacity_and_one_resource_issue() -> Non
         budget.for_file("docs/many.md").used(dependency_types.DependencyWorkResource.SHELL_UNITS)
         == 256
     )
+
+
+@pytest.mark.timeout(10)
+def test_operator_dense_many_short_commands_stop_at_ir_limit_with_truthful_issue() -> None:
+    raw = b"a&&b||c|d;" * 15_000 + b"\n"
+    budget = DependencyWorkBudget()
+
+    result, _, unit = _analyze(raw, path="scripts/operator-dense.sh", budget=budget)
+
+    assert result.commands == ()
+    assert 1 <= len(result.issues) <= 2
+    expected_exhaustion = dependency_types.DependencyWorkExhaustion(
+        dependency_types.DependencyWorkResource.RETAINED_SHELL_IR,
+        dependency_types.MAX_DEPENDENCY_RETAINED_SHELL_IR + 1,
+        dependency_types.MAX_DEPENDENCY_RETAINED_SHELL_IR,
+    )
+    assert {issue.reason for issue in result.issues} == {
+        dependency_types.ShellIssueReason.RESOURCE_LIMIT
+    }
+    assert {issue.exhaustion for issue in result.issues} == {expected_exhaustion}
+    assert (
+        budget.for_file(unit.origin_span.path).used_for_unit(
+            unit, dependency_types.DependencyWorkResource.RETAINED_SHELL_IR
+        )
+        == dependency_types.MAX_DEPENDENCY_RETAINED_SHELL_IR
+    )
+    assert [item.outcome for item in result.work_items] == [
+        dependency_types.ShellWorkOutcome.PARTIAL
+    ]
 
 
 def test_extraction_requires_normalized_paths_immutable_inventory_and_canonical_bytes() -> None:

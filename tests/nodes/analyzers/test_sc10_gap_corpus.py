@@ -183,6 +183,7 @@ def test_corpus_schema_and_self_checks() -> None:
     assert sum(row["lands_in"] == "PR-2" for row in FINDING_ROWS) == 66
     assert sum(row["lands_in"] == "PR-1" for row in CONTROL_ROWS) == 28
     assert sum(row["lands_in"] == "PR-2" for row in CONTROL_ROWS) == 137
+    assert Counter(row["status"] for row in ALL_ROWS) == {"fixed": 250}
     imported_control_ids = [row["id"] for row in CONTROL_ROWS if row["lands_in"] == "PR-2"]
     assert imported_control_ids == sorted(imported_control_ids)
     assert all(

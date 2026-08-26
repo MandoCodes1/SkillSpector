@@ -871,11 +871,21 @@ def test_resolved_destination_rejects_blank_or_control_bearing_values(destinatio
         )
 
 
-def test_resolved_destination_rejects_values_above_its_explicit_bound() -> None:
+def test_resolved_destination_accepts_exact_bound_and_rejects_one_over() -> None:
     api = _api()
-    destination = "https://packages.example.invalid/" + (
-        "a" * api.MAX_DEPENDENCY_DESTINATION_CHARACTERS
+    suffix = "://x.invalid/"
+    exact = "a" * (api.MAX_DEPENDENCY_DESTINATION_CHARACTERS - len(suffix)) + suffix
+    accepted = api.SourceChange(
+        ecosystem="npm",
+        surface="source",
+        operation="replace",
+        scope="global",
+        destination=exact,
+        destination_status=api.DestinationStatus.RESOLVED,
+        span=_span(api),
     )
+
+    assert accepted.destination == exact
 
     with pytest.raises(ValueError):
         api.SourceChange(
@@ -883,7 +893,7 @@ def test_resolved_destination_rejects_values_above_its_explicit_bound() -> None:
             surface="source",
             operation="replace",
             scope="global",
-            destination=destination,
+            destination=exact + "a",
             destination_status=api.DestinationStatus.RESOLVED,
             span=_span(api),
         )

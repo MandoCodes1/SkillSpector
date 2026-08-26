@@ -2710,7 +2710,7 @@ class _ShellLowerer:
             body.end_byte,
         )
 
-    def _fallback_body_argument(
+    def _recover_cst_anchored_body_argument(
         self,
         start_byte: int,
         end_byte: int,
@@ -2882,7 +2882,7 @@ class _ShellLowerer:
                 fallback_span=operator_span,
             )
             if not quoted and operator == "<<" and body_node.start_byte == body_start
-            else self._fallback_body_argument(
+            else self._recover_cst_anchored_body_argument(
                 body_start,
                 end_line.start,
                 strip_tabs=operator == "<<-",
@@ -2935,7 +2935,7 @@ class _ShellLowerer:
                 stack.extend(reversed(children))
         return nodes, candidates
 
-    def _fallback_heredoc_facts(
+    def _recover_cst_anchored_heredoc_facts(
         self,
         statement: Node,
         heredocs: tuple[Node, ...],
@@ -3075,7 +3075,7 @@ class _ShellLowerer:
                 return None
             if not self._recovery_step(max(0, body_end - body_start), operator_span):
                 return None
-            argument = self._fallback_body_argument(
+            argument = self._recover_cst_anchored_body_argument(
                 body_start,
                 body_end,
                 strip_tabs=strip_tabs,
@@ -3267,7 +3267,7 @@ class _ShellLowerer:
             return
         if not heredocs and not has_here_string_shape:
             return
-        recovered = self._fallback_heredoc_facts(node, heredocs, function_id)
+        recovered = self._recover_cst_anchored_heredoc_facts(node, heredocs, function_id)
         if recovered is None:
             return
         facts, generated = recovered
