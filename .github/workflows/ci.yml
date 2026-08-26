@@ -150,14 +150,16 @@ jobs:
         run: >-
           uv pip install --python .parser-smoke-venv --only-binary=:all:
           tree-sitter==0.25.2 tree-sitter-bash==0.25.1
+      - name: Install SkillSpector runtime
+        run: uv pip install --python .parser-smoke-venv .
       - name: Smoke production parser loader
         run: >-
           uv run --no-project --python .parser-smoke-venv python -c
-          "import runpy, time;
-          frontend = runpy.run_path('src/skillspector/shell_frontend.py');
-          tree = frontend['parse_bash_source'](
+          "import time;
+          from skillspector.shell_frontend import load_bash_language, parse_bash_source;
+          tree = parse_bash_source(
           b'printf ok\\n', deadline_monotonic=time.monotonic() + 5.0);
-          assert frontend['load_bash_language']().abi_version == 15;
+          assert load_bash_language().abi_version == 15;
           assert tree.root_node.type == 'program'"
 
   docker-smoke:

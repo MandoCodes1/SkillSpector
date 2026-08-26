@@ -61,3 +61,17 @@ def test_change_filter_selects_and_validates_each_event_base() -> None:
     assert '[[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]' in workflow
     assert 'git cat-file -e "${BASE_SHA}^{commit}"' in workflow
     assert 'echo "$BASE_SHA"' not in workflow
+
+
+def test_parser_wheel_smoke_installs_runtime_before_importing_production_loader() -> None:
+    """The clean wheel environment can import the production parser module."""
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+
+    wheel_install = workflow.index("- name: Install exact parser wheels only")
+    runtime_install = workflow.index("- name: Install SkillSpector runtime")
+    loader_smoke = workflow.index("- name: Smoke production parser loader")
+
+    assert wheel_install < runtime_install < loader_smoke
+    assert "uv pip install --python .parser-smoke-venv ." in workflow
+    assert "from skillspector.shell_frontend import" in workflow
+    assert "runpy.run_path('src/skillspector/shell_frontend.py')" not in workflow
