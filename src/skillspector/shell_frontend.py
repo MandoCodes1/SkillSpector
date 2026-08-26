@@ -888,6 +888,7 @@ class _ProvenGeneratedConfig(GeneratedConfig):
     """Private proof carried beside the stable public generated-config fields."""
 
     target_proof: _GeneratedValueProof | None = field(default=None, repr=False, compare=False)
+    home_relative_target: bytes | None = field(default=None, repr=False, compare=False)
     content_proof: _GeneratedValueProof | None = field(default=None, repr=False, compare=False)
     physical_size_bytes: int = field(default=0, repr=False, compare=False)
     physical_line_starts: tuple[int, ...] = field(default=(), repr=False, compare=False)
@@ -952,6 +953,7 @@ class _ArgumentIR:
     atoms: tuple[_ValueAtom, ...]
     local_start_byte: int = field(repr=False)
     local_end_byte: int = field(repr=False)
+    home_relative_target: bytes | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2096,7 +2098,15 @@ class _ShellLowerer:
             atoms,
             group.start_byte,
             group.end_byte,
+            self._home_relative_generated_target(group.raw_syntax),
         )
+
+    @staticmethod
+    def _home_relative_generated_target(raw_syntax: bytes) -> bytes | None:
+        """Retain only the two code-owned home forms needed for config dispatch."""
+        if raw_syntax in {b'"$HOME/.npmrc"', b"~/.npmrc"}:
+            return b".npmrc"
+        return None
 
     @staticmethod
     def _identifier(raw: bytes) -> str | None:
@@ -4464,6 +4474,7 @@ class _ShellLowerer:
             content=content,
             source_map=source_map,
             target_proof=output_fact.value_proof,
+            home_relative_target=output_fact.target.home_relative_target,
             content_proof=input_fact.value_proof,
             physical_size_bytes=(
                 parent_map.physical_size_bytes if parent_map is not None else len(self.raw)
@@ -7666,6 +7677,11 @@ def analyze_shell_unit(
     unit: ShellUnit,
     *,
     budget: DependencyWorkBudget,
+    deadline_monotonic: float | None = None,
 ) -> ShellFrontendResult:
     """Parse and lower one shell unit exactly once into bounded syntax-only sites."""
-    return _analyze_shell_unit(unit, budget=budget).public
+    return _analyze_shell_unit(
+        unit,
+        budget=budget,
+        deadline_monotonic=deadline_monotonic,
+    ).public

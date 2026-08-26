@@ -49,6 +49,13 @@ class DestinationStatus(StrEnum):
     UNRESOLVED = "unresolved"
 
 
+class DependencyCandidateRank(StrEnum):
+    """Strength used when equivalent transient semantic sinks overlap."""
+
+    EXACT = "exact"
+    RECOVERED = "recovered"
+
+
 class DependencyEcosystem(StrEnum):
     """Code-owned dependency ecosystems implemented by source parsers."""
 
@@ -819,6 +826,50 @@ class SourceChange:
             raise ValueError("a resolved destination must already be safely redacted")
 
 
+@dataclass(frozen=True, slots=True)
+class DependencySourceCandidate:
+    """One sanitized unreserved semantic candidate awaiting orchestration."""
+
+    ecosystem: DependencyEcosystem
+    surface: DependencySourceSurface
+    operation: DependencySourceOperation
+    scope: DependencySourceScope
+    destination: str
+    destination_status: DestinationStatus
+    span: SourceSpan
+    producer_unit_id: str | None = None
+    rank: DependencyCandidateRank = DependencyCandidateRank.EXACT
+    canonical_default: bool = False
+
+    def __post_init__(self) -> None:
+        validated = SourceChange(
+            ecosystem=self.ecosystem,
+            surface=self.surface,
+            operation=self.operation,
+            scope=self.scope,
+            destination=self.destination,
+            destination_status=self.destination_status,
+            span=self.span,
+        )
+        for name in (
+            "ecosystem",
+            "surface",
+            "operation",
+            "scope",
+            "destination_status",
+        ):
+            object.__setattr__(self, name, getattr(validated, name))
+        if self.producer_unit_id is not None:
+            _require_shell_unit_id(self.producer_unit_id)
+        try:
+            rank = DependencyCandidateRank(self.rank)
+        except (TypeError, ValueError):
+            raise ValueError("rank must be code-owned") from None
+        object.__setattr__(self, "rank", rank)
+        if type(self.canonical_default) is not bool:
+            raise ValueError("canonical_default must be a boolean")
+
+
 _METRIC_FIELDS: Final = (
     "observed_bytes",
     "limit_bytes",
@@ -901,17 +952,17 @@ class DependencySourceSpan:
 class DependencySourceParseResult:
     """Sanitized parser or adapter output."""
 
-    changes: tuple[SourceChange, ...] = ()
+    candidates: tuple[DependencySourceCandidate, ...] = ()
     limitations: tuple[DependencySourceLimitation, ...] = ()
 
     def __post_init__(self) -> None:
-        changes = tuple(self.changes)
+        candidates = tuple(self.candidates)
         limitations = tuple(self.limitations)
-        if not all(isinstance(change, SourceChange) for change in changes):
-            raise ValueError("changes must contain SourceChange values")
+        if not all(isinstance(candidate, DependencySourceCandidate) for candidate in candidates):
+            raise ValueError("candidates must contain DependencySourceCandidate values")
         if not all(isinstance(item, DependencySourceLimitation) for item in limitations):
             raise ValueError("limitations must contain DependencySourceLimitation values")
-        object.__setattr__(self, "changes", changes)
+        object.__setattr__(self, "candidates", candidates)
         object.__setattr__(self, "limitations", limitations)
 
 
@@ -920,6 +971,7 @@ class DependencySourceAnalysis:
     """Public deterministic findings plus any localized analysis limitations."""
 
     findings: tuple[Finding, ...] = ()
+    finding_producer_unit_ids: tuple[str | None, ...] = ()
     limitations: tuple[DependencySourceLimitation, ...] = ()
     applicable_spans: tuple[DependencySourceSpan, ...] = ()
     inspected_spans: tuple[DependencySourceSpan, ...] = ()
@@ -929,6 +981,9 @@ class DependencySourceAnalysis:
 
     def __post_init__(self) -> None:
         findings = tuple(self.findings)
+        producer_unit_ids = tuple(self.finding_producer_unit_ids) or tuple(
+            None for _finding in findings
+        )
         limitations = tuple(self.limitations)
         applicable_spans = tuple(self.applicable_spans)
         inspected_spans = tuple(self.inspected_spans)
@@ -936,6 +991,11 @@ class DependencySourceAnalysis:
         shell_issues = tuple(self.shell_issues)
         if not all(isinstance(finding, Finding) for finding in findings):
             raise ValueError("findings must contain Finding values")
+        if len(producer_unit_ids) != len(findings):
+            raise ValueError("finding producer identities must align one-to-one with findings")
+        for producer_unit_id in producer_unit_ids:
+            if producer_unit_id is not None:
+                _require_shell_unit_id(producer_unit_id)
         if not all(isinstance(item, DependencySourceLimitation) for item in limitations):
             raise ValueError("limitations must contain DependencySourceLimitation values")
         if not all(isinstance(item, DependencySourceSpan) for item in applicable_spans):
@@ -951,6 +1011,7 @@ class DependencySourceAnalysis:
         ):
             raise ValueError("ledger_exhaustion must be DependencyWorkExhaustion")
         object.__setattr__(self, "findings", findings)
+        object.__setattr__(self, "finding_producer_unit_ids", producer_unit_ids)
         object.__setattr__(self, "limitations", limitations)
         object.__setattr__(self, "applicable_spans", applicable_spans)
         object.__setattr__(self, "inspected_spans", inspected_spans)
@@ -1162,6 +1223,37 @@ class DependencyWorkBudget:
             return DependencyWorkExhaustion(findings, next_findings, _SCAN_LIMITS[findings])
         self._used[changes] = next_changes
         self._used[findings] = next_findings
+        return None
+
+    def reserve_dependency_outputs(
+        self,
+        *,
+        emitted_changes: int,
+        finding_output_records: int,
+        new_ledger_events: int,
+    ) -> DependencyWorkExhaustion | None:
+        """Atomically reserve finalized SC10 changes, findings, and new ledger rows."""
+        requested = {
+            DependencyWorkResource.EMITTED_CHANGES: _require_nonnegative_integer(
+                emitted_changes, "emitted_changes"
+            ),
+            DependencyWorkResource.FINDING_OUTPUT_RECORDS: _require_nonnegative_integer(
+                finding_output_records, "finding_output_records"
+            ),
+            DependencyWorkResource.LEDGER_EVENTS: _require_nonnegative_integer(
+                new_ledger_events, "new_ledger_events"
+            ),
+        }
+        next_used: dict[DependencyWorkResource, int] = {}
+        for resource, count in requested.items():
+            observed = self._used[resource] + count
+            if resource is DependencyWorkResource.LEDGER_EVENTS and self._truncation_slot_available:
+                observed += 1
+            limit = _SCAN_LIMITS[resource]
+            if observed > limit:
+                return DependencyWorkExhaustion(resource, observed, limit)
+            next_used[resource] = self._used[resource] + count
+        self._used.update(next_used)
         return None
 
     def reserve_source_batch(

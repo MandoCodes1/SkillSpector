@@ -781,6 +781,59 @@ def test_source_change_rejects_empty_semantic_fields_and_has_no_raw_payload_slot
     }
 
 
+def test_transient_candidate_is_sanitized_ranked_and_linked_to_its_shell_producer() -> None:
+    api = _api()
+    candidate = api.DependencySourceCandidate(
+        ecosystem=api.DependencyEcosystem.NPM,
+        surface=api.DependencySourceSurface.COMMAND,
+        operation=api.DependencySourceOperation.SET,
+        scope=api.DependencySourceScope.PROJECT,
+        destination="https://packages.example.invalid/REDACTED_PATH",
+        destination_status=api.DestinationStatus.RESOLVED,
+        span=_span(api),
+        producer_unit_id="a" * 32,
+        rank=api.DependencyCandidateRank.RECOVERED,
+        canonical_default=False,
+    )
+
+    assert candidate.producer_unit_id == "a" * 32
+    assert candidate.rank is api.DependencyCandidateRank.RECOVERED
+    assert candidate.canonical_default is False
+    assert "REDACTED_PATH" in repr(candidate)
+    assert {field.name for field in dataclasses.fields(api.DependencySourceCandidate)} == {
+        "ecosystem",
+        "surface",
+        "operation",
+        "scope",
+        "destination",
+        "destination_status",
+        "span",
+        "producer_unit_id",
+        "rank",
+        "canonical_default",
+    }
+
+
+def test_transient_candidate_rejects_invalid_producer_identity_and_unredacted_destination() -> None:
+    api = _api()
+    values = {
+        "ecosystem": api.DependencyEcosystem.NPM,
+        "surface": api.DependencySourceSurface.COMMAND,
+        "operation": api.DependencySourceOperation.SET,
+        "scope": api.DependencySourceScope.PROJECT,
+        "destination": "https://packages.example.invalid",
+        "destination_status": api.DestinationStatus.RESOLVED,
+        "span": _span(api),
+    }
+
+    with pytest.raises(ValueError):
+        api.DependencySourceCandidate(**values, producer_unit_id="attacker-controlled")
+    unsafe_values = dict(values)
+    unsafe_values["destination"] = "https://user:secret@packages.example.invalid/path?token=abc"
+    with pytest.raises(ValueError):
+        api.DependencySourceCandidate(**unsafe_values)
+
+
 @pytest.mark.parametrize("field", ["ecosystem", "surface", "operation", "scope"])
 @pytest.mark.parametrize("unsafe", ["attacker-secret", "safe\x00value"])
 def test_source_change_semantics_reject_attacker_controlled_labels(
@@ -838,7 +891,7 @@ def test_resolved_destination_rejects_values_above_its_explicit_bound() -> None:
 
 def test_parse_and_analysis_results_freeze_iterables_as_tuples() -> None:
     api = _api()
-    change = api.SourceChange(
+    candidate = api.DependencySourceCandidate(
         ecosystem="pip",
         surface="source",
         operation="replace",
@@ -856,16 +909,39 @@ def test_parse_and_analysis_results_freeze_iterables_as_tuples() -> None:
         limit_records=50,
     )
 
-    parsed = api.DependencySourceParseResult(changes=[change], limitations=[limitation])
+    parsed = api.DependencySourceParseResult(candidates=[candidate], limitations=[limitation])
     finding = Finding(rule_id="SC10", message="source changed")
     analysis = api.DependencySourceAnalysis(findings=[finding], limitations=[limitation])
 
-    assert parsed.changes == (change,)
+    assert parsed.candidates == (candidate,)
+    assert not hasattr(parsed, "changes")
     assert parsed.limitations == (limitation,)
     assert analysis.findings == (finding,)
     assert analysis.limitations == (limitation,)
     with pytest.raises(dataclasses.FrozenInstanceError):
-        parsed.changes = ()
+        parsed.candidates = ()
+
+
+def test_analysis_keeps_one_validated_producer_identity_per_finding() -> None:
+    api = _api()
+    finding = Finding(rule_id="SC10", message="source changed")
+
+    analysis = api.DependencySourceAnalysis(
+        findings=[finding],
+        finding_producer_unit_ids=["a" * 32],
+    )
+
+    assert analysis.finding_producer_unit_ids == ("a" * 32,)
+    with pytest.raises(ValueError):
+        api.DependencySourceAnalysis(
+            findings=[finding],
+            finding_producer_unit_ids=["a" * 32, "b" * 32],
+        )
+    with pytest.raises(ValueError):
+        api.DependencySourceAnalysis(
+            findings=[finding],
+            finding_producer_unit_ids=["attacker-controlled"],
+        )
 
 
 def test_limitation_exposes_only_safe_path_range_and_ledger_numeric_metrics() -> None:
@@ -1115,6 +1191,80 @@ def test_source_change_reservation_mutates_neither_counter_when_change_capacity_
     assert exhaustion.resource is api.DependencyWorkResource.EMITTED_CHANGES
     assert budget.used(api.DependencyWorkResource.EMITTED_CHANGES) == 10_000
     assert budget.used(api.DependencyWorkResource.FINDING_OUTPUT_RECORDS) == 9_999
+
+
+def test_dependency_output_reservation_charges_changes_findings_and_new_ledger_rows_atomically() -> (
+    None
+):
+    api = _api()
+    budget = api.DependencyWorkBudget(
+        existing_finding_output_records=9_998,
+        existing_ledger_events=9_997,
+    )
+    assert budget.charge_emitted_changes(9_998) is None
+
+    exhaustion = budget.reserve_dependency_outputs(
+        emitted_changes=2,
+        finding_output_records=2,
+        new_ledger_events=2,
+    )
+
+    assert exhaustion is None
+    assert budget.used(api.DependencyWorkResource.EMITTED_CHANGES) == 10_000
+    assert budget.used(api.DependencyWorkResource.FINDING_OUTPUT_RECORDS) == 10_000
+    assert budget.used(api.DependencyWorkResource.LEDGER_EVENTS) == 9_999
+
+
+def test_dependency_output_reservation_rolls_back_every_counter_when_ledger_capacity_denies() -> (
+    None
+):
+    api = _api()
+    budget = api.DependencyWorkBudget(
+        existing_finding_output_records=9_998,
+        existing_ledger_events=9_999,
+    )
+    assert budget.charge_emitted_changes(9_998) is None
+    before = {
+        resource: budget.used(resource)
+        for resource in (
+            api.DependencyWorkResource.EMITTED_CHANGES,
+            api.DependencyWorkResource.FINDING_OUTPUT_RECORDS,
+            api.DependencyWorkResource.LEDGER_EVENTS,
+        )
+    }
+
+    exhaustion = budget.reserve_dependency_outputs(
+        emitted_changes=1,
+        finding_output_records=1,
+        new_ledger_events=1,
+    )
+
+    assert exhaustion == api.DependencyWorkExhaustion(
+        api.DependencyWorkResource.LEDGER_EVENTS,
+        10_001,
+        10_000,
+    )
+    assert {resource: budget.used(resource) for resource in before} == before
+
+
+def test_dependency_output_reservation_does_not_charge_an_existing_producer_row() -> None:
+    api = _api()
+    budget = api.DependencyWorkBudget(
+        existing_finding_output_records=9_999,
+        existing_ledger_events=9_999,
+    )
+    before_ledger = budget.used(api.DependencyWorkResource.LEDGER_EVENTS)
+
+    exhaustion = budget.reserve_dependency_outputs(
+        emitted_changes=1,
+        finding_output_records=1,
+        new_ledger_events=0,
+    )
+
+    assert exhaustion is None
+    assert budget.used(api.DependencyWorkResource.EMITTED_CHANGES) == 1
+    assert budget.used(api.DependencyWorkResource.FINDING_OUTPUT_RECORDS) == 10_000
+    assert budget.used(api.DependencyWorkResource.LEDGER_EVENTS) == before_ledger
 
 
 def test_finding_capacity_starts_from_existing_public_output_record_footprint() -> None:

@@ -174,6 +174,66 @@ def _projection(result: Any) -> list[tuple[object, ...]]:
 
 
 @pytest.mark.parametrize(
+    "trailing",
+    [
+        (b"--location=project",),
+        (b"--location", b"project"),
+        (b"--userconfig", b"./.npmrc"),
+    ],
+)
+def test_npm_completed_pairs_snapshot_scope_before_known_trailing_options(
+    trailing: tuple[bytes, ...],
+) -> None:
+    result = adapt_command(
+        _site(
+            [
+                b"npm",
+                b"config",
+                b"set",
+                b"registry",
+                b"https://npm.invalid",
+                *trailing,
+            ]
+        ),
+        budget=DependencyWorkBudget(),
+    )
+
+    assert _projection(result) == [
+        (
+            DependencyEcosystem.NPM,
+            DependencySourceSurface.COMMAND,
+            DependencySourceOperation.SET,
+            DependencySourceScope.GLOBAL,
+            "exact",
+            b"https://npm.invalid",
+        )
+    ]
+    assert result.issues == ()
+
+
+@pytest.mark.parametrize("trailing", [(b"--location",), (b"--userconfig",)])
+def test_npm_missing_trailing_option_operands_remain_limitations(
+    trailing: tuple[bytes, ...],
+) -> None:
+    result = adapt_command(
+        _site(
+            [
+                b"npm",
+                b"config",
+                b"set",
+                b"registry",
+                b"https://npm.invalid",
+                *trailing,
+            ]
+        ),
+        budget=DependencyWorkBudget(),
+    )
+
+    assert result.candidates == ()
+    assert len(result.issues) == 1
+
+
+@pytest.mark.parametrize(
     ("argv", "semantic"),
     [
         (

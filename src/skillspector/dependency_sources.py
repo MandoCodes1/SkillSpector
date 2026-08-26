@@ -31,13 +31,20 @@ from yaml.parser import ParserError  # type: ignore[import-untyped]
 from yaml.scanner import ScannerError  # type: ignore[import-untyped]
 
 from skillspector.artifacts import ArtifactDisposition, ArtifactRecord, ContentKind
+from skillspector.dependency_command_adapters import (
+    DependencyCommandCandidate,
+    MavenSettingsReference,
+    adapt_command,
+)
 from skillspector.dependency_source_types import (
     MAX_DEPENDENCY_FILE_BYTES,
     MAX_DEPENDENCY_SOURCE_MAP_ENTRIES_PER_FILE,
     CommandSite,
+    DependencyCandidateRank,
     DependencyEcosystem,
     DependencyFileBudget,
     DependencySourceAnalysis,
+    DependencySourceCandidate,
     DependencySourceLimitation,
     DependencySourceLimitationReason,
     DependencySourceOperation,
@@ -50,12 +57,18 @@ from skillspector.dependency_source_types import (
     DependencyWorkResource,
     DestinationStatus,
     GeneratedConfig,
+    ShellIssue,
+    ShellIssueReason,
+    ShellTruncationClaimStatus,
+    ShellWorkItem,
+    ShellWorkOutcome,
     SourceChange,
     SourceMap,
     SourceSpan,
     StaticValueState,
     finding_from_source_change,
 )
+from skillspector.shell_frontend import analyze_shell_unit, extract_shell_units
 from skillspector.url_redaction import redact_url
 
 _NPM_BASENAMES: Final = frozenset({".npmrc", "npmrc"})
@@ -85,8 +98,9 @@ _PIP_OPTIONS: Final = ("index-url", "extra-index-url")
 _SHELL_SUFFIXES: Final = frozenset({".sh", ".bash", ".zsh", ".ksh", ".envrc"})
 _SHELL_NAMES: Final = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
 _MARKDOWN_SHELL_INFO: Final = _SHELL_NAMES | frozenset(
-    {"shell", "console", "terminal", "shell-session"}
+    {"shell", "shell-script", "console", "terminal", "shell-session"}
 )
+_COMMAND_PLACEHOLDER: Final = re.compile(r"^[A-Z][A-Z0-9_]*_PLACEHOLDER$")
 _SHELL_SHEBANG: Final = re.compile(
     r"^#!(?:/[^\s]*/(?:sh|bash|dash|zsh|ksh)|/usr/bin/env(?:[ \t]+-S)?[ \t]+(?:sh|bash|dash|zsh|ksh))(?:[ \t]|$)"
 )
@@ -119,6 +133,8 @@ class _Candidate:
     span: SourceSpan
     destination: str | None = None
     force_unresolved: bool = False
+    producer_unit_id: str | None = None
+    rank: DependencyCandidateRank = DependencyCandidateRank.EXACT
 
 
 _CandidateMapper = Callable[[_Candidate], _Candidate | None]
@@ -618,6 +634,26 @@ def _markdown_executable_ranges(lines: list[str]) -> list[tuple[int, int]]:
     return ranges
 
 
+def _markdown_indented_code_ranges(lines: list[str]) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].strip() or not lines[index].startswith(("    ", "\t")):
+            index += 1
+            continue
+        start = index
+        index += 1
+        while index < len(lines) and (
+            not lines[index].strip() or lines[index].startswith(("    ", "\t"))
+        ):
+            index += 1
+        end = index
+        while end > start and not lines[end - 1].strip():
+            end -= 1
+        ranges.append((start + 1, end))
+    return ranges
+
+
 def _make_recipe_ranges(lines: list[str]) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
     index = 0
@@ -765,12 +801,11 @@ def _canonical_destination(ecosystem: DependencyEcosystem, value: str) -> bool:
     return False
 
 
-def _destination(
+def _candidate_destination(
     ecosystem: DependencyEcosystem,
     raw_destination: str,
-) -> tuple[str, DestinationStatus] | None:
-    if _canonical_destination(ecosystem, raw_destination):
-        return None
+) -> tuple[str, DestinationStatus, bool]:
+    canonical_default = _canonical_destination(ecosystem, raw_destination)
     interpolation = {
         DependencyEcosystem.NPM: _NPM_INTERPOLATION,
         DependencyEcosystem.PIP: _PIP_INTERPOLATION,
@@ -778,15 +813,15 @@ def _destination(
         DependencyEcosystem.MAVEN: _MAVEN_INTERPOLATION,
     }.get(ecosystem)
     if interpolation is not None and interpolation.search(raw_destination):
-        return "unresolved", DestinationStatus.UNRESOLVED
-    return redact_url(raw_destination), DestinationStatus.RESOLVED
+        return "unresolved", DestinationStatus.UNRESOLVED, False
+    return redact_url(raw_destination), DestinationStatus.RESOLVED, canonical_default
 
 
 def _candidate_change(
     candidate: _Candidate,
     raw: bytes,
     budget: DependencyFileBudget,
-) -> tuple[SourceChange | None, DependencyWorkExhaustion | None]:
+) -> tuple[DependencySourceCandidate | None, DependencyWorkExhaustion | None]:
     if exhaustion := budget.charge_source_records(1):
         return None, exhaustion
     raw_destination = candidate.destination
@@ -795,18 +830,13 @@ def _candidate_change(
     literal_bytes = len(raw_destination.encode("utf-8"))
     if exhaustion := budget.charge_retained_literal_bytes(literal_bytes):
         return None, exhaustion
-    normalized = (
-        ("unresolved", DestinationStatus.UNRESOLVED)
+    destination, status, canonical_default = (
+        ("unresolved", DestinationStatus.UNRESOLVED, False)
         if candidate.force_unresolved
-        else _destination(candidate.ecosystem, raw_destination)
+        else _candidate_destination(candidate.ecosystem, raw_destination)
     )
-    if normalized is None:
-        return None, None
-    if exhaustion := budget.reserve_source_changes():
-        return None, exhaustion
-    destination, status = normalized
     return (
-        SourceChange(
+        DependencySourceCandidate(
             ecosystem=candidate.ecosystem,
             surface=candidate.surface,
             operation=candidate.operation,
@@ -814,12 +844,15 @@ def _candidate_change(
             destination=destination,
             destination_status=status,
             span=candidate.span,
+            producer_unit_id=candidate.producer_unit_id,
+            rank=candidate.rank,
+            canonical_default=canonical_default,
         ),
         None,
     )
 
 
-def _changes_from_candidates(
+def _prepare_candidates(
     candidates: Sequence[_Candidate],
     *,
     path: str,
@@ -849,7 +882,7 @@ def _changes_from_candidates(
         ):
             return DependencySourceParseResult(limitations=(_limitation(path, raw),))
     if atomic:
-        prepared: list[tuple[_Candidate, str, DestinationStatus]] = []
+        prepared: list[tuple[_Candidate, str]] = []
         retained_literal_bytes = 0
         for candidate in candidates:
             raw_destination = candidate.destination
@@ -858,48 +891,119 @@ def _changes_from_candidates(
                     "utf-8"
                 )
             retained_literal_bytes += len(raw_destination.encode("utf-8"))
-            normalized = (
-                ("unresolved", DestinationStatus.UNRESOLVED)
-                if candidate.force_unresolved
-                else _destination(candidate.ecosystem, raw_destination)
-            )
-            if normalized is not None:
-                prepared.append((candidate, *normalized))
+            prepared.append((candidate, raw_destination))
         exhaustion = budget.reserve_source_batch(
             source_records=len(candidates),
             retained_literal_bytes=retained_literal_bytes,
-            emitted_changes=len(prepared),
+            emitted_changes=0,
         )
         if exhaustion is not None:
             return DependencySourceParseResult(
                 limitations=(_limitation(path, raw, exhaustion),),
             )
         return DependencySourceParseResult(
-            changes=tuple(
-                SourceChange(
+            candidates=tuple(
+                DependencySourceCandidate(
                     ecosystem=candidate.ecosystem,
                     surface=candidate.surface,
                     operation=candidate.operation,
                     scope=candidate.scope,
-                    destination=destination,
-                    destination_status=status,
+                    destination=normalized[0],
+                    destination_status=normalized[1],
                     span=candidate.span,
+                    producer_unit_id=candidate.producer_unit_id,
+                    rank=candidate.rank,
+                    canonical_default=normalized[2],
                 )
-                for candidate, destination, status in prepared
+                for candidate, raw_destination in prepared
+                for normalized in (
+                    (
+                        ("unresolved", DestinationStatus.UNRESOLVED, False)
+                        if candidate.force_unresolved
+                        else _candidate_destination(candidate.ecosystem, raw_destination)
+                    ),
+                )
             )
         )
 
-    changes: list[SourceChange] = []
+    prepared_candidates: list[DependencySourceCandidate] = []
     for candidate in candidates:
-        change, exhaustion = _candidate_change(candidate, raw, budget)
+        prepared_candidate, exhaustion = _candidate_change(candidate, raw, budget)
         if exhaustion is not None:
             return DependencySourceParseResult(
-                changes=() if atomic else tuple(changes),
+                candidates=() if atomic else tuple(prepared_candidates),
                 limitations=(_limitation(path, raw, exhaustion),),
             )
-        if change is not None:
-            changes.append(change)
-    return DependencySourceParseResult(changes=tuple(changes))
+        if prepared_candidate is not None:
+            prepared_candidates.append(prepared_candidate)
+    return DependencySourceParseResult(candidates=tuple(prepared_candidates))
+
+
+def _semantic_sink_key(candidate: DependencySourceCandidate) -> tuple[object, ...]:
+    span = candidate.span
+    return (
+        candidate.ecosystem,
+        candidate.surface,
+        candidate.operation,
+        candidate.scope,
+        span.path,
+        span.start_byte,
+        span.end_byte,
+    )
+
+
+def _rank_candidates(
+    candidates: Iterable[DependencySourceCandidate],
+) -> tuple[DependencySourceCandidate, ...]:
+    """Deduplicate semantic sinks while retaining exact evidence over recovery."""
+    retained: list[DependencySourceCandidate] = []
+    indexes: dict[tuple[object, ...], int] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, DependencySourceCandidate):
+            raise ValueError("candidates must contain DependencySourceCandidate values")
+        key = _semantic_sink_key(candidate)
+        previous_index = indexes.get(key)
+        if previous_index is None:
+            indexes[key] = len(retained)
+            retained.append(candidate)
+            continue
+        previous = retained[previous_index]
+        if (
+            previous.rank is DependencyCandidateRank.RECOVERED
+            and candidate.rank is DependencyCandidateRank.EXACT
+        ):
+            retained[previous_index] = candidate
+            continue
+        # Direct structured parsers may intentionally materialize the same
+        # physical record in multiple effective configuration contexts.  Those
+        # are not duplicate producer evidence and must remain distinct.
+        if (
+            previous.rank is DependencyCandidateRank.EXACT
+            and candidate.rank is DependencyCandidateRank.EXACT
+            and previous.producer_unit_id is None
+            and candidate.producer_unit_id is None
+        ):
+            retained.append(candidate)
+    return tuple(retained)
+
+
+def _finalize_candidates(
+    candidates: Iterable[DependencySourceCandidate],
+) -> tuple[SourceChange, ...]:
+    """Rank and deduplicate semantic sinks before suppressing canonical defaults."""
+    return tuple(
+        SourceChange(
+            ecosystem=candidate.ecosystem,
+            surface=candidate.surface,
+            operation=candidate.operation,
+            scope=candidate.scope,
+            destination=candidate.destination,
+            destination_status=candidate.destination_status,
+            span=candidate.span,
+        )
+        for candidate in _rank_candidates(candidates)
+        if not candidate.canonical_default
+    )
 
 
 def _parse_npm(
@@ -944,7 +1048,7 @@ def _parse_npm(
             ),
             span=SourceSpan(path, start_byte, end_byte, line_number, line_number),
         )
-    return _changes_from_candidates(
+    return _prepare_candidates(
         tuple(sorted(effective.values(), key=lambda candidate: candidate.span.start_byte)),
         path=path,
         raw=raw,
@@ -1132,7 +1236,7 @@ def _parse_pip(
                     )
                 )
     candidates.sort(key=lambda candidate: candidate.span.start_byte)
-    return _changes_from_candidates(
+    return _prepare_candidates(
         candidates,
         path=path,
         raw=raw,
@@ -1223,7 +1327,7 @@ def _parse_yarn_v1(
             span=SourceSpan(path, start_byte, end_byte, line_number, line_number),
             destination=value,
         )
-    return _changes_from_candidates(
+    return _prepare_candidates(
         tuple(sorted(effective.values(), key=lambda item: item.span.start_byte)),
         path=path,
         raw=raw,
@@ -1662,7 +1766,7 @@ def _parse_yarn_yaml(
                     return DependencySourceParseResult(limitations=(_limitation(path, raw),))
                 candidates.append(candidate)
     candidates.sort(key=lambda item: item.span.start_byte)
-    return _changes_from_candidates(
+    return _prepare_candidates(
         candidates,
         path=path,
         raw=raw,
@@ -2027,7 +2131,7 @@ def _parse_python_project(
                 return DependencySourceParseResult(limitations=(_limitation(path, raw),))
             candidates.append(candidate)
     candidates.sort(key=lambda item: item.span.start_byte)
-    return _changes_from_candidates(
+    return _prepare_candidates(
         candidates,
         path=path,
         raw=raw,
@@ -2250,7 +2354,7 @@ def _parse_cargo(
             )
 
     candidates.sort(key=lambda item: item.span.start_byte)
-    return _changes_from_candidates(
+    return _prepare_candidates(
         candidates,
         path=path,
         raw=raw,
@@ -2551,7 +2655,7 @@ def _parse_maven(
                 destination=record.destination,
             )
         )
-    return _changes_from_candidates(
+    return _prepare_candidates(
         candidates,
         path=path,
         raw=raw,
@@ -2617,6 +2721,105 @@ def _span_limitation(
     )
 
 
+def _is_markdown_shell_path(path: str) -> bool:
+    """Limit executable Markdown parsing to code-owned skill-document basenames."""
+    basename = _basename(path).casefold()
+    suffix = "." + basename.rsplit(".", 1)[-1] if "." in basename else ""
+    return suffix in {".md", ".markdown", ".mdown", ".mkd"} and (
+        basename.rsplit(".", 1)[0] == "readme" or basename == "skill.md"
+    )
+
+
+def _adapted_source_candidate(
+    candidate: DependencyCommandCandidate,
+    *,
+    producer_unit_id: str,
+) -> DependencySourceCandidate:
+    if candidate.destination.state is StaticValueState.EXACT:
+        raw_destination = cast(bytes, candidate.destination.exact_bytes).decode(
+            "utf-8", errors="strict"
+        )
+        destination, status, canonical_default = _candidate_destination(
+            candidate.ecosystem,
+            raw_destination,
+        )
+        # Code-owned documentation placeholders are inert command examples, not
+        # resolved network destinations.  Restrict this to an exact ASCII token
+        # shape so URL hosts and paths containing the word remain analyzable.
+        if _is_markdown_shell_path(candidate.span.path) and _COMMAND_PLACEHOLDER.fullmatch(
+            raw_destination
+        ):
+            canonical_default = True
+    else:
+        destination = "unresolved"
+        status = DestinationStatus.UNRESOLVED
+        canonical_default = False
+    return DependencySourceCandidate(
+        ecosystem=candidate.ecosystem,
+        surface=candidate.surface,
+        operation=candidate.operation,
+        scope=candidate.scope,
+        destination=destination,
+        destination_status=status,
+        span=candidate.span,
+        producer_unit_id=producer_unit_id,
+        rank=DependencyCandidateRank.EXACT,
+        canonical_default=canonical_default,
+    )
+
+
+def _shell_limitation(issue: ShellIssue) -> DependencySourceLimitation:
+    return _span_limitation(issue.span, issue.exhaustion)
+
+
+def _deduplicate_limitations(
+    limitations: Iterable[DependencySourceLimitation],
+) -> tuple[DependencySourceLimitation, ...]:
+    retained: dict[tuple[object, ...], DependencySourceLimitation] = {}
+    for limitation in limitations:
+        key = (
+            limitation.reason,
+            limitation.path,
+            limitation.start_line,
+            limitation.end_line,
+        )
+        retained.setdefault(key, limitation)
+    return tuple(retained.values())
+
+
+def _retain_orchestration_issue(
+    issues: list[ShellIssue],
+    *,
+    reason: ShellIssueReason,
+    span: SourceSpan,
+    unit_id: str | None,
+    budget: DependencyWorkBudget,
+    exhaustion: DependencyWorkExhaustion | None = None,
+) -> None:
+    issue_capacity = budget.charge_shell_issues(1)
+    if issue_capacity is None:
+        issues.append(
+            ShellIssue(
+                reason=reason,
+                outcome=ShellWorkOutcome.PARTIAL,
+                span=span,
+                unit_id=unit_id,
+                exhaustion=exhaustion,
+            )
+        )
+        return
+    if budget.claim_reserved_shell_truncation_issue() is ShellTruncationClaimStatus.CLAIMED:
+        issues.append(
+            ShellIssue(
+                reason=ShellIssueReason.RESOURCE_LIMIT,
+                outcome=ShellWorkOutcome.PARTIAL,
+                span=span,
+                unit_id=unit_id,
+                exhaustion=issue_capacity,
+            )
+        )
+
+
 def _parse_generated_configs(
     configs: Iterable[GeneratedConfig],
     *,
@@ -2625,7 +2828,7 @@ def _parse_generated_configs(
     """Dispatch only typed generated buffers through existing direct parsers."""
     if not isinstance(budget, DependencyWorkBudget):
         raise ValueError("budget must be a DependencyWorkBudget")
-    changes: list[SourceChange] = []
+    candidates: list[DependencySourceCandidate] = []
     limitations: list[DependencySourceLimitation] = []
     for config in configs:
         if not isinstance(config, GeneratedConfig):
@@ -2643,7 +2846,17 @@ def _parse_generated_configs(
             limitations.append(_span_limitation(config.span))
             continue
         selector: str | None
-        if config.target.state is StaticValueState.EXACT:
+        home_relative_target = getattr(config, "home_relative_target", None)
+        if home_relative_target is not None:
+            if (
+                type(home_relative_target) is not bytes
+                or home_relative_target != b".npmrc"
+                or config.target.state is not StaticValueState.UNKNOWN
+            ):
+                limitations.append(_span_limitation(config.span))
+                continue
+            selector = ".npmrc"
+        elif config.target.state is StaticValueState.EXACT:
             if target_proof is not None and (
                 target_proof.raw != cast(bytes, config.target.exact_bytes)
                 or target_proof.unknown_ranges
@@ -2779,9 +2992,16 @@ def _parse_generated_configs(
                 else _span_limitation(config.span)
             )
             continue
-        changes.extend(parsed.changes)
+        candidates.extend(
+            replace(
+                candidate,
+                producer_unit_id=config.unit_id,
+                rank=DependencyCandidateRank.RECOVERED,
+            )
+            for candidate in parsed.candidates
+        )
     return DependencySourceParseResult(
-        changes=tuple(changes),
+        candidates=tuple(candidates),
         limitations=tuple(limitations),
     )
 
@@ -2853,6 +3073,98 @@ def _canonical_bundle_path(value: object) -> str | None:
         return DependencySourceSpan(path=value, start_line=1, end_line=1).path
     except ValueError:
         return None
+
+
+def _parse_typed_maven_settings_references(
+    references: Iterable[tuple[MavenSettingsReference, str]],
+    *,
+    components: Iterable[str],
+    local_file_cache: Mapping[str, str],
+    raw_file_cache: Mapping[str, bytes],
+    artifact_inventory: Iterable[ArtifactRecord],
+    budget: DependencyWorkBudget,
+) -> DependencySourceParseResult:
+    """Resolve Task 7's typed Maven references through Task 6's direct XML parser."""
+    component_counts: dict[str, int] = {}
+    for path in components:
+        normalized = _canonical_bundle_path(path)
+        if normalized is not None:
+            component_counts[normalized] = component_counts.get(normalized, 0) + 1
+    inventory_by_path: dict[str, list[ArtifactRecord]] = {}
+    for record in artifact_inventory:
+        normalized = _canonical_bundle_path(record.get("path"))
+        if normalized is not None:
+            inventory_by_path.setdefault(normalized, []).append(record)
+
+    candidates: list[DependencySourceCandidate] = []
+    limitations: list[DependencySourceLimitation] = []
+    for reference, producer_unit_id in references:
+        if reference.path.state is not StaticValueState.EXACT:
+            limitations.append(_span_limitation(reference.span))
+            continue
+        try:
+            decoded_reference = cast(bytes, reference.path.exact_bytes).decode(
+                "utf-8", errors="strict"
+            )
+            resolved = DependencySourceSpan(
+                path=decoded_reference,
+                start_line=1,
+                end_line=1,
+            ).path
+        except (UnicodeDecodeError, ValueError):
+            limitations.append(_span_limitation(reference.span))
+            continue
+        raw = raw_file_cache.get(resolved)
+        decoded = local_file_cache.get(resolved)
+        records = inventory_by_path.get(resolved, [])
+        if (
+            component_counts.get(resolved) != 1
+            or not isinstance(raw, bytes)
+            or not isinstance(decoded, str)
+            or len(records) != 1
+        ):
+            limitations.append(_span_limitation(reference.span))
+            continue
+        observed_size = max(len(raw), _inventory_size(records[0]))
+        file_budget = budget.for_file(resolved)
+        charged_size = file_budget.used(DependencyWorkResource.PHYSICAL_BYTES)
+        if charged_size not in {0, observed_size}:
+            limitations.append(_span_limitation(reference.span))
+            continue
+        if charged_size == 0:
+            if exhaustion := file_budget.charge_physical_bytes(observed_size):
+                limitations.append(_span_limitation(reference.span, exhaustion))
+                continue
+        if observed_size > MAX_DEPENDENCY_FILE_BYTES or not _is_complete_text_record(
+            records[0], len(raw)
+        ):
+            limitations.append(_span_limitation(reference.span))
+            continue
+        try:
+            canonical_text = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            limitations.append(_span_limitation(reference.span))
+            continue
+        if decoded != canonical_text:
+            limitations.append(_span_limitation(reference.span))
+            continue
+        parsed = _parse_maven(
+            resolved,
+            canonical_text,
+            raw,
+            file_budget,
+            expected_root="settings",
+            require_expected_root=True,
+        )
+        candidates.extend(
+            replace(candidate, producer_unit_id=producer_unit_id) for candidate in parsed.candidates
+        )
+        if parsed.limitations:
+            limitations.append(_span_limitation(reference.span))
+    return DependencySourceParseResult(
+        candidates=tuple(candidates),
+        limitations=tuple(limitations),
+    )
 
 
 def _parse_maven_settings_references(
@@ -2957,7 +3269,7 @@ def _parse_maven_settings_references(
     )
     feature_function_keys = source_functions_closed | settings_functions_closed
 
-    changes: list[SourceChange] = []
+    candidates: list[DependencySourceCandidate] = []
     limitations: list[DependencySourceLimitation] = []
     resolution_barrier = False
     for command, resolution, program_id, owner_function in validated_commands:
@@ -3062,11 +3374,11 @@ def _parse_maven_settings_references(
             expected_root="settings",
             require_expected_root=True,
         )
-        changes.extend(parsed.changes)
+        candidates.extend(parsed.candidates)
         if parsed.limitations:
             limitations.append(_span_limitation(command.span))
     return DependencySourceParseResult(
-        changes=tuple(changes),
+        candidates=tuple(candidates),
         limitations=tuple(limitations),
     )
 
@@ -3079,20 +3391,25 @@ def analyze_dependency_sources(
     artifact_inventory: Iterable[ArtifactRecord],
     budget: DependencyWorkBudget,
     executable_paths: frozenset[str] = frozenset(),
+    deadline_monotonic: float | None = None,
 ) -> DependencySourceAnalysis:
-    """Analyze direct configs and disclose structurally executable unscanned surfaces."""
+    """Analyze bounded direct and typed executable dependency-source surfaces."""
     if not isinstance(executable_paths, frozenset):
         raise ValueError("executable_paths must be an immutable set")
+    if not isinstance(budget, DependencyWorkBudget):
+        raise ValueError("budget must be a DependencyWorkBudget")
     normalized_executable_paths = frozenset(
         DependencySourceSpan(path=path, start_line=1, end_line=1).path for path in executable_paths
     )
+    component_items = tuple(components)
+    inventory_items = tuple(artifact_inventory)
     inventory_by_path: dict[str, list[ArtifactRecord]] = {}
-    for record in artifact_inventory:
+    for record in inventory_items:
         path = record.get("path")
         if isinstance(path, str):
             inventory_by_path.setdefault(path, []).append(record)
 
-    component_paths = {path for path in components if isinstance(path, str)}
+    component_paths = {path for path in component_items if isinstance(path, str)}
     uv_directories = {
         path.rpartition("/")[0] for path in component_paths if _basename(path) == "uv.toml"
     }
@@ -3104,55 +3421,14 @@ def analyze_dependency_sources(
         for path in sorted(component_paths)
         if _is_recognized_path(path)
     )
-    coverage_limitations: list[DependencySourceLimitation] = []
-    for path in sorted(component_paths):
-        raw = raw_file_cache.get(path)
-        if not isinstance(raw, bytes):
-            continue
-        records = inventory_by_path.get(path, [])
-        if len(records) != 1 or not _is_complete_text_record(records[0], len(raw)):
-            continue
-        try:
-            decoded = raw.decode("utf-8", errors="strict")
-        except UnicodeDecodeError:
-            continue
-        cached = local_file_cache.get(path)
-        if not isinstance(cached, str) or cached != decoded:
-            continue
-        for span in _executable_surface_ranges(
-            path,
-            decoded,
-            raw,
-            normalized_executable_paths,
-        ):
-            coverage_limitations.append(
-                DependencySourceLimitation(
-                    reason=DependencySourceLimitationReason.UNSCANNED_EXECUTABLE_CONTENT,
-                    path=span.path,
-                    start_line=span.start_line,
-                    end_line=span.end_line,
-                )
-            )
-    coverage_limitations = list(
-        {
-            (item.reason, item.path, item.start_line, item.end_line): item
-            for item in coverage_limitations
-        }.values()
-    )
-    required_ledger_rows = len(applicable_spans) + len(coverage_limitations)
-    if exhaustion := budget.charge_ledger_events(required_ledger_rows):
-        budget.claim_reserved_truncation_event()
-        return DependencySourceAnalysis(
-            limitations=tuple(coverage_limitations),
-            applicable_spans=applicable_spans,
-            ledger_exhaustion=exhaustion,
-        )
-
-    changes: list[SourceChange] = []
-    limitations: list[DependencySourceLimitation] = list(coverage_limitations)
+    direct_candidates: list[DependencySourceCandidate] = []
+    limitations: list[DependencySourceLimitation] = []
     inspected_spans: list[DependencySourceSpan] = []
+
+    # Direct configuration parsers retain sanitized, unreserved candidates.  Public
+    # output capacity is reserved only after all transient producers are deduplicated.
     for path in sorted(component_paths):
-        if not isinstance(path, str) or not _is_recognized_path(path):
+        if not _is_recognized_path(path):
             continue
         raw = raw_file_cache.get(path)
         safe_raw = raw if isinstance(raw, bytes) else None
@@ -3188,14 +3464,316 @@ def analyze_dependency_sources(
                 _basename(path) == "pyproject.toml" and path.rpartition("/")[0] in uv_directories
             ),
         )
-        changes.extend(parsed.changes)
+        direct_candidates.extend(parsed.candidates)
         limitations.extend(parsed.limitations)
         if not parsed.limitations:
             inspected_spans.append(_whole_file_span(path, safe_raw))
 
+    # Coverage discovery is code-owned and precedes the frontend.  It is evidence
+    # only about applicability; it is never used as command semantics.
+    coverage_limitations: list[DependencySourceLimitation] = []
+    validated_shell_inputs: dict[str, tuple[str, bytes, ArtifactRecord]] = {}
+    for path in sorted(component_paths):
+        raw = raw_file_cache.get(path)
+        if not isinstance(raw, bytes):
+            continue
+        records = inventory_by_path.get(path, [])
+        if len(records) != 1 or not _is_complete_text_record(records[0], len(raw)):
+            continue
+        try:
+            decoded = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            continue
+        cached = local_file_cache.get(path)
+        if not isinstance(cached, str) or cached != decoded:
+            continue
+        validated_shell_inputs[path] = (decoded, raw, records[0])
+        for span in _executable_surface_ranges(
+            path,
+            decoded,
+            raw,
+            normalized_executable_paths,
+        ):
+            coverage_limitations.append(
+                DependencySourceLimitation(
+                    reason=DependencySourceLimitationReason.UNSCANNED_EXECUTABLE_CONTENT,
+                    path=span.path,
+                    start_line=span.start_line,
+                    end_line=span.end_line,
+                )
+            )
+
+        # Untagged indented blocks remain explicit coverage limitations.  Only
+        # README/SKILL Markdown is eligible for shell frontend invocation.
+        if _is_markdown_shell_path(path):
+            for start_line, end_line in _markdown_indented_code_ranges(_physical_lines(decoded)):
+                coverage_limitations.append(
+                    DependencySourceLimitation(
+                        reason=DependencySourceLimitationReason.UNSCANNED_EXECUTABLE_CONTENT,
+                        path=path,
+                        start_line=start_line,
+                        end_line=end_line,
+                    )
+                )
+
+    shell_candidates: list[DependencySourceCandidate] = []
+    shell_work_items: list[ShellWorkItem] = []
+    shell_issues: list[ShellIssue] = []
+    explicit_shell_limitations: list[DependencySourceLimitation] = []
+    deterministic_unit_ids: set[str] = set()
+    typed_maven_references: list[tuple[MavenSettingsReference, str]] = []
+    handled_shell_spans: list[SourceSpan] = []
+    runtime_exhausted = False
+
+    for path in sorted(component_paths):
+        if _is_recognized_path(path):
+            continue
+        validated = validated_shell_inputs.get(path)
+        if validated is None:
+            continue
+        decoded, raw, record = validated
+        lower_path = path.casefold()
+        is_markdown = lower_path.endswith((".md", ".markdown", ".mdown", ".mkd"))
+        if is_markdown and not _is_markdown_shell_path(path):
+            continue
+        applicable_ranges = _executable_surface_ranges(
+            path,
+            decoded,
+            raw,
+            normalized_executable_paths,
+        )
+        if not applicable_ranges:
+            continue
+
+        file_budget = budget.for_file(path)
+        observed_size = max(len(raw), _inventory_size(record))
+        if exhaustion := file_budget.charge_physical_bytes(observed_size):
+            resource_span = SourceSpan(path, 0, len(raw), 1, _line_count(raw))
+            _retain_orchestration_issue(
+                shell_issues,
+                reason=ShellIssueReason.RESOURCE_LIMIT,
+                span=resource_span,
+                unit_id=None,
+                budget=budget,
+                exhaustion=exhaustion,
+            )
+            handled_shell_spans.append(resource_span)
+            continue
+
+        extracted = extract_shell_units(
+            path,
+            raw,
+            executable_paths=normalized_executable_paths,
+            budget=budget,
+        )
+        shell_issues.extend(extracted.issues)
+        handled_shell_spans.extend(issue.span for issue in extracted.issues)
+        handled_shell_spans.extend(unit.origin_span for unit in extracted.units)
+
+        for unit in extracted.units:
+            if runtime_exhausted:
+                shell_work_items.append(
+                    ShellWorkItem(
+                        unit.unit_id,
+                        unit.dialect,
+                        unit.kind,
+                        unit.provenance,
+                        unit.origin_span,
+                        ShellWorkOutcome.SKIPPED,
+                    )
+                )
+                continue
+            frontend = analyze_shell_unit(
+                unit,
+                budget=budget,
+                deadline_monotonic=deadline_monotonic,
+            )
+            shell_work_items.extend(frontend.work_items)
+            shell_issues.extend(frontend.issues)
+            handled_shell_spans.extend(item.span for item in frontend.work_items)
+            handled_shell_spans.extend(issue.span for issue in frontend.issues)
+            if any(issue.reason is ShellIssueReason.RUNTIME_LIMIT for issue in frontend.issues):
+                runtime_exhausted = True
+
+            for command in frontend.commands:
+                adapted = adapt_command(command, budget=budget)
+                shell_issues.extend(adapted.issues)
+                handled_shell_spans.extend(issue.span for issue in adapted.issues)
+                if adapted.candidates or adapted.maven_settings:
+                    deterministic_unit_ids.add(command.unit_id)
+                typed_maven_references.extend(
+                    (reference, command.unit_id) for reference in adapted.maven_settings
+                )
+                for adapted_candidate in adapted.candidates:
+                    if exhaustion := budget.charge_source_records(1):
+                        _retain_orchestration_issue(
+                            shell_issues,
+                            reason=ShellIssueReason.RESOURCE_LIMIT,
+                            span=adapted_candidate.span,
+                            unit_id=command.unit_id,
+                            budget=budget,
+                            exhaustion=exhaustion,
+                        )
+                        continue
+                    shell_candidates.append(
+                        _adapted_source_candidate(
+                            adapted_candidate,
+                            producer_unit_id=command.unit_id,
+                        )
+                    )
+
+            for config in frontend.generated_configs:
+                deterministic_unit_ids.add(config.unit_id)
+                generated = _parse_generated_configs((config,), budget=budget)
+                shell_candidates.extend(generated.candidates)
+                for limitation in generated.limitations:
+                    explicit_shell_limitations.append(limitation)
+                    generated_span = SourceSpan(
+                        limitation.path,
+                        config.span.start_byte,
+                        config.span.end_byte,
+                        limitation.start_line,
+                        limitation.end_line,
+                    )
+                    _retain_orchestration_issue(
+                        shell_issues,
+                        reason=ShellIssueReason.UNSUPPORTED_SEMANTICS,
+                        span=generated_span,
+                        unit_id=config.unit_id,
+                        budget=budget,
+                    )
+
+    for reference, producer_unit_id in typed_maven_references:
+        parsed_maven = _parse_typed_maven_settings_references(
+            ((reference, producer_unit_id),),
+            components=component_items,
+            local_file_cache=local_file_cache,
+            raw_file_cache=raw_file_cache,
+            artifact_inventory=inventory_items,
+            budget=budget,
+        )
+        shell_candidates.extend(parsed_maven.candidates)
+        for _ignored_limitation in parsed_maven.limitations:
+            explicit_shell_limitations.append(_span_limitation(reference.span))
+            _retain_orchestration_issue(
+                shell_issues,
+                reason=ShellIssueReason.UNSUPPORTED_SEMANTICS,
+                span=reference.span,
+                unit_id=producer_unit_id,
+                budget=budget,
+            )
+
+    # Any typed unit or localized issue replaces overlapping coarse coverage at
+    # range granularity.  Non-overlapping and out-of-gate coverage stays public.
+    def overlaps(span: SourceSpan, limitation: DependencySourceLimitation) -> bool:
+        return (
+            span.path == limitation.path
+            and span.start_line <= limitation.end_line
+            and limitation.start_line <= span.end_line
+        )
+
+    retained_coverage = [
+        limitation
+        for limitation in coverage_limitations
+        if not any(overlaps(span, limitation) for span in handled_shell_spans)
+    ]
+    limitations.extend(retained_coverage)
+    limitations.extend(explicit_shell_limitations)
+
+    work_by_unit_id = {item.unit_id: item for item in shell_work_items}
+
+    def public_shell_limitation(issue: ShellIssue) -> DependencySourceLimitation:
+        work = work_by_unit_id.get(issue.unit_id) if issue.unit_id is not None else None
+        if work is None or work.span.path != issue.span.path:
+            return _shell_limitation(issue)
+        return _span_limitation(
+            SourceSpan(
+                issue.span.path,
+                issue.span.start_byte,
+                max(issue.span.end_byte, work.span.end_byte),
+                issue.span.start_line,
+                max(issue.span.end_line, work.span.end_line),
+            ),
+            issue.exhaustion,
+        )
+
+    limitations.extend(
+        public_shell_limitation(issue)
+        for issue in shell_issues
+        if issue.reason is not ShellIssueReason.UNSUPPORTED_SEMANTICS
+        or issue.unit_id not in deterministic_unit_ids
+    )
+    limitations = list(_deduplicate_limitations(limitations))
+
+    # Every transient producer identity must resolve to exactly one terminal work
+    # item before a candidate may become public evidence.
+    work_item_counts: dict[str, int] = {}
+    for item in shell_work_items:
+        work_item_counts[item.unit_id] = work_item_counts.get(item.unit_id, 0) + 1
+    retained_shell_candidates: list[DependencySourceCandidate] = []
+    for source_candidate in shell_candidates:
+        source_producer_unit_id = source_candidate.producer_unit_id
+        if (
+            source_producer_unit_id is not None
+            and work_item_counts.get(source_producer_unit_id) == 1
+        ):
+            retained_shell_candidates.append(source_candidate)
+            continue
+        _retain_orchestration_issue(
+            shell_issues,
+            reason=ShellIssueReason.UNSUPPORTED_SEMANTICS,
+            span=source_candidate.span,
+            unit_id=source_producer_unit_id,
+            budget=budget,
+        )
+    shell_candidates = retained_shell_candidates
+    limitations.extend(
+        public_shell_limitation(issue)
+        for issue in shell_issues
+        if issue.reason is not ShellIssueReason.UNSUPPORTED_SEMANTICS
+        or issue.unit_id not in deterministic_unit_ids
+    )
+    limitations = list(_deduplicate_limitations(limitations))
+
+    # Adapter and generated-config issues make their producer row partial even
+    # when syntax lowering itself completed.
+    partial_unit_ids = {
+        issue.unit_id
+        for issue in shell_issues
+        if issue.unit_id is not None
+        and issue.outcome in {ShellWorkOutcome.PARTIAL, ShellWorkOutcome.FAILED}
+    }
+    shell_work_items = [
+        replace(item, outcome=ShellWorkOutcome.PARTIAL)
+        if item.unit_id in partial_unit_ids and item.outcome is ShellWorkOutcome.COMPLETED
+        else item
+        for item in shell_work_items
+    ]
+
+    ranked = tuple(
+        candidate
+        for candidate in _rank_candidates((*direct_candidates, *shell_candidates))
+        if not candidate.canonical_default
+    )
+    changes = tuple(
+        SourceChange(
+            ecosystem=candidate.ecosystem,
+            surface=candidate.surface,
+            operation=candidate.operation,
+            scope=candidate.scope,
+            destination=candidate.destination,
+            destination_status=candidate.destination_status,
+            span=candidate.span,
+        )
+        for candidate in ranked
+    )
+
     return DependencySourceAnalysis(
         findings=tuple(finding_from_source_change(change) for change in changes),
+        finding_producer_unit_ids=tuple(candidate.producer_unit_id for candidate in ranked),
         limitations=tuple(limitations),
         applicable_spans=applicable_spans,
         inspected_spans=tuple(inspected_spans),
+        shell_work_items=tuple(shell_work_items),
+        shell_issues=tuple(shell_issues),
     )

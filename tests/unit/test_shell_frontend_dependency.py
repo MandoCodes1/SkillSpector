@@ -270,6 +270,36 @@ def test_reader_deadline_is_classified_as_local_runtime_partial(
     assert caught.value.deadline_tripped is True
 
 
+def test_public_shell_analysis_propagates_the_production_deadline() -> None:
+    frontend = _frontend()
+    contracts = importlib.import_module("skillspector.dependency_source_types")
+    raw = b"printf ok\n"
+    unit = contracts.ShellUnit(
+        dialect=contracts.ShellDialect.BASH,
+        kind=contracts.ShellUnitKind.STANDALONE,
+        provenance=contracts.SiteProvenance.FILE_SUFFIX,
+        raw_bytes=raw,
+        origin_span=contracts.SourceSpan(
+            "scripts/setup.sh",
+            0,
+            len(raw),
+            1,
+            1,
+            start_column=0,
+            end_column=len(raw),
+        ),
+    )
+
+    result = frontend.analyze_shell_unit(
+        unit,
+        budget=contracts.DependencyWorkBudget(),
+        deadline_monotonic=time.monotonic() - 1.0,
+    )
+
+    assert [issue.reason for issue in result.issues] == [contracts.ShellIssueReason.RUNTIME_LIMIT]
+    assert [item.outcome for item in result.work_items] == [contracts.ShellWorkOutcome.PARTIAL]
+
+
 def test_native_parser_timeout_is_classified_only_after_deadline_trips(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

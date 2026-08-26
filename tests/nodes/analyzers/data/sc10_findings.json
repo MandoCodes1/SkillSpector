@@ -408,7 +408,7 @@
     },
     {
       "id": "no-logical-line-joining-bypass",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -545,7 +545,7 @@
     },
     {
       "id": "continuation-assignment-evidence-corruption",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -567,7 +567,7 @@
     },
     {
       "id": "no-logical-line-joining-false-positive",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "inert",
       "files": {
@@ -577,7 +577,7 @@
     },
     {
       "id": "multiline-quoted-string-not-masked",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "inert",
       "files": {
@@ -587,7 +587,7 @@
     },
     {
       "id": "non-shell-line-boundaries",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "inert",
       "files": {
@@ -597,7 +597,7 @@
     },
     {
       "id": "npm-absolute-path-executable",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -619,7 +619,7 @@
     },
     {
       "id": "exec-allowlist-path-qualified-and-versioned",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -641,7 +641,7 @@
     },
     {
       "id": "path-qualified-command-word",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -674,7 +674,7 @@
     },
     {
       "id": "ampersand-not-a-control-operator",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -718,7 +718,7 @@
     },
     {
       "id": "reserved-words-in-command-position",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -795,7 +795,7 @@
     },
     {
       "id": "single-line-function-definition",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -828,7 +828,7 @@
     },
     {
       "id": "leading-redirection-prefix",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -861,7 +861,7 @@
     },
     {
       "id": "case-arm-pattern-forms",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -894,7 +894,7 @@
     },
     {
       "id": "redirection-word-consumed-as-destination",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -916,7 +916,7 @@
     },
     {
       "id": "redirection-fd-prefixed-silences-finding",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -938,7 +938,7 @@
     },
     {
       "id": "npm-yarn-wrapper-corepack-npx",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -960,7 +960,7 @@
     },
     {
       "id": "npm-nested-shell-string",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -982,7 +982,7 @@
     },
     {
       "id": "exec-preserving-prefix-wrappers",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1004,7 +1004,7 @@
     },
     {
       "id": "string-to-argv-execution",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1048,7 +1048,7 @@
     },
     {
       "id": "wrapper-option-allowlist-fails-to-silent",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1092,7 +1092,7 @@
     },
     {
       "id": "npm-flags-before-operands",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1114,7 +1114,7 @@
     },
     {
       "id": "yarn-flags-before-operands",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1136,7 +1136,7 @@
     },
     {
       "id": "flag-between-operands-corrupts-destination",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1158,7 +1158,7 @@
     },
     {
       "id": "npm-multi-pair-second-destination-dropped",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1191,7 +1191,7 @@
     },
     {
       "id": "npm-yarn-registry-cli-flag-unmodeled",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1213,7 +1213,7 @@
     },
     {
       "id": "yarn-npmscopes-command-form",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1235,7 +1235,7 @@
     },
     {
       "id": "npm-flag-before-subcommand",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1257,7 +1257,7 @@
     },
     {
       "id": "npm-subcommand-aliases",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1279,7 +1279,7 @@
     },
     {
       "id": "npm-argv-terminator",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1301,7 +1301,7 @@
     },
     {
       "id": "pnpm-unmodeled",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1323,7 +1323,7 @@
     },
     {
       "id": "pip-config-set-early-return-non-global-key",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1345,7 +1345,7 @@
     },
     {
       "id": "pip-config-file-option-before-subcommand",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1367,7 +1367,7 @@
     },
     {
       "id": "poetry-global-options-before-subcommand",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1389,7 +1389,7 @@
     },
     {
       "id": "poetry-config-local-flag-before-key",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1411,7 +1411,7 @@
     },
     {
       "id": "poetry-option-operand-consumed-multi",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1433,7 +1433,7 @@
     },
     {
       "id": "cargo-has-no-command-branch",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1455,7 +1455,7 @@
     },
     {
       "id": "pip-short-option-bundling",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1477,7 +1477,7 @@
     },
     {
       "id": "maven-settings-file-flag-and-unrecognised-filename",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1500,7 +1500,7 @@
     },
     {
       "id": "uv-entirely-uncovered",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1522,7 +1522,7 @@
     },
     {
       "id": "pip-long-option-abbreviation",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1544,7 +1544,7 @@
     },
     {
       "id": "option-before-operand-fixed-argv-index",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1588,7 +1588,7 @@
     },
     {
       "id": "placeholder-destination-reported-as-resolved",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "inert",
       "files": {
@@ -1598,7 +1598,7 @@
     },
     {
       "id": "maven-altdeploymentrepository",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "inert",
       "files": {
@@ -1608,7 +1608,7 @@
     },
     {
       "id": "heredoc-noncat-writer",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1630,7 +1630,7 @@
     },
     {
       "id": "heredoc-compound-command-prefix",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1652,7 +1652,7 @@
     },
     {
       "id": "unterminated-heredoc-write-missed",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1674,7 +1674,7 @@
     },
     {
       "id": "heredoc-command-prefix",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1696,7 +1696,7 @@
     },
     {
       "id": "heredoc-here-string",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1718,7 +1718,7 @@
     },
     {
       "id": "heredoc-clobber-override",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1740,7 +1740,7 @@
     },
     {
       "id": "heredoc-amp-redirect",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1762,7 +1762,7 @@
     },
     {
       "id": "heredoc-segment-nonzero",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1784,7 +1784,7 @@
     },
     {
       "id": "heredoc-second-on-line",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1806,7 +1806,7 @@
     },
     {
       "id": "heredoc-line-continuation",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1828,7 +1828,7 @@
     },
     {
       "id": "heredoc-dynamic-target-var",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1850,7 +1850,7 @@
     },
     {
       "id": "heredoc-delim-backslash-newline-bypass",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1872,7 +1872,7 @@
     },
     {
       "id": "heredoc-async-ampersand",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1894,7 +1894,7 @@
     },
     {
       "id": "npmrc-global-path-no-dot",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1916,7 +1916,7 @@
     },
     {
       "id": "unterminated-heredoc-body-executed",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "inert",
       "files": {
@@ -1926,7 +1926,7 @@
     },
     {
       "id": "heredoc-delim-backslash-newline-fp",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "inert",
       "files": {
@@ -1936,7 +1936,7 @@
     },
     {
       "id": "heredoc-pipe-to-writer",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "limitation",
       "files": {
@@ -1954,7 +1954,7 @@
     },
     {
       "id": "markdown-tilde-fence",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1976,7 +1976,7 @@
     },
     {
       "id": "markdown-four-backtick-fence",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -1998,7 +1998,7 @@
     },
     {
       "id": "markdown-fence-language-set-exact",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "finding",
       "files": {
@@ -2020,7 +2020,7 @@
     },
     {
       "id": "markdown-4tick-nested-inner-fence",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "inert",
       "files": {
@@ -2030,7 +2030,7 @@
     },
     {
       "id": "markdown-untagged-code-blocks",
-      "status": "unfixed",
+      "status": "fixed",
       "lands_in": "PR-2",
       "expected_outcome": "limitation",
       "files": {

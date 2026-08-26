@@ -796,17 +796,17 @@ def _npm_family(
     cursor = 1
     config_seen = False
     action: bytes | None = None
-    operands: list[_Token] = []
+    operands: list[tuple[_Token, DependencySourceScope]] = []
     while cursor < len(tokens):
         raw = _exact(tokens[cursor])
         if raw is None:
             if action is not None:
-                operands.append(tokens[cursor])
+                operands.append((tokens[cursor], scope))
                 cursor += 1
                 continue
             return [], tokens[cursor].span
         if raw == b"--":
-            operands.extend(tokens[cursor + 1 :])
+            operands.extend((token, scope) for token in tokens[cursor + 1 :])
             break
         if raw in {b"-g", b"--global"}:
             scope = DependencySourceScope.GLOBAL
@@ -830,6 +830,11 @@ def _npm_family(
                 if location_operand == b"project"
                 else DependencySourceScope.GLOBAL
             )
+            cursor += 2
+            continue
+        if action is not None and raw == b"--userconfig":
+            if cursor + 1 >= len(tokens) or _exact(tokens[cursor + 1]) is None:
+                return [], tokens[cursor].span
             cursor += 2
             continue
         if raw.startswith(b"-"):
@@ -866,35 +871,36 @@ def _npm_family(
             if raw in {b"get", b"list", b"ls", b"edit", b"fix", b"help"}:
                 return [], None
             return [], tokens[cursor].span
-        operands.append(tokens[cursor])
+        operands.append((tokens[cursor], scope))
         cursor += 1
 
     candidates: list[DependencyCommandCandidate] = []
     if config_seen and action is not None:
         remove = action in {b"delete", b"del", b"rm", b"unset"}
         if remove:
-            if any(_exact(token) is None for token in operands):
-                return [], operands[0].span
+            if any(_exact(token) is None for token, _scope in operands):
+                return [], operands[0][0].span
             return [], None
         operand_index = 0
         while operand_index < len(operands):
-            key_token = operands[operand_index]
+            key_token, key_pair_scope = operands[operand_index]
             key = _exact(key_token)
             if key is None:
                 return [], key_token.span
             if b"=" in key:
                 key, destination = key.split(b"=", 1)
                 value = _Token(StaticValue.exact(destination), key_token.span)
+                pair_scope = key_pair_scope
                 operand_index += 1
             else:
                 if operand_index + 1 >= len(operands):
                     return [], key_token.span
-                value = operands[operand_index + 1]
+                value, pair_scope = operands[operand_index + 1]
                 operand_index += 2
             key_scope = (
                 DependencySourceScope.SCOPED
                 if key.startswith(b"@") and key.endswith(b":registry")
-                else scope
+                else pair_scope
             )
             if key != b"registry" and key_scope is not DependencySourceScope.SCOPED:
                 continue
