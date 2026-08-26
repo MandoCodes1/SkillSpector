@@ -10,9 +10,9 @@ import json
 import re
 import tomllib
 import xml.etree.ElementTree as ET
-from bisect import bisect_left
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Final, cast
 from urllib.parse import urlsplit
 
@@ -32,6 +32,9 @@ from yaml.scanner import ScannerError  # type: ignore[import-untyped]
 
 from skillspector.artifacts import ArtifactDisposition, ArtifactRecord, ContentKind
 from skillspector.dependency_source_types import (
+    MAX_DEPENDENCY_FILE_BYTES,
+    MAX_DEPENDENCY_SOURCE_MAP_ENTRIES_PER_FILE,
+    CommandSite,
     DependencyEcosystem,
     DependencyFileBudget,
     DependencySourceAnalysis,
@@ -44,9 +47,13 @@ from skillspector.dependency_source_types import (
     DependencySourceSurface,
     DependencyWorkBudget,
     DependencyWorkExhaustion,
+    DependencyWorkResource,
     DestinationStatus,
+    GeneratedConfig,
     SourceChange,
+    SourceMap,
     SourceSpan,
+    StaticValueState,
     finding_from_source_change,
 )
 from skillspector.url_redaction import redact_url
@@ -111,6 +118,349 @@ class _Candidate:
     scope: DependencySourceScope
     span: SourceSpan
     destination: str | None = None
+    force_unresolved: bool = False
+
+
+_CandidateMapper = Callable[[_Candidate], _Candidate | None]
+
+
+@dataclass(slots=True)
+class _GeneratedCandidateMapper:
+    entries: tuple[tuple[int, int, int, int], ...]
+    path: str
+    physical_size_bytes: int
+    physical_line_starts: tuple[int, ...]
+    config_span: SourceSpan
+    unknown_ranges: tuple[tuple[int, int], ...] = ()
+    force_unresolved: bool = False
+    failed: bool = False
+    _strict_source_map: SourceMap | None = field(default=None, repr=False)
+    _child_starts: tuple[int, ...] = field(init=False, repr=False)
+    _unknown_starts: tuple[int, ...] = field(init=False, repr=False)
+    _unknown_ends: tuple[int, ...] = field(init=False, repr=False)
+    _candidate_ranges: list[tuple[int, int]] = field(default_factory=list, repr=False)
+
+    def __post_init__(self) -> None:
+        self._child_starts = tuple(entry[0] for entry in self.entries)
+        self._unknown_starts = tuple(start for start, _ in self.unknown_ranges)
+        self._unknown_ends = tuple(end for _, end in self.unknown_ranges)
+
+    @classmethod
+    def from_source_map(
+        cls,
+        source_map: SourceMap,
+        config_span: SourceSpan,
+        *,
+        force_unresolved: bool = False,
+    ) -> _GeneratedCandidateMapper | None:
+        entries = tuple(
+            (
+                entry.child_start_byte,
+                entry.child_end_byte,
+                entry.physical_start_byte,
+                entry.physical_end_byte,
+            )
+            for entry in source_map.entries
+        )
+        if any(
+            physical_start < config_span.start_byte or physical_end > config_span.end_byte
+            for _, _, physical_start, physical_end in entries
+        ):
+            return None
+        return cls(
+            entries,
+            source_map.path,
+            source_map.physical_size_bytes,
+            source_map.physical_line_starts,
+            config_span,
+            force_unresolved=force_unresolved,
+            _strict_source_map=source_map,
+        )
+
+    def _physical_position(self, byte_offset: int) -> tuple[int, int]:
+        line_index = bisect_right(self.physical_line_starts, byte_offset) - 1
+        return line_index + 1, byte_offset - self.physical_line_starts[line_index]
+
+    def _entry_for(self, byte_offset: int) -> tuple[int, int, int, int] | None:
+        if not self.entries:
+            return None
+        index = max(0, bisect_right(self._child_starts, byte_offset) - 1)
+        entry = self.entries[index]
+        return entry if entry[0] <= byte_offset < entry[1] else None
+
+    @staticmethod
+    def _mapped_endpoint(
+        entry: tuple[int, int, int, int],
+        byte_offset: int,
+        *,
+        end: bool,
+    ) -> int:
+        child_start, child_end, physical_start, physical_end = entry
+        if child_end - child_start == physical_end - physical_start:
+            return physical_start + (byte_offset - child_start) + (1 if end else 0)
+        return physical_end if end else physical_start
+
+    def _map_range(self, start_byte: int, end_byte: int) -> SourceSpan | None:
+        if self._strict_source_map is not None:
+            return self._strict_source_map.map_range(start_byte, end_byte)
+        if end_byte <= start_byte:
+            return None
+        start_entry = self._entry_for(start_byte)
+        end_entry = self._entry_for(end_byte - 1)
+        if start_entry is None or end_entry is None:
+            return None
+        mapped_start = self._mapped_endpoint(start_entry, start_byte, end=False)
+        mapped_end = self._mapped_endpoint(end_entry, end_byte - 1, end=True)
+        if (
+            mapped_end <= mapped_start
+            or mapped_start < self.config_span.start_byte
+            or mapped_end > self.config_span.end_byte
+            or mapped_end > self.physical_size_bytes
+        ):
+            return None
+        start_line, start_column = self._physical_position(mapped_start)
+        end_line, _ = self._physical_position(mapped_end - 1)
+        end_line_start = self.physical_line_starts[end_line - 1]
+        return SourceSpan(
+            self.path,
+            mapped_start,
+            mapped_end,
+            start_line,
+            end_line,
+            start_column=start_column,
+            end_column=mapped_end - end_line_start,
+        )
+
+    def __call__(self, candidate: _Candidate) -> _Candidate | None:
+        mapped = self._map_range(candidate.span.start_byte, candidate.span.end_byte)
+        if mapped is None:
+            self.failed = True
+            return None
+        candidate_unknown = self.force_unresolved
+        first_unknown = bisect_right(self._unknown_ends, candidate.span.start_byte)
+        unknown_limit = bisect_left(self._unknown_starts, candidate.span.end_byte)
+        if first_unknown < unknown_limit:
+            if (
+                candidate.span.start_byte > self.unknown_ranges[first_unknown][0]
+                or candidate.span.end_byte < self.unknown_ranges[unknown_limit - 1][1]
+            ):
+                self.failed = True
+                return None
+            candidate_unknown = True
+        self._candidate_ranges.append((candidate.span.start_byte, candidate.span.end_byte))
+        return replace(
+            candidate,
+            surface=DependencySourceSurface.GENERATED_CONFIG,
+            span=mapped,
+            force_unresolved=candidate.force_unresolved or candidate_unknown,
+        )
+
+    @property
+    def uncertainty_confined(self) -> bool:
+        if self.failed:
+            return False
+        candidates = iter(sorted(self._candidate_ranges))
+        current = next(candidates, None)
+        for unknown_start, unknown_end in self.unknown_ranges:
+            while current is not None and current[1] <= unknown_start:
+                current = next(candidates, None)
+            if current is None or current[0] > unknown_start or current[1] < unknown_end:
+                return False
+        return True
+
+
+@dataclass(frozen=True, slots=True)
+class _GeneratedProofView:
+    raw: bytes = field(repr=False)
+    entries: tuple[tuple[int, int, int, int], ...] = field(repr=False)
+    unknown_ranges: tuple[tuple[int, int], ...] = field(repr=False)
+    unknowns_quoted: bool
+    path: str
+    physical_size_bytes: int
+    physical_line_starts: tuple[int, ...] = field(repr=False)
+
+
+def _span_matches_physical_lines(
+    span: SourceSpan,
+    physical_size_bytes: int,
+    physical_line_starts: tuple[int, ...],
+) -> bool:
+    if span.end_byte > physical_size_bytes or not physical_line_starts:
+        return False
+    start_index = bisect_right(physical_line_starts, span.start_byte) - 1
+    end_offset = span.end_byte - 1 if span.end_byte > span.start_byte else span.start_byte
+    end_index = bisect_right(physical_line_starts, end_offset) - 1
+    return start_index + 1 == span.start_line and end_index + 1 == span.end_line
+
+
+def _generated_config_physical_metadata(
+    config: GeneratedConfig,
+) -> tuple[int, tuple[int, ...]] | None:
+    from skillspector.shell_frontend import _ProvenGeneratedConfig  # noqa: PLC0415
+
+    if type(config) is not _ProvenGeneratedConfig:
+        return None
+    physical_size = getattr(config, "physical_size_bytes", None)
+    line_starts = getattr(config, "physical_line_starts", None)
+    if (
+        type(physical_size) is not int
+        or physical_size < config.span.end_byte
+        or physical_size > MAX_DEPENDENCY_FILE_BYTES
+        or not isinstance(line_starts, tuple)
+        or not line_starts
+        or len(line_starts) > MAX_DEPENDENCY_FILE_BYTES + 1
+        or line_starts[0] != 0
+        or any(type(value) is not int or value < 0 for value in line_starts)
+        or any(right <= left for left, right in zip(line_starts, line_starts[1:], strict=False))
+        or line_starts[-1] > physical_size
+        or not _span_matches_physical_lines(config.span, physical_size, line_starts)
+    ):
+        return None
+    return physical_size, line_starts
+
+
+def _generated_proof_view(
+    config: GeneratedConfig,
+    attribute: str,
+) -> _GeneratedProofView | None:
+    proof = getattr(config, attribute, None)
+    if proof is None:
+        return None
+    from skillspector.shell_frontend import (  # noqa: PLC0415
+        _GENERATED_UNKNOWN_MARKER,
+        _GeneratedProofEntry,
+        _GeneratedValueProof,
+    )
+
+    config_metadata = _generated_config_physical_metadata(config)
+    if config_metadata is None or type(proof) is not _GeneratedValueProof:
+        return None
+    raw = getattr(proof, "raw_bytes", None)
+    raw_entries = getattr(proof, "entries", None)
+    raw_unknowns = getattr(proof, "unknown_ranges", None)
+    unknowns_quoted = getattr(proof, "unknowns_quoted", None)
+    path = getattr(proof, "path", None)
+    physical_size = getattr(proof, "physical_size_bytes", None)
+    line_starts = getattr(proof, "physical_line_starts", None)
+    if (
+        type(raw) is not bytes
+        or len(raw) > MAX_DEPENDENCY_FILE_BYTES
+        or not isinstance(raw_entries, tuple)
+        or not isinstance(raw_unknowns, tuple)
+        or len(raw_entries) > MAX_DEPENDENCY_SOURCE_MAP_ENTRIES_PER_FILE
+        or len(raw_unknowns) > MAX_DEPENDENCY_SOURCE_MAP_ENTRIES_PER_FILE
+        or type(unknowns_quoted) is not bool
+        or path != config.span.path
+        or type(physical_size) is not int
+        or physical_size < config.span.end_byte
+        or not isinstance(line_starts, tuple)
+        or not line_starts
+        or line_starts[0] != 0
+        or any(type(value) is not int or value < 0 for value in line_starts)
+        or any(right <= left for left, right in zip(line_starts, line_starts[1:], strict=False))
+        or line_starts[-1] > physical_size
+        or not _span_matches_physical_lines(config.span, physical_size, line_starts)
+        or (physical_size, line_starts) != config_metadata
+    ):
+        return None
+    entries: list[tuple[int, int, int, int]] = []
+    for entry in raw_entries:
+        if type(entry) is not _GeneratedProofEntry:
+            return None
+        values = tuple(
+            getattr(entry, name, None)
+            for name in (
+                "child_start_byte",
+                "child_end_byte",
+                "physical_start_byte",
+                "physical_end_byte",
+            )
+        )
+        if any(type(value) is not int for value in values):
+            return None
+        typed_values = cast(tuple[int, int, int, int], values)
+        if (
+            typed_values[0] < 0
+            or typed_values[1] <= typed_values[0]
+            or typed_values[1] > len(raw)
+            or typed_values[2] < config.span.start_byte
+            or typed_values[3] <= typed_values[2]
+            or typed_values[3] > config.span.end_byte
+            or typed_values[3] > physical_size
+        ):
+            return None
+        entries.append(typed_values)
+    if any(
+        right[0] < left[1] or right[2] < left[3]
+        for left, right in zip(entries, entries[1:], strict=False)
+    ):
+        return None
+    if entries:
+        if (
+            entries[0][0] != 0
+            or any(right[0] != left[1] for left, right in zip(entries, entries[1:], strict=False))
+            or (
+                entries[-1][1] != len(raw)
+                and not (entries[-1][1] == len(raw) - 1 and raw.endswith(b"\n"))
+            )
+        ):
+            return None
+    elif raw not in {b"", b"\n"}:
+        return None
+    unknowns: list[tuple[int, int]] = []
+    for item in raw_unknowns:
+        if (
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or any(type(value) is not int for value in item)
+            or item[0] < 0
+            or item[1] <= item[0]
+            or item[1] > len(raw)
+            or raw[item[0] : item[1]] != _GENERATED_UNKNOWN_MARKER
+        ):
+            return None
+        unknowns.append(item)
+    if any(right[0] < left[1] for left, right in zip(unknowns, unknowns[1:], strict=False)):
+        return None
+    if unknowns:
+        expected_unknowns: list[tuple[int, int]] = []
+        marker_start = 0
+        while (marker_start := raw.find(_GENERATED_UNKNOWN_MARKER, marker_start)) >= 0:
+            marker_end = marker_start + len(_GENERATED_UNKNOWN_MARKER)
+            expected_unknowns.append((marker_start, marker_end))
+            if len(expected_unknowns) > MAX_DEPENDENCY_SOURCE_MAP_ENTRIES_PER_FILE:
+                return None
+            marker_start = marker_end
+        if tuple(expected_unknowns) != tuple(unknowns):
+            return None
+    entry_starts = tuple(entry[0] for entry in entries)
+    for start, end in unknowns:
+        entry_index = max(0, bisect_right(entry_starts, start) - 1)
+        if not entries or entries[entry_index][0] > start or entries[entry_index][1] < end:
+            return None
+    return _GeneratedProofView(
+        raw,
+        tuple(entries),
+        tuple(unknowns),
+        unknowns_quoted,
+        path,
+        physical_size,
+        line_starts,
+    )
+
+
+def _selector_from_target_proof(proof: _GeneratedProofView) -> str | None:
+    if not proof.unknown_ranges or not proof.unknowns_quoted:
+        return None
+    suffix = proof.raw[max(end for _, end in proof.unknown_ranges) :]
+    separator = suffix.rfind(b"/")
+    if separator < 0 or separator + 1 == len(suffix):
+        return None
+    try:
+        selector = suffix[separator + 1 :].decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    return selector if _is_recognized_path(selector) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -445,7 +795,11 @@ def _candidate_change(
     literal_bytes = len(raw_destination.encode("utf-8"))
     if exhaustion := budget.charge_retained_literal_bytes(literal_bytes):
         return None, exhaustion
-    normalized = _destination(candidate.ecosystem, raw_destination)
+    normalized = (
+        ("unresolved", DestinationStatus.UNRESOLVED)
+        if candidate.force_unresolved
+        else _destination(candidate.ecosystem, raw_destination)
+    )
     if normalized is None:
         return None, None
     if exhaustion := budget.reserve_source_changes():
@@ -472,7 +826,28 @@ def _changes_from_candidates(
     raw: bytes,
     budget: DependencyFileBudget,
     atomic: bool = False,
+    candidate_mapper: _CandidateMapper | None = None,
 ) -> DependencySourceParseResult:
+    if candidate_mapper is not None:
+        mapped: list[_Candidate] = []
+        for candidate in candidates:
+            raw_destination = candidate.destination
+            if raw_destination is None:
+                raw_destination = raw[candidate.span.start_byte : candidate.span.end_byte].decode(
+                    "utf-8"
+                )
+            retained = candidate_mapper(
+                replace(candidate, destination=raw_destination),
+            )
+            if retained is None:
+                return DependencySourceParseResult(limitations=(_limitation(path, raw),))
+            mapped.append(retained)
+        candidates = tuple(mapped)
+        if (
+            isinstance(candidate_mapper, _GeneratedCandidateMapper)
+            and not candidate_mapper.uncertainty_confined
+        ):
+            return DependencySourceParseResult(limitations=(_limitation(path, raw),))
     if atomic:
         prepared: list[tuple[_Candidate, str, DestinationStatus]] = []
         retained_literal_bytes = 0
@@ -483,7 +858,11 @@ def _changes_from_candidates(
                     "utf-8"
                 )
             retained_literal_bytes += len(raw_destination.encode("utf-8"))
-            normalized = _destination(candidate.ecosystem, raw_destination)
+            normalized = (
+                ("unresolved", DestinationStatus.UNRESOLVED)
+                if candidate.force_unresolved
+                else _destination(candidate.ecosystem, raw_destination)
+            )
             if normalized is not None:
                 prepared.append((candidate, *normalized))
         exhaustion = budget.reserve_source_batch(
@@ -528,6 +907,8 @@ def _parse_npm(
     text: str,
     raw: bytes,
     budget: DependencyFileBudget,
+    *,
+    candidate_mapper: _CandidateMapper | None = None,
 ) -> DependencySourceParseResult:
     effective: dict[str, _Candidate] = {}
     offsets = _line_offsets(text)
@@ -568,6 +949,7 @@ def _parse_npm(
         path=path,
         raw=raw,
         budget=budget,
+        candidate_mapper=candidate_mapper,
     )
 
 
@@ -616,6 +998,8 @@ def _parse_pip(
     text: str,
     raw: bytes,
     budget: DependencyFileBudget,
+    *,
+    candidate_mapper: _CandidateMapper | None = None,
 ) -> DependencySourceParseResult:
     lines = _physical_lines(text)
     offsets = _line_offsets(text)
@@ -748,7 +1132,13 @@ def _parse_pip(
                     )
                 )
     candidates.sort(key=lambda candidate: candidate.span.start_byte)
-    return _changes_from_candidates(candidates, path=path, raw=raw, budget=budget)
+    return _changes_from_candidates(
+        candidates,
+        path=path,
+        raw=raw,
+        budget=budget,
+        candidate_mapper=candidate_mapper,
+    )
 
 
 def _yarn_v1_tokens(line: str) -> tuple[list[tuple[str, int, int]], bool]:
@@ -801,6 +1191,8 @@ def _parse_yarn_v1(
     text: str,
     raw: bytes,
     budget: DependencyFileBudget,
+    *,
+    candidate_mapper: _CandidateMapper | None = None,
 ) -> DependencySourceParseResult:
     effective: dict[str, _Candidate] = {}
     offsets = _line_offsets(text)
@@ -836,6 +1228,7 @@ def _parse_yarn_v1(
         path=path,
         raw=raw,
         budget=budget,
+        candidate_mapper=candidate_mapper,
     )
 
 
@@ -1139,6 +1532,8 @@ def _parse_yarn_yaml(
     text: str,
     raw: bytes,
     budget: DependencyFileBudget,
+    *,
+    candidate_mapper: _CandidateMapper | None = None,
 ) -> DependencySourceParseResult:
     root, anchors, failure = _yaml_event_tree(path, text, raw, budget)
     if failure is not None:
@@ -1273,6 +1668,7 @@ def _parse_yarn_yaml(
         raw=raw,
         budget=budget,
         atomic=True,
+        candidate_mapper=candidate_mapper,
     )
 
 
@@ -1546,6 +1942,8 @@ def _parse_python_project(
     budget: DependencyFileBudget,
     *,
     skip_pyproject_uv: bool,
+    selector_path: str | None = None,
+    candidate_mapper: _CandidateMapper | None = None,
 ) -> DependencySourceParseResult:
     try:
         document = tomllib.loads(text)
@@ -1555,7 +1953,7 @@ def _parse_python_project(
         return DependencySourceParseResult(limitations=(_limitation(path, raw, exhaustion),))
 
     table_specs: list[tuple[tuple[str, ...], DependencyEcosystem]]
-    if _basename(path) == "uv.toml":
+    if _basename(selector_path or path) == "uv.toml":
         table_specs = [(("index",), DependencyEcosystem.UV)]
     else:
         table_specs = [
@@ -1635,6 +2033,7 @@ def _parse_python_project(
         raw=raw,
         budget=budget,
         atomic=True,
+        candidate_mapper=candidate_mapper,
     )
 
 
@@ -1755,6 +2154,8 @@ def _parse_cargo(
     text: str,
     raw: bytes,
     budget: DependencyFileBudget,
+    *,
+    candidate_mapper: _CandidateMapper | None = None,
 ) -> DependencySourceParseResult:
     try:
         document = tomllib.loads(text)
@@ -1855,6 +2256,7 @@ def _parse_cargo(
         raw=raw,
         budget=budget,
         atomic=True,
+        candidate_mapper=candidate_mapper,
     )
 
 
@@ -1895,6 +2297,8 @@ def _xml_semantic_records(
     text: str,
     raw: bytes,
     budget: DependencyFileBudget,
+    *,
+    expected_root: str | None = None,
 ) -> tuple[list[_XmlSemanticRecord] | None, bool, DependencySourceParseResult | None]:
     parser = ET.XMLPullParser(events=("start", "end"))
     frames: list[_XmlFrame] = []
@@ -1986,8 +2390,10 @@ def _xml_semantic_records(
         return None, False, DependencySourceParseResult(limitations=(_limitation(path, raw),))
     if frames:
         return None, False, DependencySourceParseResult(limitations=(_limitation(path, raw),))
-    expected_root = "settings" if _basename(path) == "settings.xml" else "project"
-    applicable = root_name == expected_root
+    selected_root = expected_root or (
+        "settings" if _basename(path) == "settings.xml" else "project"
+    )
+    applicable = root_name == selected_root
     if not applicable:
         return [], False, None
     if invalid_relevant:
@@ -2104,14 +2510,28 @@ def _parse_maven(
     text: str,
     raw: bytes,
     budget: DependencyFileBudget,
+    *,
+    expected_root: str | None = None,
+    require_expected_root: bool = False,
+    candidate_mapper: _CandidateMapper | None = None,
 ) -> DependencySourceParseResult:
     if b"<!DOCTYPE" in raw or b"<!ENTITY" in raw:
         return DependencySourceParseResult(limitations=(_limitation(path, raw),))
-    records, applicable, failure = _xml_semantic_records(path, text, raw, budget)
+    records, applicable, failure = _xml_semantic_records(
+        path,
+        text,
+        raw,
+        budget,
+        expected_root=expected_root,
+    )
     if failure is not None:
         return failure
     if not applicable:
-        return DependencySourceParseResult()
+        return (
+            DependencySourceParseResult(limitations=(_limitation(path, raw),))
+            if require_expected_root
+            else DependencySourceParseResult()
+        )
     if records is None:
         return DependencySourceParseResult(limitations=(_limitation(path, raw),))
     lexical = _xml_url_spans(path, raw)
@@ -2137,6 +2557,7 @@ def _parse_maven(
         raw=raw,
         budget=budget,
         atomic=True,
+        candidate_mapper=candidate_mapper,
     )
 
 
@@ -2147,26 +2568,506 @@ def _parse_file(
     budget: DependencyFileBudget,
     *,
     skip_pyproject_uv: bool = False,
+    selector_path: str | None = None,
+    candidate_mapper: _CandidateMapper | None = None,
 ) -> DependencySourceParseResult:
-    basename = _basename(path)
+    selected_path = selector_path or path
+    basename = _basename(selected_path)
     if basename in _NPM_BASENAMES:
-        return _parse_npm(path, text, raw, budget)
+        return _parse_npm(path, text, raw, budget, candidate_mapper=candidate_mapper)
     if basename in _PIP_BASENAMES:
-        return _parse_pip(path, text, raw, budget)
+        return _parse_pip(path, text, raw, budget, candidate_mapper=candidate_mapper)
     if basename in _YARN_V1_BASENAMES:
-        return _parse_yarn_v1(path, text, raw, budget)
+        return _parse_yarn_v1(path, text, raw, budget, candidate_mapper=candidate_mapper)
     if basename in _YARN_YAML_BASENAMES:
-        return _parse_yarn_yaml(path, text, raw, budget)
-    if _is_cargo_path(path):
-        return _parse_cargo(path, text, raw, budget)
+        return _parse_yarn_yaml(path, text, raw, budget, candidate_mapper=candidate_mapper)
+    if _is_cargo_path(selected_path):
+        return _parse_cargo(path, text, raw, budget, candidate_mapper=candidate_mapper)
     if basename in _MAVEN_BASENAMES:
-        return _parse_maven(path, text, raw, budget)
+        return _parse_maven(
+            path,
+            text,
+            raw,
+            budget,
+            expected_root="settings" if basename == "settings.xml" else "project",
+            candidate_mapper=candidate_mapper,
+        )
     return _parse_python_project(
         path,
         text,
         raw,
         budget,
         skip_pyproject_uv=skip_pyproject_uv,
+        selector_path=selected_path,
+        candidate_mapper=candidate_mapper,
+    )
+
+
+def _span_limitation(
+    span: SourceSpan,
+    exhaustion: DependencyWorkExhaustion | None = None,
+) -> DependencySourceLimitation:
+    metrics = exhaustion.ledger_metrics() if exhaustion is not None else {}
+    return DependencySourceLimitation(
+        reason=DependencySourceLimitationReason.PARSE_INCOMPLETE,
+        path=span.path,
+        start_line=span.start_line,
+        end_line=span.end_line,
+        **metrics,
+    )
+
+
+def _parse_generated_configs(
+    configs: Iterable[GeneratedConfig],
+    *,
+    budget: DependencyWorkBudget,
+) -> DependencySourceParseResult:
+    """Dispatch only typed generated buffers through existing direct parsers."""
+    if not isinstance(budget, DependencyWorkBudget):
+        raise ValueError("budget must be a DependencyWorkBudget")
+    changes: list[SourceChange] = []
+    limitations: list[DependencySourceLimitation] = []
+    for config in configs:
+        if not isinstance(config, GeneratedConfig):
+            raise ValueError("configs must contain GeneratedConfig values")
+        config_metadata = _generated_config_physical_metadata(config)
+        if config_metadata is None:
+            limitations.append(_span_limitation(config.span))
+            continue
+        target_unknown = False
+        raw_target_proof = getattr(config, "target_proof", None)
+        target_proof = (
+            _generated_proof_view(config, "target_proof") if raw_target_proof is not None else None
+        )
+        if raw_target_proof is not None and target_proof is None:
+            limitations.append(_span_limitation(config.span))
+            continue
+        selector: str | None
+        if config.target.state is StaticValueState.EXACT:
+            if target_proof is not None and (
+                target_proof.raw != cast(bytes, config.target.exact_bytes)
+                or target_proof.unknown_ranges
+            ):
+                limitations.append(_span_limitation(config.span))
+                continue
+            try:
+                target_text = cast(bytes, config.target.exact_bytes).decode(
+                    "utf-8", errors="strict"
+                )
+            except UnicodeDecodeError:
+                limitations.append(_span_limitation(config.span))
+                continue
+            selector = target_text
+            if "\x00" in selector:
+                limitations.append(_span_limitation(config.span))
+                continue
+            if not _is_recognized_path(selector):
+                continue
+        elif config.target.state is StaticValueState.UNKNOWN:
+            selector = (
+                _selector_from_target_proof(target_proof) if target_proof is not None else None
+            )
+            if selector is None:
+                limitations.append(_span_limitation(config.span))
+                continue
+            target_unknown = True
+        else:
+            limitations.append(_span_limitation(config.span))
+            continue
+
+        map_candidate: _GeneratedCandidateMapper | None
+        if config.content.state is StaticValueState.EXACT:
+            if config.source_map is None:
+                limitations.append(_span_limitation(config.span))
+                continue
+            raw = cast(bytes, config.content.exact_bytes)
+            source_map = config.source_map
+            if (
+                source_map.path != config.span.path
+                or source_map.child_size_bytes != len(raw)
+                or source_map.physical_size_bytes < config.span.end_byte
+                or (
+                    source_map.physical_size_bytes,
+                    source_map.physical_line_starts,
+                )
+                != config_metadata
+                or not _span_matches_physical_lines(
+                    config.span,
+                    source_map.physical_size_bytes,
+                    source_map.physical_line_starts,
+                )
+            ):
+                limitations.append(_span_limitation(config.span))
+                continue
+            raw_content_proof = getattr(config, "content_proof", None)
+            content_proof = (
+                _generated_proof_view(config, "content_proof")
+                if raw_content_proof is not None
+                else None
+            )
+            if raw_content_proof is not None and content_proof is None:
+                limitations.append(_span_limitation(config.span))
+                continue
+            if content_proof is not None:
+                if (
+                    content_proof.raw != raw
+                    or content_proof.unknown_ranges
+                    or content_proof.path != source_map.path
+                    or content_proof.physical_size_bytes != source_map.physical_size_bytes
+                    or content_proof.physical_line_starts != source_map.physical_line_starts
+                ):
+                    limitations.append(_span_limitation(config.span))
+                    continue
+                map_candidate = _GeneratedCandidateMapper(
+                    content_proof.entries,
+                    content_proof.path,
+                    content_proof.physical_size_bytes,
+                    content_proof.physical_line_starts,
+                    config.span,
+                    force_unresolved=target_unknown,
+                )
+            else:
+                map_candidate = _GeneratedCandidateMapper.from_source_map(
+                    source_map,
+                    config.span,
+                    force_unresolved=target_unknown,
+                )
+        elif config.content.state is StaticValueState.UNKNOWN:
+            content_proof = _generated_proof_view(config, "content_proof")
+            if content_proof is None or not content_proof.unknown_ranges:
+                limitations.append(_span_limitation(config.span))
+                continue
+            raw = content_proof.raw
+            map_candidate = _GeneratedCandidateMapper(
+                content_proof.entries,
+                content_proof.path,
+                content_proof.physical_size_bytes,
+                content_proof.physical_line_starts,
+                config.span,
+                unknown_ranges=content_proof.unknown_ranges,
+                force_unresolved=target_unknown,
+            )
+        else:
+            limitations.append(_span_limitation(config.span))
+            continue
+        if map_candidate is None or b"\x00" in raw or len(raw) > MAX_DEPENDENCY_FILE_BYTES:
+            limitations.append(_span_limitation(config.span))
+            continue
+        try:
+            text = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            limitations.append(_span_limitation(config.span))
+            continue
+
+        parsed = _parse_file(
+            config.span.path,
+            text,
+            raw,
+            budget.for_file(config.span.path),
+            selector_path=selector,
+            candidate_mapper=map_candidate,
+        )
+        if not map_candidate.uncertainty_confined or parsed.limitations:
+            limitations.append(
+                replace(
+                    parsed.limitations[0],
+                    path=config.span.path,
+                    start_line=config.span.start_line,
+                    end_line=config.span.end_line,
+                )
+                if parsed.limitations
+                else _span_limitation(config.span)
+            )
+            continue
+        changes.extend(parsed.changes)
+    return DependencySourceParseResult(
+        changes=tuple(changes),
+        limitations=tuple(limitations),
+    )
+
+
+def _maven_settings_arguments(command: CommandSite) -> tuple[tuple[bytes, ...], bool]:
+    if len(command.argv) == 1:
+        return (), False
+    first = command.argv[1]
+    if first.state is not StaticValueState.EXACT:
+        return (), True
+    first_literal = cast(bytes, first.exact_bytes)
+    if first_literal == b"--":
+        return (), False
+    if first_literal.startswith((b"-s=", b"--settings=")):
+        return (), True
+    if first_literal not in {b"-s", b"--settings"}:
+        index = 2
+        while index < len(command.argv):
+            value = command.argv[index]
+            if value.state is not StaticValueState.EXACT:
+                return (), True
+            literal = cast(bytes, value.exact_bytes)
+            if literal == b"--":
+                return (), False
+            if literal in {b"-s", b"--settings"} or literal.startswith((b"-s=", b"--settings=")):
+                return (), True
+            index += 1
+        return (), False
+    if len(command.argv) == 2 or command.argv[2].state is not StaticValueState.EXACT:
+        return (), True
+    reference = cast(bytes, command.argv[2].exact_bytes)
+    index = 3
+    while index < len(command.argv):
+        value = command.argv[index]
+        if value.state is not StaticValueState.EXACT:
+            return (), True
+        literal = cast(bytes, value.exact_bytes)
+        if literal == b"--":
+            break
+        if literal in {b"-s", b"--settings"} or literal.startswith((b"-s=", b"--settings=")):
+            return (), True
+        index += 1
+    return (reference,), False
+
+
+def _maven_function_feature_closure(
+    seeds: set[tuple[str, int]],
+    reverse_calls_by_id: Mapping[int, set[tuple[str, int]]],
+    ambiguous_callers: set[tuple[str, int]],
+) -> frozenset[tuple[str, int]]:
+    retained = set(seeds)
+    if retained:
+        retained.update(ambiguous_callers)
+    pending = list(retained)
+    while pending:
+        callee = pending.pop()
+        for caller in reverse_calls_by_id.get(callee[1], ()):
+            if caller in retained:
+                continue
+            retained.add(caller)
+            pending.append(caller)
+    return frozenset(retained)
+
+
+def _canonical_bundle_path(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return DependencySourceSpan(path=value, start_line=1, end_line=1).path
+    except ValueError:
+        return None
+
+
+def _parse_maven_settings_references(
+    commands: Iterable[object],
+    *,
+    components: Iterable[str],
+    local_file_cache: Mapping[str, str],
+    raw_file_cache: Mapping[str, bytes],
+    artifact_inventory: Iterable[ArtifactRecord],
+    budget: DependencyWorkBudget,
+) -> DependencySourceParseResult:
+    """Resolve literal Maven settings references only within supplied bundle maps."""
+    if not isinstance(budget, DependencyWorkBudget):
+        raise ValueError("budget must be a DependencyWorkBudget")
+    component_counts: dict[str, int] = {}
+    for path in components:
+        normalized = _canonical_bundle_path(path)
+        if normalized is not None:
+            component_counts[normalized] = component_counts.get(normalized, 0) + 1
+    inventory_by_path: dict[str, list[ArtifactRecord]] = {}
+    for record in artifact_inventory:
+        normalized = _canonical_bundle_path(record.get("path"))
+        if normalized is not None:
+            inventory_by_path.setdefault(normalized, []).append(record)
+    raw_by_path: dict[str, list[object]] = {}
+    for path, raw in raw_file_cache.items():
+        normalized = _canonical_bundle_path(path)
+        if normalized is not None:
+            raw_by_path.setdefault(normalized, []).append(raw)
+    local_by_path: dict[str, list[object]] = {}
+    for path, decoded in local_file_cache.items():
+        normalized = _canonical_bundle_path(path)
+        if normalized is not None:
+            local_by_path.setdefault(normalized, []).append(decoded)
+
+    validated_commands: list[tuple[CommandSite, object, str, tuple[str, int] | None]] = []
+    for modeled_command in commands:
+        command = getattr(modeled_command, "site", None)
+        resolution = getattr(modeled_command, "resolution", None)
+        program_id = getattr(modeled_command, "program_id", None)
+        function_id = getattr(modeled_command, "function_id", None)
+        containing_program_id = getattr(modeled_command, "containing_function_program_id", None)
+        containing_function_id = getattr(modeled_command, "containing_function_id", None)
+        if (
+            not isinstance(command, CommandSite)
+            or resolution is None
+            or not isinstance(program_id, str)
+            or not program_id
+            or (function_id is not None and type(function_id) is not int)
+            or (containing_program_id is None) != (containing_function_id is None)
+            or (
+                containing_program_id is not None
+                and (not isinstance(containing_program_id, str) or not containing_program_id)
+            )
+            or (containing_function_id is not None and type(containing_function_id) is not int)
+        ):
+            raise ValueError("commands must contain modeled shell command values")
+        owner_function = (
+            (program_id, function_id)
+            if function_id is not None
+            else (
+                (containing_program_id, containing_function_id)
+                if containing_program_id is not None and containing_function_id is not None
+                else None
+            )
+        )
+        validated_commands.append((command, resolution, program_id, owner_function))
+
+    source_functions: set[tuple[str, int]] = set()
+    settings_functions: set[tuple[str, int]] = set()
+    reverse_calls_by_id: dict[int, set[tuple[str, int]]] = {}
+    ambiguous_callers: set[tuple[str, int]] = set()
+    for command, resolution, _program_id, owner_function in validated_commands:
+        if owner_function is None:
+            continue
+        function_key = owner_function
+        argv = command.argv
+        if argv[0].state is StaticValueState.EXACT and cast(bytes, argv[0].exact_bytes) in {
+            b".",
+            b"source",
+        }:
+            source_functions.add(function_key)
+        if argv[0].state is StaticValueState.EXACT and cast(bytes, argv[0].exact_bytes) == b"mvn":
+            references, malformed = _maven_settings_arguments(command)
+            if references or malformed:
+                settings_functions.add(function_key)
+        resolution_kind = getattr(getattr(resolution, "kind", None), "value", None)
+        target_function_id = getattr(resolution, "function_id", None)
+        if resolution_kind == "function" and type(target_function_id) is int:
+            reverse_calls_by_id.setdefault(target_function_id, set()).add(function_key)
+        elif resolution_kind == "ambiguous":
+            ambiguous_callers.add(function_key)
+    source_functions_closed = _maven_function_feature_closure(
+        source_functions,
+        reverse_calls_by_id,
+        ambiguous_callers,
+    )
+    settings_functions_closed = _maven_function_feature_closure(
+        settings_functions,
+        reverse_calls_by_id,
+        ambiguous_callers,
+    )
+    feature_function_keys = source_functions_closed | settings_functions_closed
+
+    changes: list[SourceChange] = []
+    limitations: list[DependencySourceLimitation] = []
+    resolution_barrier = False
+    for command, resolution, program_id, owner_function in validated_commands:
+        if owner_function is not None:
+            continue
+        argv = command.argv
+        resolution_kind = getattr(getattr(resolution, "kind", None), "value", None)
+        target_function_id = getattr(resolution, "function_id", None)
+        possible_function_keys: frozenset[tuple[str, int]]
+        if resolution_kind == "function" and type(target_function_id) is int:
+            possible_function_keys = frozenset(
+                key for key in feature_function_keys if key[1] == target_function_id
+            )
+        elif resolution_kind == "ambiguous":
+            same_program_keys = frozenset(
+                key for key in feature_function_keys if key[0] == program_id
+            )
+            possible_function_keys = same_program_keys or frozenset(feature_function_keys)
+        else:
+            possible_function_keys = frozenset()
+        if possible_function_keys & source_functions_closed:
+            resolution_barrier = True
+        if possible_function_keys & settings_functions_closed and not (
+            argv[0].state is StaticValueState.EXACT and cast(bytes, argv[0].exact_bytes) == b"mvn"
+        ):
+            limitations.append(_span_limitation(command.span))
+        if argv[0].state is StaticValueState.EXACT and cast(bytes, argv[0].exact_bytes) in {
+            b".",
+            b"source",
+        }:
+            resolution_barrier = True
+            continue
+        if (
+            argv[0].state is not StaticValueState.EXACT
+            or cast(bytes, argv[0].exact_bytes) != b"mvn"
+        ):
+            continue
+        if resolution_barrier or resolution_kind != "external":
+            limitations.append(_span_limitation(command.span))
+            continue
+        references, malformed = _maven_settings_arguments(command)
+        if malformed:
+            limitations.append(_span_limitation(command.span))
+            continue
+        if not references:
+            continue
+        try:
+            reference = references[0].decode("utf-8", errors="strict")
+            resolved = DependencySourceSpan(
+                path=reference,
+                start_line=1,
+                end_line=1,
+            ).path
+        except (UnicodeDecodeError, ValueError):
+            limitations.append(_span_limitation(command.span))
+            continue
+        if component_counts.get(resolved) != 1:
+            limitations.append(_span_limitation(command.span))
+            continue
+        records = inventory_by_path.get(resolved, [])
+        raw_values = raw_by_path.get(resolved, [])
+        local_values = local_by_path.get(resolved, [])
+        if (
+            len(records) != 1
+            or len(raw_values) != 1
+            or len(local_values) != 1
+            or not isinstance(raw_values[0], bytes)
+            or not isinstance(local_values[0], str)
+        ):
+            limitations.append(_span_limitation(command.span))
+            continue
+        raw = cast(bytes, raw_values[0])
+        supplied_text = cast(str, local_values[0])
+        observed_size = max(len(raw), _inventory_size(records[0]))
+        file_budget = budget.for_file(resolved)
+        charged_size = file_budget.used(DependencyWorkResource.PHYSICAL_BYTES)
+        if charged_size not in {0, observed_size}:
+            limitations.append(_span_limitation(command.span))
+            continue
+        if charged_size == 0:
+            if exhaustion := file_budget.charge_physical_bytes(observed_size):
+                limitations.append(_span_limitation(command.span, exhaustion))
+                continue
+        if observed_size > MAX_DEPENDENCY_FILE_BYTES or not _is_complete_text_record(
+            records[0], len(raw)
+        ):
+            limitations.append(_span_limitation(command.span))
+            continue
+        try:
+            decoded = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            limitations.append(_span_limitation(command.span))
+            continue
+        if supplied_text != decoded:
+            limitations.append(_span_limitation(command.span))
+            continue
+        parsed = _parse_maven(
+            resolved,
+            decoded,
+            raw,
+            file_budget,
+            expected_root="settings",
+            require_expected_root=True,
+        )
+        changes.extend(parsed.changes)
+        if parsed.limitations:
+            limitations.append(_span_limitation(command.span))
+    return DependencySourceParseResult(
+        changes=tuple(changes),
+        limitations=tuple(limitations),
     )
 
 

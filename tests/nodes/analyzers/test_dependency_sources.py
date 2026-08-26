@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib
 from bisect import bisect_left
 from collections.abc import Iterable, Mapping
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -1878,6 +1879,1205 @@ def test_maven_settings_accepts_only_mirrors_and_profile_repository_paths() -> N
     assert {finding.evidence["surface"] for finding in analysis.findings} == {"maven-config"}
     for private_value in ("private-mirror-id", "private-pattern", "private-profile-id"):
         assert private_value not in repr(analysis)
+
+
+def test_proven_generated_npm_config_dispatch_remaps_to_physical_script_span() -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    raw = b"writer > .npmrc <<EOF\nregistry=https://packages.example.invalid/private\nEOF\n"
+    budget = DependencyWorkBudget()
+    extraction = shell_frontend.extract_shell_units(
+        "scripts/setup.sh",
+        raw,
+        executable_paths=frozenset(),
+        budget=budget,
+    )
+    frontend = shell_frontend.analyze_shell_unit(extraction.units[0], budget=budget)
+
+    parsed = dependency_sources._parse_generated_configs(
+        frontend.generated_configs,
+        budget=budget,
+    )
+
+    assert parsed.limitations == ()
+    assert [
+        (
+            change.ecosystem.value,
+            change.surface.value,
+            change.destination,
+            change.span.path,
+            change.span.start_line,
+        )
+        for change in parsed.changes
+    ] == [
+        (
+            "npm",
+            "generated-config",
+            "https://packages.example.invalid/REDACTED_PATH",
+            "scripts/setup.sh",
+            2,
+        )
+    ]
+
+
+def test_async_pending_heredoc_cannot_create_a_generated_dependency_change() -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    raw = (
+        b"cat <<A >/dev/null & cat >.npmrc <<B\n"
+        b"registry=https://first.example.invalid\n"
+        b"A\n"
+        b"# empty\n"
+        b"B\n"
+    )
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/generated.sh",
+        raw,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    analysis = shell_frontend._analyze_shell_unit(unit, budget=budget)
+
+    parsed = dependency_sources._parse_generated_configs(
+        analysis.program.generated_configs,
+        budget=budget,
+    )
+
+    assert analysis.program.generated_configs == ()
+    assert parsed.changes == ()
+
+
+def test_generated_configs_follow_typed_function_execution_context() -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+
+    def destinations(script: bytes) -> tuple[list[str], Any]:
+        budget = DependencyWorkBudget()
+        unit = shell_frontend.extract_shell_units(
+            "scripts/generated.sh",
+            script,
+            executable_paths=frozenset(),
+            budget=budget,
+        ).units[0]
+        analysis = shell_frontend._analyze_shell_unit(unit, budget=budget)
+        parsed = dependency_sources._parse_generated_configs(
+            analysis.program.generated_configs,
+            budget=budget,
+        )
+        return [change.destination for change in parsed.changes], analysis
+
+    root_definition = b"f(){ writer >.npmrc <<EOF\nregistry=https://root.example.invalid\nEOF\n}\n"
+    assert destinations(root_definition + b":\n")[0] == []
+    assert destinations(root_definition + b"f\n")[0] == ["https://root.example.invalid"]
+
+    transitive = (
+        b"leaf(){ writer >.npmrc <<EOF\nregistry=https://leaf.example.invalid\nEOF\n}\n"
+        b"middle(){ leaf; }\n"
+        b"top(){ middle; }\n"
+    )
+    assert destinations(transitive + b":\n")[0] == []
+    transitive_destinations, transitive_exact_analysis = destinations(transitive + b"top\n")
+    assert transitive_destinations == ["https://leaf.example.invalid"]
+    assert transitive_exact_analysis.public.issues == ()
+
+    superseded = (
+        b"f(){ writer >.npmrc <<EOF\nregistry=https://old.example.invalid\nEOF\n}\n"
+        b"f(){ writer >.npmrc <<EOF\nregistry=https://new.example.invalid\nEOF\n}\n"
+        b"f\n"
+    )
+    assert destinations(superseded)[0] == ["https://new.example.invalid"]
+
+    eval_definition = (
+        b"eval 'f(){ writer >.npmrc <<EOF\nregistry=https://eval.example.invalid\nEOF\n}'\n"
+    )
+    assert destinations(eval_definition + b":\n")[0] == []
+    assert destinations(eval_definition + b"f\n")[0] == ["https://eval.example.invalid"]
+
+    containing_eval = (
+        b"outer(){ eval 'writer >.npmrc <<EOF\nregistry=https://nested.example.invalid\nEOF\n'; }\n"
+    )
+    assert destinations(containing_eval + b":\n")[0] == []
+    assert destinations(containing_eval + b"outer\n")[0] == ["https://nested.example.invalid"]
+
+    ambiguous = (
+        b"if cond; then f(){ writer >.npmrc <<EOF\n"
+        b"registry=https://ambiguous.example.invalid\nEOF\n}; fi\n"
+        b"f\n"
+    )
+    ambiguous_destinations, ambiguous_analysis = destinations(ambiguous)
+    assert ambiguous_destinations == []
+    assert ambiguous_analysis.public.issues
+
+    dynamic_root_destinations, dynamic_root_analysis = destinations(root_definition + b'"$FN"\n')
+    assert dynamic_root_destinations == []
+    assert dynamic_root_analysis.public.issues
+
+    dynamic_nested = root_definition + b'outer(){ "$FN"; }\n'
+    inactive_destinations, inactive_analysis = destinations(dynamic_nested + b":\n")
+    assert inactive_destinations == []
+    assert inactive_analysis.public.issues == ()
+    active_destinations, active_analysis = destinations(dynamic_nested + b"outer\n")
+    assert active_destinations == []
+    assert active_analysis.public.issues
+
+    transitive_ambiguous = (
+        b"leaf(){ writer >.npmrc <<EOF\n"
+        b"registry=https://leaf.example.invalid\nEOF\n}\n"
+        b"if other; then FN=leaf; fi\n"
+        b'if cond; then mid(){ "$FN"; }; fi\n'
+        b"mid\n"
+    )
+    transitive_destinations, transitive_analysis = destinations(transitive_ambiguous)
+    assert transitive_destinations == []
+    assert transitive_analysis.public.issues
+
+    unrelated_ambiguous = (
+        b"leaf(){ writer >.npmrc <<EOF\n"
+        b"registry=https://leaf.example.invalid\nEOF\n}\n"
+        b"if cond; then mid(){ :; }; fi\n"
+        b"mid\n"
+    )
+    unrelated_destinations, unrelated_analysis = destinations(unrelated_ambiguous)
+    assert unrelated_destinations == []
+    assert unrelated_analysis.public.issues == ()
+
+    invocation_dependent = (
+        b"CFG=.npmrc\n"
+        b'f(){ writer >"$CFG" <<EOF\n'
+        b"registry=https://stale.example.invalid\nEOF\n}\n"
+        b"f\n"
+    )
+    dependent_destinations, dependent_analysis = destinations(invocation_dependent)
+    assert dependent_destinations == []
+    assert dependent_analysis.public.issues
+
+
+def test_eval_function_activation_uses_program_qualified_definition_order() -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+
+    def destinations(payload: bytes) -> tuple[list[str], Any]:
+        outer = b"f(){ writer >.npmrc <<EOF\nregistry=https://outer.example.invalid\nEOF\n}\n"
+        budget = DependencyWorkBudget()
+        unit = shell_frontend.extract_shell_units(
+            "scripts/generated.sh",
+            outer + b"eval '" + payload + b"'\n",
+            executable_paths=frozenset(),
+            budget=budget,
+        ).units[0]
+        analysis = shell_frontend._analyze_shell_unit(unit, budget=budget)
+        parsed = dependency_sources._parse_generated_configs(
+            analysis.program.generated_configs,
+            budget=budget,
+        )
+        return [change.destination for change in parsed.changes], analysis
+
+    child_definition = (
+        b"f(){ writer >.npmrc <<EOF\nregistry=https://child.example.invalid\nEOF\n}\n"
+    )
+    before_destinations, before = destinations(b"f\n" + child_definition)
+    after_destinations, after = destinations(child_definition + b"f\n")
+    both_destinations, both = destinations(b"f\n" + child_definition + b"f\n")
+    ambiguous_destinations, ambiguous = destinations(
+        b"if cond; then " + child_definition.rstrip(b"\n") + b"; fi\nf\n"
+    )
+
+    assert before_destinations == ["https://outer.example.invalid"]
+    assert before.public.issues == ()
+    assert after_destinations == ["https://child.example.invalid"]
+    assert after.public.issues == ()
+    assert both_destinations == [
+        "https://outer.example.invalid",
+        "https://child.example.invalid",
+    ]
+    assert both.public.issues == ()
+    assert ambiguous_destinations == []
+    assert ambiguous.public.issues
+
+
+@pytest.mark.parametrize("setup", [b"CFG=.npmrc\n", b"unset CFG\n"])
+def test_unquoted_function_target_limitation_follows_typed_activation(
+    setup: bytes,
+) -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+
+    def analyze(tail: bytes) -> tuple[Any, Any]:
+        raw = (
+            b"f(){ " + setup + b"writer >$CFG <<EOF\n"
+            b"registry=https://packages.example.invalid/private\nEOF\n}\n" + tail
+        )
+        budget = DependencyWorkBudget()
+        unit = shell_frontend.extract_shell_units(
+            "scripts/generated.sh",
+            raw,
+            executable_paths=frozenset(),
+            budget=budget,
+        ).units[0]
+        analysis = shell_frontend._analyze_shell_unit(unit, budget=budget)
+        parsed = dependency_sources._parse_generated_configs(
+            analysis.program.generated_configs,
+            budget=budget,
+        )
+        return analysis, parsed
+
+    inactive, inactive_parsed = analyze(b":\n")
+    active, active_parsed = analyze(b"f\n")
+
+    assert inactive.public.issues == ()
+    assert inactive.program.generated_configs == ()
+    assert inactive_parsed.changes == ()
+    assert inactive_parsed.limitations == ()
+    assert active.public.issues
+    assert active_parsed.changes == ()
+    assert active_parsed.limitations
+
+    ambiguous_raw = (
+        b"if cond; then f(){ " + setup + b"writer >$CFG <<EOF\n"
+        b"registry=https://packages.example.invalid/private\nEOF\n}; fi\n"
+        b"f\n"
+    )
+    ambiguous_budget = DependencyWorkBudget()
+    ambiguous_unit = shell_frontend.extract_shell_units(
+        "scripts/generated.sh",
+        ambiguous_raw,
+        executable_paths=frozenset(),
+        budget=ambiguous_budget,
+    ).units[0]
+    ambiguous = shell_frontend._analyze_shell_unit(
+        ambiguous_unit,
+        budget=ambiguous_budget,
+    )
+
+    assert ambiguous.program.generated_configs == ()
+    assert ambiguous.public.issues
+
+
+@pytest.mark.parametrize("target", [b"foo bar/.npmrc", b"*/.npmrc"])
+def test_generated_config_unquoted_target_expansion_is_never_resolved(
+    target: bytes,
+) -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+
+    def parse(raw: bytes) -> tuple[Any, Any]:
+        budget = DependencyWorkBudget()
+        unit = shell_frontend.extract_shell_units(
+            "scripts/generated.sh",
+            raw,
+            executable_paths=frozenset(),
+            budget=budget,
+        ).units[0]
+        analysis = shell_frontend._analyze_shell_unit(unit, budget=budget)
+        return (
+            dependency_sources._parse_generated_configs(
+                analysis.program.generated_configs,
+                budget=budget,
+            ),
+            analysis,
+        )
+
+    prefix = b"CFG='" + target + b"'\n"
+    body = b" <<EOF\nregistry=https://packages.example.invalid/private\nEOF\n"
+    unquoted, unquoted_analysis = parse(prefix + b"writer >$CFG" + body)
+    quoted, quoted_analysis = parse(prefix + b'writer >"$CFG"' + body)
+
+    assert unquoted.changes == ()
+    assert unquoted.limitations
+    assert unquoted_analysis.public.issues
+    assert [change.destination for change in quoted.changes] == [
+        "https://packages.example.invalid/REDACTED_PATH"
+    ]
+    assert quoted.limitations == ()
+    assert quoted_analysis.public.issues == ()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        (
+            b"HOST=packages.example.invalid\n"
+            b"writer >.npmrc <<EOF\nregistry=https://$HOST/private\nEOF\n"
+        ),
+        (b'HOST=packages.example.invalid\nwriter >.npmrc <<< "registry=https://$HOST/private"\n'),
+        (
+            b"REGISTRY=https://packages.example.invalid/private\n"
+            b"writer >.npmrc <<EOF\nregistry=$REGISTRY\nEOF\n"
+        ),
+        (b"writer >.npmrc <<EOF\nregistry=https://packages.example.inva\\\nlid/private\nEOF\n"),
+    ],
+)
+def test_generated_config_dispatch_encloses_proven_transformed_value_spans(raw: bytes) -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/generated.sh",
+        raw,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    frontend = shell_frontend.analyze_shell_unit(unit, budget=budget)
+
+    parsed = dependency_sources._parse_generated_configs(
+        frontend.generated_configs,
+        budget=budget,
+    )
+
+    assert parsed.limitations == ()
+    assert len(parsed.changes) == 1
+    change = parsed.changes[0]
+    assert change.destination == "https://packages.example.invalid/REDACTED_PATH"
+    assert change.destination_status.value == "resolved"
+    assert change.span.path == "scripts/generated.sh"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        (b'writer >"$DIR/.npmrc" <<EOF\nregistry=https://packages.example.invalid/private\nEOF\n'),
+        (b"writer >.npmrc <<EOF\nregistry=https://$HOST/private\nEOF\n"),
+        b"writer >.npmrc <<EOF\nregistry=$REGISTRY\nEOF\n",
+    ],
+)
+def test_generated_config_sink_confined_uncertainty_is_an_unresolved_change(raw: bytes) -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/generated.sh",
+        raw,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    analysis = shell_frontend._analyze_shell_unit(unit, budget=budget)
+
+    parsed = dependency_sources._parse_generated_configs(
+        analysis.program.generated_configs,
+        budget=budget,
+    )
+
+    assert parsed.limitations == ()
+    assert len(parsed.changes) == 1
+    change = parsed.changes[0]
+    assert change.destination == "unresolved"
+    assert change.destination_status.value == "unresolved"
+    assert change.span.path == "scripts/generated.sh"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'writer >"$TARGET" <<EOF\nregistry=https://packages.example.invalid\nEOF\n',
+        b"writer >.npmrc <<EOF\n$UNKNOWN\nEOF\n",
+    ],
+)
+def test_generated_config_structure_changing_uncertainty_is_a_limitation(raw: bytes) -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/generated.sh",
+        raw,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    analysis = shell_frontend._analyze_shell_unit(unit, budget=budget)
+
+    parsed = dependency_sources._parse_generated_configs(
+        analysis.program.generated_configs,
+        budget=budget,
+    )
+
+    assert parsed.changes == ()
+    assert len(parsed.limitations) == 1
+
+
+def test_generated_config_unknown_state_requires_code_owned_uncertainty_markers() -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    raw = b"writer >.npmrc <<EOF\nregistry=https://$HOST/private\nEOF\n"
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/generated.sh",
+        raw,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    config = shell_frontend._analyze_shell_unit(unit, budget=budget).program.generated_configs[0]
+    assert config.content_proof is not None
+    forged_raw = b"registry=https://packages.example.invalid/private\n"
+    base_forged_proof = replace(
+        config.content_proof,
+        raw_bytes=forged_raw,
+        entries=(
+            shell_frontend._GeneratedProofEntry(
+                0,
+                len(forged_raw),
+                config.span.start_byte,
+                config.span.end_byte,
+            ),
+        ),
+    )
+    fake_start = forged_raw.index(b"packages")
+    for forged_proof in (
+        replace(base_forged_proof, unknown_ranges=()),
+        replace(
+            base_forged_proof,
+            unknown_ranges=((fake_start, fake_start + len(b"packages")),),
+        ),
+    ):
+        parsed = dependency_sources._parse_generated_configs(
+            [replace(config, content_proof=forged_proof)],
+            budget=budget,
+        )
+
+        assert parsed.changes == ()
+        assert len(parsed.limitations) == 1
+
+
+def test_generated_config_unknown_state_requires_every_uncertainty_marker() -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    raw = (
+        b'HOST="$A"\nOTHER="$B"\nwriter >.npmrc <<EOF\n'
+        b"registry=https://$HOST/private\n"
+        b"@scope:registry=https://$OTHER/private\nEOF\n"
+    )
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/generated.sh",
+        raw,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    config = shell_frontend._analyze_shell_unit(unit, budget=budget).program.generated_configs[0]
+    assert config.content_proof is not None
+    assert len(config.content_proof.unknown_ranges) == 2
+
+    parsed = dependency_sources._parse_generated_configs(
+        [
+            replace(
+                config,
+                content_proof=replace(
+                    config.content_proof,
+                    unknown_ranges=config.content_proof.unknown_ranges[1:],
+                ),
+            )
+        ],
+        budget=budget,
+    )
+
+    assert parsed.changes == ()
+    assert len(parsed.limitations) == 1
+
+
+def test_generated_config_rejects_tampered_interior_physical_line_metadata() -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    raw = b'HOST="$DYNAMIC"\nwriter >.npmrc <<EOF\nregistry=https://$HOST/private\nEOF\n'
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/generated.sh",
+        raw,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    config = shell_frontend._analyze_shell_unit(unit, budget=budget).program.generated_configs[0]
+    assert config.content_proof is not None
+    starts = config.content_proof.physical_line_starts
+    assert len(starts) >= 4
+    tampered_starts = (*starts[:2], starts[2] - 1, *starts[3:])
+
+    parsed = dependency_sources._parse_generated_configs(
+        [
+            replace(
+                config,
+                content_proof=replace(
+                    config.content_proof,
+                    physical_line_starts=tampered_starts,
+                ),
+            )
+        ],
+        budget=budget,
+    )
+
+    assert parsed.changes == ()
+    assert len(parsed.limitations) == 1
+
+
+def test_generated_config_uncovered_uncertainty_fails_before_output_reservations() -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    budget = DependencyWorkBudget()
+    raw = (
+        b"writer >.npmrc <<EOF\nregistry=https://packages.example.invalid/private\n$UNKNOWN\nEOF\n"
+    )
+    unit = shell_frontend.extract_shell_units(
+        "scripts/generated.sh",
+        raw,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    analysis = shell_frontend._analyze_shell_unit(unit, budget=budget)
+
+    parsed = dependency_sources._parse_generated_configs(
+        analysis.program.generated_configs,
+        budget=budget,
+    )
+
+    assert parsed.changes == ()
+    assert len(parsed.limitations) == 1
+    assert budget.used(DependencyWorkResource.SOURCE_RECORDS) == 0
+    assert budget.used(DependencyWorkResource.EMITTED_CHANGES) == 0
+
+
+@pytest.mark.parametrize(
+    ("target", "content", "ecosystem"),
+    [
+        ("/opt/homebrew/etc/npmrc", "registry=https://packages.example.invalid\n", "npm"),
+        ("pip.conf", "[global]\nindex-url=https://packages.example.invalid\n", "pip"),
+        (".yarnrc", 'registry "https://packages.example.invalid"\n', "yarn"),
+        (".yarnrc.yml", 'npmRegistryServer: "https://packages.example.invalid"\n', "yarn"),
+        (
+            ".cargo/config.toml",
+            '[registries.internal]\nindex = "https://packages.example.invalid"\n',
+            "cargo",
+        ),
+        (
+            "pyproject.toml",
+            '[[tool.poetry.source]]\nname = "internal"\nurl = "https://packages.example.invalid"\n',
+            "poetry",
+        ),
+        (
+            "uv.toml",
+            '[[index]]\nurl = "https://packages.example.invalid"\ndefault = true\n',
+            "uv",
+        ),
+        (
+            "settings.xml",
+            "<settings><mirrors><mirror><url>https://packages.example.invalid</url>"
+            "</mirror></mirrors></settings>\n",
+            "maven",
+        ),
+    ],
+)
+def test_generated_config_dispatch_is_generic_but_evidence_stays_in_script(
+    target: str,
+    content: str,
+    ecosystem: str,
+) -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    raw = f"writer > {target} <<'EOF'\n{content}EOF\n".encode()
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/generated.sh",
+        raw,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    frontend = shell_frontend.analyze_shell_unit(unit, budget=budget)
+
+    parsed = dependency_sources._parse_generated_configs(
+        frontend.generated_configs,
+        budget=budget,
+    )
+
+    assert parsed.limitations == ()
+    assert [(change.ecosystem.value, change.surface.value) for change in parsed.changes] == [
+        (ecosystem, "generated-config")
+    ]
+    assert parsed.changes[0].span.path == "scripts/generated.sh"
+
+
+def test_generated_config_invalid_values_and_mapping_gaps_fail_closed_before_output() -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    dependency_types = importlib.import_module("skillspector.dependency_source_types")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    raw = b"writer > .npmrc <<'EOF'\nregistry=https://packages.example.invalid\nEOF\n"
+
+    def config() -> Any:
+        budget = DependencyWorkBudget()
+        unit = shell_frontend.extract_shell_units(
+            "scripts/generated.sh",
+            raw,
+            executable_paths=frozenset(),
+            budget=budget,
+        ).units[0]
+        return shell_frontend.analyze_shell_unit(unit, budget=budget).generated_configs[0]
+
+    base = config()
+    assert base.source_map is not None
+    body_entry = base.source_map.entries[0]
+    gap = len(base.content.exact_bytes) // 2
+    cases = [
+        replace(base, target=dependency_types.StaticValue.unknown()),
+        replace(base, content=dependency_types.StaticValue.unknown(), source_map=None),
+        replace(base, target=dependency_types.StaticValue.exact(b"bad\x00.npmrc")),
+        replace(base, content=dependency_types.StaticValue.exact(b"registry=\xff\n")),
+        replace(
+            base,
+            source_map=dependency_types.SourceMap(
+                path=base.span.path,
+                entries=(),
+                child_size_bytes=len(base.content.exact_bytes),
+                physical_size_bytes=len(raw),
+                physical_line_starts=(
+                    0,
+                    *(index + 1 for index, byte in enumerate(raw) if byte == 10),
+                ),
+            ),
+        ),
+        replace(
+            base,
+            source_map=dependency_types.SourceMap(
+                path=base.span.path,
+                entries=(
+                    dependency_types.SourceMapEntry(
+                        0,
+                        gap,
+                        body_entry.physical_start_byte,
+                        body_entry.physical_start_byte + gap,
+                    ),
+                    dependency_types.SourceMapEntry(
+                        gap + 1,
+                        len(base.content.exact_bytes),
+                        body_entry.physical_start_byte + gap + 1,
+                        body_entry.physical_end_byte,
+                    ),
+                ),
+                child_size_bytes=len(base.content.exact_bytes),
+                physical_size_bytes=len(raw),
+                physical_line_starts=base.source_map.physical_line_starts,
+            ),
+        ),
+    ]
+    for candidate in cases:
+        budget = DependencyWorkBudget()
+        parsed = dependency_sources._parse_generated_configs([candidate], budget=budget)
+        assert parsed.changes == ()
+        assert len(parsed.limitations) == 1
+        assert budget.used(DependencyWorkResource.SOURCE_RECORDS) == 0
+        assert budget.used(DependencyWorkResource.EMITTED_CHANGES) == 0
+
+    ignored = dependency_sources._parse_generated_configs(
+        [replace(base, target=dependency_types.StaticValue.exact(b"notes.txt"))],
+        budget=DependencyWorkBudget(),
+    )
+    assert ignored.changes == ()
+    assert ignored.limitations == ()
+
+
+def test_generated_config_private_proof_retained_collections_are_bounded() -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    dependency_types = importlib.import_module("skillspector.dependency_source_types")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    limit = dependency_types.MAX_DEPENDENCY_SOURCE_MAP_ENTRIES_PER_FILE
+
+    def proof_config(
+        raw: bytes,
+        entries: tuple[Any, ...],
+        unknown_ranges: tuple[tuple[int, int], ...],
+    ) -> Any:
+        span = dependency_types.SourceSpan(
+            "scripts/generated.sh",
+            0,
+            len(raw),
+            1,
+            1,
+        )
+        proof = shell_frontend._GeneratedValueProof(
+            raw,
+            entries,
+            unknown_ranges,
+            True,
+            span.path,
+            len(raw),
+            (0,),
+        )
+        return shell_frontend._ProvenGeneratedConfig(
+            unit_id="0" * 32,
+            provenance=dependency_types.SiteProvenance.GENERATED_CONFIG,
+            span=span,
+            target=dependency_types.StaticValue.exact(b".npmrc"),
+            content=dependency_types.StaticValue.unknown(),
+            source_map=None,
+            content_proof=proof,
+            physical_size_bytes=len(raw),
+            physical_line_starts=(0,),
+        )
+
+    entry_raw = b"x" * (limit + 1)
+    too_many_entries = tuple(
+        shell_frontend._GeneratedProofEntry(index, index + 1, index, index + 1)
+        for index in range(len(entry_raw))
+    )
+    entry_config = proof_config(entry_raw, too_many_entries, ())
+
+    unknown_raw = b"x" * ((limit + 1) * 2)
+    one_entry = (shell_frontend._GeneratedProofEntry(0, len(unknown_raw), 0, len(unknown_raw)),)
+    too_many_unknowns = tuple((index * 2, index * 2 + 1) for index in range(limit + 1))
+    unknown_config = proof_config(unknown_raw, one_entry, too_many_unknowns)
+
+    assert dependency_sources._generated_proof_view(entry_config, "content_proof") is None
+    assert dependency_sources._generated_proof_view(unknown_config, "content_proof") is None
+
+
+@pytest.mark.parametrize("transformed", [False, True])
+def test_generated_config_rejects_tampered_physical_line_metadata(
+    transformed: bool,
+) -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    raw = (
+        b"HOST=packages.example.invalid\n"
+        b"writer >.npmrc <<EOF\nregistry=https://$HOST/private\nEOF\n"
+        if transformed
+        else b"writer >.npmrc <<'EOF'\nregistry=https://packages.example.invalid/private\nEOF\n"
+    )
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/generated.sh",
+        raw,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    config = shell_frontend._analyze_shell_unit(unit, budget=budget).program.generated_configs[0]
+    assert config.source_map is not None
+    if transformed:
+        assert config.content_proof is not None
+        candidate = replace(
+            config,
+            content_proof=replace(config.content_proof, physical_line_starts=(0,)),
+        )
+    else:
+        candidate = replace(
+            config,
+            source_map=replace(config.source_map, physical_line_starts=(0,)),
+        )
+
+    parsed = dependency_sources._parse_generated_configs([candidate], budget=budget)
+
+    assert parsed.changes == ()
+    assert len(parsed.limitations) == 1
+
+
+def test_literal_maven_settings_reference_dispatches_nonstandard_bundle_file() -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    script_path = "scripts/setup.sh"
+    settings_path = "ci-settings.xml"
+    script = b"mvn -s ci-settings.xml install\n"
+    settings = (
+        b"<settings>\n"
+        b"  <mirrors><mirror>\n"
+        b"    <url>https://packages.example.invalid/repository</url>\n"
+        b"  </mirror></mirrors>\n"
+        b"</settings>\n"
+    )
+    budget = DependencyWorkBudget()
+    extraction = shell_frontend.extract_shell_units(
+        script_path,
+        script,
+        executable_paths=frozenset(),
+        budget=budget,
+    )
+    frontend = shell_frontend._analyze_shell_unit(extraction.units[0], budget=budget)
+
+    parsed = dependency_sources._parse_maven_settings_references(
+        frontend.program.execution_commands,
+        components=[script_path, settings_path],
+        local_file_cache={
+            script_path: script.decode(),
+            settings_path: settings.decode(),
+        },
+        raw_file_cache={script_path: script, settings_path: settings},
+        artifact_inventory=[
+            classify_artifact(script_path, script),
+            classify_artifact(settings_path, settings),
+        ],
+        budget=budget,
+    )
+
+    assert parsed.limitations == ()
+    assert [
+        (
+            change.ecosystem.value,
+            change.surface.value,
+            change.destination,
+            change.span.path,
+            change.span.start_line,
+        )
+        for change in parsed.changes
+    ] == [
+        (
+            "maven",
+            "maven-config",
+            "https://packages.example.invalid/REDACTED_PATH",
+            settings_path,
+            3,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (b"mvn --settings ci-settings.xml install\n", "finding"),
+        (b"mvn -s missing.xml install\n", "limitation"),
+        (b'mvn -s "$CFG" install\n', "limitation"),
+        (b'mvn "$OPT" -s ci-settings.xml install\n', "limitation"),
+        (b"mvn --file -s ci-settings.xml install\n", "limitation"),
+        (b"mvn --unknown -s ci-settings.xml install\n", "limitation"),
+        (b"mvn install -s ci-settings.xml\n", "limitation"),
+        (b"mvn -s /ci-settings.xml install\n", "limitation"),
+        (b"mvn -s ../ci-settings.xml install\n", "limitation"),
+        (b"mvn -s ci-settings.xml --settings ci-settings.xml install\n", "limitation"),
+        (b"mvn -- -s ci-settings.xml install\n", "inert"),
+        (b"mvn deploy -DaltDeploymentRepository=x::default::https://publish.invalid\n", "inert"),
+        (b"other -s ci-settings.xml\n", "inert"),
+    ],
+)
+def test_maven_settings_reference_is_literal_unique_bundle_root_only(
+    command: bytes,
+    expected: str,
+) -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    settings_path = "ci-settings.xml"
+    settings = (
+        b"<settings><mirrors><mirror>\n"
+        b"<url>https://packages.example.invalid/repository</url>\n"
+        b"</mirror></mirrors></settings>\n"
+    )
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/setup.sh",
+        command,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    frontend = shell_frontend._analyze_shell_unit(unit, budget=budget)
+    record = classify_artifact(settings_path, settings)
+
+    parsed = dependency_sources._parse_maven_settings_references(
+        frontend.program.execution_commands,
+        components=["scripts/setup.sh", settings_path],
+        local_file_cache={settings_path: settings.decode()},
+        raw_file_cache={settings_path: settings},
+        artifact_inventory=[record],
+        budget=budget,
+    )
+
+    assert len(parsed.changes) == (1 if expected == "finding" else 0)
+    assert len(parsed.limitations) == (1 if expected == "limitation" else 0)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "duplicate",
+        "raw-missing",
+        "decoded-mismatch",
+        "partial-record",
+        "size-mismatch",
+        "invalid-utf8",
+        "wrong-root",
+    ],
+)
+def test_maven_settings_reference_rejects_inconsistent_supplied_bundle_maps(
+    defect: str,
+) -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    path = "ci-settings.xml"
+    settings = (
+        b"<settings><mirrors><mirror><url>https://packages.example.invalid</url>"
+        b"</mirror></mirrors></settings>\n"
+    )
+    command = b"mvn -s ci-settings.xml install\n"
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/setup.sh",
+        command,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    commands = shell_frontend._analyze_shell_unit(unit, budget=budget).program.execution_commands
+    record = classify_artifact(path, settings)
+    active_settings = settings
+    if defect == "invalid-utf8":
+        active_settings = b"\xff"
+        record = classify_artifact(path, active_settings)
+    elif defect == "wrong-root":
+        active_settings = b"<project/>\n"
+        record = classify_artifact(path, active_settings)
+    elif defect == "partial-record":
+        record = {**record, "decodable": False}
+    elif defect == "size-mismatch":
+        record = {**record, "size_bytes": len(settings) + 1}
+    inventory = [record, record] if defect == "duplicate" else [record]
+    raw_cache = {} if defect == "raw-missing" else {path: active_settings}
+    local_cache = {
+        path: (
+            "different"
+            if defect == "decoded-mismatch"
+            else active_settings.decode("utf-8", errors="replace")
+        )
+    }
+
+    parsed = dependency_sources._parse_maven_settings_references(
+        commands,
+        components=["scripts/setup.sh", path],
+        local_file_cache=local_cache,
+        raw_file_cache=raw_cache,
+        artifact_inventory=inventory,
+        budget=budget,
+    )
+
+    assert parsed.changes == ()
+    assert len(parsed.limitations) == 1
+
+
+def test_maven_settings_reference_rejects_normalized_bundle_aliases() -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    path = "ci-settings.xml"
+    alias = "./ci-settings.xml"
+    settings = (
+        b"<settings><mirrors><mirror><url>https://packages.example.invalid</url>"
+        b"</mirror></mirrors></settings>\n"
+    )
+    conflicting = settings.replace(b"packages", b"conflict")
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/setup.sh",
+        b"mvn -s ci-settings.xml install\n",
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    commands = shell_frontend._analyze_shell_unit(
+        unit,
+        budget=budget,
+    ).program.execution_commands
+
+    parsed = dependency_sources._parse_maven_settings_references(
+        commands,
+        components=["scripts/setup.sh", path, alias],
+        local_file_cache={path: settings.decode(), alias: conflicting.decode()},
+        raw_file_cache={path: settings, alias: conflicting},
+        artifact_inventory=[
+            classify_artifact(path, settings),
+            classify_artifact(alias, conflicting),
+        ],
+        budget=budget,
+    )
+
+    assert parsed.changes == ()
+    assert len(parsed.limitations) == 1
+
+
+def test_maven_settings_reference_rejects_function_shadowed_mvn() -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    path = "ci-settings.xml"
+    settings = (
+        b"<settings><mirrors><mirror><url>https://packages.example.invalid</url>"
+        b"</mirror></mirrors></settings>\n"
+    )
+    script = b"mvn() { :; }\nmvn -s ci-settings.xml install\n"
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/setup.sh",
+        script,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    commands = shell_frontend._analyze_shell_unit(
+        unit,
+        budget=budget,
+    ).program.execution_commands
+
+    parsed = dependency_sources._parse_maven_settings_references(
+        commands,
+        components=["scripts/setup.sh", path],
+        local_file_cache={path: settings.decode()},
+        raw_file_cache={path: settings},
+        artifact_inventory=[classify_artifact(path, settings)],
+        budget=budget,
+    )
+
+    assert parsed.changes == ()
+    assert len(parsed.limitations) == 1
+
+
+@pytest.mark.parametrize(
+    ("script", "expected_limitations"),
+    [
+        (b"f() { mvn -s ci-settings.xml install; }\n", 0),
+        (b". ./defs.sh\nmvn -s ci-settings.xml install\n", 1),
+        (b"source ./defs.sh\nmvn -s ci-settings.xml install\n", 1),
+    ],
+)
+def test_maven_settings_reference_honors_private_execution_and_source_barriers(
+    script: bytes,
+    expected_limitations: int,
+) -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    path = "ci-settings.xml"
+    settings = (
+        b"<settings><mirrors><mirror><url>https://packages.example.invalid</url>"
+        b"</mirror></mirrors></settings>\n"
+    )
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/setup.sh",
+        script,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    commands = shell_frontend._analyze_shell_unit(
+        unit,
+        budget=budget,
+    ).program.execution_commands
+
+    parsed = dependency_sources._parse_maven_settings_references(
+        commands,
+        components=["scripts/setup.sh", path],
+        local_file_cache={path: settings.decode()},
+        raw_file_cache={path: settings},
+        artifact_inventory=[classify_artifact(path, settings)],
+        budget=budget,
+    )
+
+    assert parsed.changes == ()
+    assert len(parsed.limitations) == expected_limitations
+
+
+@pytest.mark.parametrize(
+    ("script", "expected_limitations"),
+    [
+        (b"run() { mvn -s ci-settings.xml install; }\nrun\n", 1),
+        (b"run() { mvn -s ci-settings.xml install; }\neval 'run'\n", 1),
+        (b"run() { eval 'mvn -s ci-settings.xml install'; }\nrun\n", 1),
+        (b"run() { sh -c 'mvn -s ci-settings.xml install'; }\nrun\n", 1),
+        (
+            b"run() { mvn -s ci-settings.xml install; }\neval 'other(){ :; }; run'\n",
+            1,
+        ),
+        (
+            b"inner() { mvn -s ci-settings.xml install; }\nouter() { inner; }\neval 'outer'\n",
+            1,
+        ),
+        (
+            b"danger() { mvn -s ci-settings.xml install; }\n"
+            b"outer() { eval 'other(){ :; }; danger'; }\nouter\n",
+            1,
+        ),
+        (
+            b"danger() { mvn -s ci-settings.xml install; }\nouter() { eval 'danger'; }\nouter\n",
+            1,
+        ),
+        (
+            b"inner() { mvn -s ci-settings.xml install; }\n"
+            b"mid() { inner; }\nouter() { eval 'mid'; }\nouter\n",
+            1,
+        ),
+        (b"run() { mvn -s ci-settings.xml install; }\n:\n", 0),
+        (b"load() { . ./defs.sh; }\nload\nmvn -s ci-settings.xml install\n", 1),
+        (b". ./defs.sh\neval 'mvn -s ci-settings.xml install'\n", 1),
+        (
+            b"load() { . ./defs.sh; }\n"
+            b"eval 'other(){ :; }; load'\n"
+            b"mvn -s ci-settings.xml install\n",
+            1,
+        ),
+    ],
+)
+def test_maven_settings_reference_fails_closed_across_typed_execution_boundaries(
+    script: bytes,
+    expected_limitations: int,
+) -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    path = "ci-settings.xml"
+    settings = (
+        b"<settings><mirrors><mirror><url>https://packages.example.invalid</url>"
+        b"</mirror></mirrors></settings>\n"
+    )
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/setup.sh",
+        script,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    commands = shell_frontend._analyze_shell_unit(
+        unit,
+        budget=budget,
+    ).program.execution_commands
+
+    parsed = dependency_sources._parse_maven_settings_references(
+        commands,
+        components=["scripts/setup.sh", path],
+        local_file_cache={path: settings.decode()},
+        raw_file_cache={path: settings},
+        artifact_inventory=[classify_artifact(path, settings)],
+        budget=budget,
+    )
+
+    assert parsed.changes == ()
+    assert len(parsed.limitations) == expected_limitations
+
+
+@pytest.mark.parametrize(
+    ("script", "expected_changes"),
+    [
+        (b"run() { eval 'mvn -s ci-settings.xml install'; }\n:\n", 0),
+        (b"run() { sh -c 'mvn -s ci-settings.xml install'; }\n:\n", 0),
+        (
+            b"load() { eval '. ./defs.sh'; }\nmvn -s ci-settings.xml install\n",
+            1,
+        ),
+    ],
+)
+def test_maven_settings_reference_preserves_uncalled_nested_function_context(
+    script: bytes,
+    expected_changes: int,
+) -> None:
+    dependency_sources = importlib.import_module("skillspector.dependency_sources")
+    shell_frontend = importlib.import_module("skillspector.shell_frontend")
+    path = "ci-settings.xml"
+    settings = (
+        b"<settings><mirrors><mirror><url>https://packages.example.invalid</url>"
+        b"</mirror></mirrors></settings>\n"
+    )
+    budget = DependencyWorkBudget()
+    unit = shell_frontend.extract_shell_units(
+        "scripts/setup.sh",
+        script,
+        executable_paths=frozenset(),
+        budget=budget,
+    ).units[0]
+    commands = shell_frontend._analyze_shell_unit(
+        unit,
+        budget=budget,
+    ).program.execution_commands
+
+    parsed = dependency_sources._parse_maven_settings_references(
+        commands,
+        components=["scripts/setup.sh", path],
+        local_file_cache={path: settings.decode()},
+        raw_file_cache={path: settings},
+        artifact_inventory=[classify_artifact(path, settings)],
+        budget=budget,
+    )
+
+    assert len(parsed.changes) == expected_changes
+    assert parsed.limitations == ()
 
 
 def test_maven_project_accepts_both_direct_repository_container_types() -> None:

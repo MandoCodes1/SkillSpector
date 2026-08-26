@@ -32,6 +32,7 @@ from skillspector.dependency_source_types import (
     DependencyWorkBudget,
     DependencyWorkExhaustion,
     DependencyWorkResource,
+    GeneratedConfig,
     ShellDialect,
     ShellExtractionResult,
     ShellFrontendResult,
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
 EXPECTED_BASH_ABI_VERSION: Final = 15
 EXPECTED_BASH_SEMANTIC_VERSION: Final = (0, 25, 1)
 MAX_TREE_SITTER_READ_BYTES: Final = 4_096
+_GENERATED_UNKNOWN_MARKER: Final = b"SKILLSPECTOR_UNRESOLVED"
 _MARKDOWN_SUFFIXES: Final = frozenset({".md", ".markdown", ".mdown", ".mkd"})
 _UNSUPPORTED_SHELL_SUFFIXES: Final = frozenset({".zsh", ".envrc", ".ksh"})
 _SUPPORTED_FENCE_DIALECTS: Final = {
@@ -703,6 +705,8 @@ class _ExecutionRegionKind(StrEnum):
 class _RedirectKind(StrEnum):
     """Narrow syntax-proven redirect facts; deliberately not an FD model."""
 
+    STDIN_HEREDOC = "stdin_heredoc"
+    STDIN_HERE_STRING = "stdin_here_string"
     STDOUT_TRUNCATE = "stdout_truncate"
     STDOUT_CLOBBER = "stdout_clobber"
     STDOUT_APPEND = "stdout_append"
@@ -859,6 +863,43 @@ class _ValueAtom:
 
 
 @dataclass(frozen=True, slots=True)
+class _GeneratedProofEntry:
+    child_start_byte: int
+    child_end_byte: int
+    physical_start_byte: int
+    physical_end_byte: int
+
+
+@dataclass(frozen=True, slots=True)
+class _GeneratedValueProof:
+    raw_bytes: bytes = field(repr=False)
+    entries: tuple[_GeneratedProofEntry, ...] = field(repr=False)
+    unknown_ranges: tuple[tuple[int, int], ...] = field(repr=False)
+    unknowns_quoted: bool
+    path: str
+    physical_size_bytes: int
+    physical_line_starts: tuple[int, ...] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _ProvenGeneratedConfig(GeneratedConfig):
+    """Private proof carried beside the stable public generated-config fields."""
+
+    target_proof: _GeneratedValueProof | None = field(default=None, repr=False, compare=False)
+    content_proof: _GeneratedValueProof | None = field(default=None, repr=False, compare=False)
+    physical_size_bytes: int = field(default=0, repr=False, compare=False)
+    physical_line_starts: tuple[int, ...] = field(default=(), repr=False, compare=False)
+    producer_program_id: str = field(default="", repr=False, compare=False)
+    producer_command_start_byte: int | None = field(default=None, repr=False, compare=False)
+    producer_function_id: int | None = field(default=None, repr=False, compare=False)
+    execution_limitation_span: SourceSpan | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class _BindingIR:
     name: str = field(repr=False)
     value: StaticValue
@@ -941,6 +982,11 @@ class _RedirectFact:
     kind: _RedirectKind
     target: _ArgumentIR
     span: SourceSpan
+    local_start_byte: int = field(default=0, repr=False)
+    expands: bool = field(default=False, repr=False)
+    complete: bool = field(default=True, repr=False)
+    value_proof: _GeneratedValueProof | None = field(default=None, repr=False)
+    execution_limitation_span: SourceSpan | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -967,8 +1013,11 @@ class _CommandIR:
     arguments: tuple[_ArgumentIR, ...]
     prefix_assignments: tuple[AssignmentSite, ...]
     redirects: tuple[_RedirectFact, ...]
+    redirects_complete: bool = True
     prefix_bindings: tuple[_BindingIR, ...] = ()
     program_id: str = field(default="", repr=False)
+    containing_function_program_id: str | None = field(default=None, repr=False)
+    containing_function_id: int | None = field(default=None, repr=False)
     execution_order: int = 0
     state_update_order: int = 0
     state_frame_id: int = 0
@@ -992,6 +1041,8 @@ class _ShellProgramIR:
     initial_functions_unknown: bool = False
     execution_commands: tuple[_CommandIR, ...] = ()
     nested_programs: tuple[_NestedProgramIR, ...] = ()
+    generated_configs: tuple[GeneratedConfig, ...] = ()
+    recovered_generated_drafts: tuple[_RecoveredGeneratedDraft, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1108,6 +1159,7 @@ class _FunctionDraft:
 
 @dataclass(frozen=True, slots=True)
 class _RedirectOwner:
+    node: Node = field(repr=False)
     statement_start_byte: int
     body_start_byte: int
     body_end_byte: int
@@ -1122,6 +1174,13 @@ class _RedirectDraft:
     node: Node = field(repr=False)
     command_start_byte: int | None
     statement_start_byte: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveredGeneratedDraft:
+    input_fact: _RedirectFact
+    output_fact: _RedirectFact
+    function_id: int | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1203,6 +1262,11 @@ class _ShellLowerer:
         self.assignment_drafts: list[_AssignmentDraft] = []
         self.redirect_owners: dict[int, _RedirectOwner] = {}
         self.redirect_drafts: list[_RedirectDraft] = []
+        self.heredoc_facts_by_statement: dict[int, list[_RedirectFact]] = {}
+        self.recovered_generated_drafts: list[_RecoveredGeneratedDraft] = []
+        self.consumed_error_nodes: set[tuple[int, int, str]] = set()
+        self.consumed_redirect_nodes: set[tuple[int, int, str]] = set()
+        self.masked_data_ranges: list[tuple[int, int]] = []
         self.wrapper_argument_drafts: list[_WrapperArgumentsDraft] = []
         self.event_drafts: list[_ShellEventDraft] = []
         self.region_chain_cache: dict[int | None, tuple[_ExecutionRegion, ...]] = {}
@@ -2309,6 +2373,895 @@ class _ShellLowerer:
         )
         return region_id
 
+    @staticmethod
+    def _normalized_heredoc_delimiter(
+        raw: bytes,
+        start: int,
+        limit: int,
+    ) -> tuple[bytes, bool, int] | None:
+        """Apply only heredoc delimiter quote removal inside an anchored header."""
+        index = start
+        while index < limit and raw[index] in {9, 32}:
+            index += 1
+        output = bytearray()
+        quoted = False
+        quote: int | None = None
+        ansi_quote = False
+        while index < limit:
+            byte = raw[index]
+            if quote is None:
+                if byte in {9, 10, 13, 32, 38, 40, 41, 59, 60, 62, 124}:
+                    break
+                if byte == 36 and index + 1 < limit and raw[index + 1] in {34, 39}:
+                    quoted = True
+                    ansi_quote = raw[index + 1] == 39
+                    quote = raw[index + 1]
+                    index += 2
+                    continue
+                if byte in {34, 39}:
+                    quoted = True
+                    quote = byte
+                    ansi_quote = False
+                    index += 1
+                    continue
+                if byte == 92:
+                    quoted = True
+                    if index + 1 >= limit:
+                        return None
+                    if raw[index + 1] == 10:
+                        index += 2
+                        continue
+                    output.append(raw[index + 1])
+                    index += 2
+                    continue
+                if byte == 0:
+                    return None
+                output.append(byte)
+                index += 1
+                continue
+            if byte == quote:
+                quote = None
+                ansi_quote = False
+                index += 1
+                continue
+            if byte == 0 or byte in {10, 13}:
+                return None
+            if byte == 92 and quote == 34:
+                if index + 1 >= limit:
+                    return None
+                following = raw[index + 1]
+                if following == 10:
+                    index += 2
+                    continue
+                if following in {34, 36, 92, 96}:
+                    output.append(following)
+                    index += 2
+                    continue
+            if byte == 92 and ansi_quote:
+                if index + 1 >= limit or raw[index + 1] not in {39, 92}:
+                    return None
+                output.append(raw[index + 1])
+                index += 2
+                continue
+            output.append(byte)
+            index += 1
+        if quote is not None or not output:
+            return None
+        return bytes(output), quoted, index
+
+    def _recovery_step(self, count: int, span: SourceSpan) -> bool:
+        if exhaustion := self.file_budget.charge_shell_cst_visits(
+            self.accounting_unit,
+            count,
+        ):
+            self._resource(exhaustion, span)
+            return False
+        return True
+
+    def _mask_data_range(self, start_byte: int, end_byte: int) -> None:
+        if end_byte <= start_byte:
+            return
+        index = bisect_left(self.masked_data_ranges, (start_byte, -1))
+        if index > 0 and self.masked_data_ranges[index - 1][1] >= start_byte:
+            index -= 1
+            start_byte = min(start_byte, self.masked_data_ranges[index][0])
+            end_byte = max(end_byte, self.masked_data_ranges[index][1])
+        right = index
+        while right < len(self.masked_data_ranges):
+            candidate_start, candidate_end = self.masked_data_ranges[right]
+            if candidate_start > end_byte:
+                break
+            end_byte = max(end_byte, candidate_end)
+            right += 1
+        self.masked_data_ranges[index:right] = [(start_byte, end_byte)]
+
+    def _is_masked_data_node(self, node: Node) -> bool:
+        index = bisect_right(self.masked_data_ranges, (node.start_byte, len(self.raw))) - 1
+        return index >= 0 and node.end_byte <= self.masked_data_ranges[index][1]
+
+    def _body_argument(
+        self,
+        start_byte: int,
+        end_byte: int,
+        *,
+        strip_tabs: bool,
+        fallback_span: SourceSpan,
+    ) -> _ArgumentIR | None:
+        output = bytearray()
+        raw_fragments: list[tuple[int, int, int, int, bool]] = []
+        if strip_tabs:
+            line_index = max(0, bisect_right(self.local_line_starts, start_byte) - 1)
+            while line_index < len(self.local_lines):
+                line = self.local_lines[line_index]
+                if line.start >= end_byte:
+                    break
+                line_index += 1
+                if line.full_end <= start_byte:
+                    continue
+                segment_start = max(line.start, start_byte)
+                segment_end = min(line.full_end, end_byte)
+                while (
+                    segment_start < min(line.content_end, segment_end)
+                    and self.raw[segment_start] == 9
+                ):
+                    segment_start += 1
+                if segment_end <= segment_start:
+                    continue
+                value_start = len(output)
+                output.extend(self.raw[segment_start:segment_end])
+                raw_fragments.append((segment_start, segment_end, value_start, len(output), True))
+        elif end_byte > start_byte:
+            output.extend(self.raw[start_byte:end_byte])
+            raw_fragments.append((start_byte, end_byte, 0, end_byte - start_byte, True))
+        fragments = self._mapped_fragments(tuple(raw_fragments), fallback_start=start_byte)
+        if fragments is None:
+            return None
+        span = self._span(start_byte, end_byte) if end_byte > start_byte else fallback_span
+        if span is None:
+            self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, fallback_span)
+            return None
+        if not self._reserve(
+            1 + len(fragments),
+            value_bytes=len(output),
+            span=span,
+        ):
+            return None
+        return _ArgumentIR(
+            StaticValue.exact(bytes(output)),
+            span,
+            fragments,
+            (),
+            start_byte,
+            end_byte,
+        )
+
+    @staticmethod
+    def _decode_heredoc_literal(
+        raw: bytes,
+        *,
+        source_start_byte: int,
+    ) -> tuple[bytes | None, tuple[tuple[int, int, int, int, bool], ...], bool]:
+        """Decode only Bash's unquoted-heredoc backslash rules."""
+        output = bytearray()
+        fragments: list[tuple[int, int, int, int, bool]] = []
+        dynamic_marker = False
+        index = 0
+        while index < len(raw):
+            byte = raw[index]
+            if byte == 0:
+                return None, (), True
+            if byte == 92 and index + 1 < len(raw):
+                following = raw[index + 1]
+                if following == 10:
+                    index += 2
+                    continue
+                if following in {36, 92, 96}:
+                    value_offset = len(output)
+                    output.append(following)
+                    self_fragment = (
+                        source_start_byte + index + 1,
+                        source_start_byte + index + 2,
+                        value_offset,
+                        value_offset + 1,
+                        True,
+                    )
+                    fragments.append(self_fragment)
+                    index += 2
+                    continue
+            if byte in {36, 96}:
+                dynamic_marker = True
+            value_offset = len(output)
+            output.append(byte)
+            _ShellLowerer._append_surviving_fragment(
+                fragments,
+                source_byte=source_start_byte + index,
+                value_byte=value_offset,
+            )
+            index += 1
+        return bytes(output), tuple(fragments), dynamic_marker
+
+    def _native_expanding_body_argument(
+        self,
+        body: Node,
+        *,
+        fallback_span: SourceSpan,
+    ) -> _ArgumentIR | None:
+        expansion_nodes = sorted(
+            (child for child in body.named_children if child.type != "heredoc_content"),
+            key=lambda child: (child.start_byte, child.end_byte),
+        )
+        atoms: list[_FoldAtom] = []
+        cursor = body.start_byte
+        literal_bytes = 0
+        for expansion in (*expansion_nodes, None):
+            end = expansion.start_byte if expansion is not None else body.end_byte
+            if end < cursor:
+                self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, fallback_span)
+                return None
+            if end > cursor:
+                literal, raw_fragments, dynamic_marker = self._decode_heredoc_literal(
+                    self.raw[cursor:end],
+                    source_start_byte=cursor,
+                )
+                if literal is None or dynamic_marker:
+                    self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, fallback_span)
+                    if not self._reserve(1, span=fallback_span):
+                        return None
+                    return _ArgumentIR(
+                        StaticValue.unknown(),
+                        fallback_span,
+                        (),
+                        (),
+                        body.start_byte,
+                        body.end_byte,
+                    )
+                literal_bytes += len(literal)
+                atoms.append(
+                    _FoldAtom(
+                        _ValueAtomKind.LITERAL,
+                        StaticValue.exact(literal),
+                        raw_fragments,
+                        cursor,
+                        end,
+                    )
+                )
+            if expansion is None:
+                break
+            name = self._simple_variable_reference(expansion)
+            if name is None:
+                span = self._node_span(expansion) or fallback_span
+                self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, span)
+                if not self._reserve(1, span=fallback_span):
+                    return None
+                return _ArgumentIR(
+                    StaticValue.unknown(),
+                    fallback_span,
+                    (),
+                    (),
+                    body.start_byte,
+                    body.end_byte,
+                )
+            atoms.append(
+                _FoldAtom(
+                    _ValueAtomKind.VARIABLE,
+                    StaticValue.unknown(),
+                    (),
+                    expansion.start_byte,
+                    expansion.end_byte,
+                    name=name,
+                    quoted=True,
+                )
+            )
+            cursor = expansion.end_byte
+        mapped_atoms = self._mapped_atoms(tuple(atoms))
+        if mapped_atoms is None:
+            return None
+        span = self._span(body.start_byte, body.end_byte) or fallback_span
+        fragment_count = sum(len(atom.fragments) for atom in mapped_atoms)
+        if not self._reserve(
+            1 + len(mapped_atoms) + fragment_count,
+            value_bytes=literal_bytes,
+            span=span,
+        ):
+            return None
+        if all(atom.kind is _ValueAtomKind.LITERAL for atom in mapped_atoms):
+            exact_value = StaticValue.exact(
+                b"".join(cast(bytes, atom.value.exact_bytes) for atom in mapped_atoms)
+            )
+            resolved_fragments: list[_ValueFragment] = []
+            output_cursor = 0
+            for atom in mapped_atoms:
+                atom_bytes = cast(bytes, atom.value.exact_bytes)
+                resolved_fragments.extend(
+                    replace(
+                        fragment,
+                        value_start_byte=output_cursor + fragment.value_start_byte,
+                        value_end_byte=output_cursor + fragment.value_end_byte,
+                    )
+                    for fragment in atom.fragments
+                )
+                output_cursor += len(atom_bytes)
+            return _ArgumentIR(
+                exact_value,
+                span,
+                tuple(resolved_fragments),
+                (),
+                body.start_byte,
+                body.end_byte,
+            )
+        return _ArgumentIR(
+            StaticValue.unknown(),
+            span,
+            (),
+            mapped_atoms,
+            body.start_byte,
+            body.end_byte,
+        )
+
+    def _fallback_body_argument(
+        self,
+        start_byte: int,
+        end_byte: int,
+        *,
+        strip_tabs: bool,
+        expands: bool,
+        fallback_span: SourceSpan,
+    ) -> _ArgumentIR | None:
+        if not expands:
+            return self._body_argument(
+                start_byte,
+                end_byte,
+                strip_tabs=strip_tabs,
+                fallback_span=fallback_span,
+            )
+        if strip_tabs:
+            literal = self._body_argument(
+                start_byte,
+                end_byte,
+                strip_tabs=True,
+                fallback_span=fallback_span,
+            )
+            if literal is None or literal.value.state is not StaticValueState.EXACT:
+                return literal
+            if not any(
+                marker in cast(bytes, literal.value.exact_bytes) for marker in (b"$", b"`", b"\\")
+            ):
+                return literal
+            self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, literal.span)
+            return replace(literal, value=StaticValue.unknown(), fragments=())
+        value, raw_fragments, dynamic_marker = self._decode_heredoc_literal(
+            self.raw[start_byte:end_byte],
+            source_start_byte=start_byte,
+        )
+        span = self._span(start_byte, end_byte) or fallback_span
+        if value is None or dynamic_marker:
+            self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, span)
+            if not self._reserve(1, span=span):
+                return None
+            return _ArgumentIR(
+                StaticValue.unknown(),
+                span,
+                (),
+                (),
+                start_byte,
+                end_byte,
+            )
+        fragments = self._mapped_fragments(raw_fragments, fallback_start=start_byte)
+        if fragments is None:
+            return None
+        if not self._reserve(
+            1 + len(fragments),
+            value_bytes=len(value),
+            span=span,
+        ):
+            return None
+        return _ArgumentIR(
+            StaticValue.exact(value),
+            span,
+            fragments,
+            (),
+            start_byte,
+            end_byte,
+        )
+
+    def _here_string_argument(self, redirect: Node, operator_start: int) -> _ArgumentIR | None:
+        destination = redirect.child_by_field_name("destination")
+        if destination is None:
+            named = redirect.named_children
+            if (
+                redirect.type != "herestring_redirect"
+                or len(named) != 1
+                or not redirect.children
+                or redirect.children[0].type != "<<<"
+            ):
+                return None
+            destination = named[0]
+        argument = self._argument(
+            _NodeGroup(
+                (destination,),
+                destination.start_byte,
+                destination.end_byte,
+                self.raw[destination.start_byte : destination.end_byte],
+            )
+        )
+        if argument is None:
+            return None
+        if argument.value.state is StaticValueState.EXACT:
+            value = cast(bytes, argument.value.exact_bytes) + b"\n"
+            if not self._reserve(1, value_bytes=1, span=argument.span):
+                return None
+            argument = replace(argument, value=StaticValue.exact(value))
+        elif argument.atoms:
+            if not self._reserve(1, value_bytes=1, span=argument.span):
+                return None
+            argument = replace(
+                argument,
+                atoms=(
+                    *argument.atoms,
+                    _ValueAtom(
+                        _ValueAtomKind.LITERAL,
+                        StaticValue.exact(b"\n"),
+                        argument.span,
+                        (),
+                        quoted=True,
+                    ),
+                ),
+            )
+        span = self._span(operator_start, redirect.end_byte)
+        if span is None:
+            self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, argument.span)
+            return None
+        return argument
+
+    def _native_heredoc_fact(self, node: Node) -> _RedirectFact | None:
+        start_node = next((child for child in node.children if child.type == "heredoc_start"), None)
+        body_node = next((child for child in node.children if child.type == "heredoc_body"), None)
+        end_node = next((child for child in node.children if child.type == "heredoc_end"), None)
+        operator_node = next(
+            (child for child in node.children if child.type in {"<<", "<<-"}),
+            None,
+        )
+        if (
+            start_node is None
+            or body_node is None
+            or end_node is None
+            or end_node.is_missing
+            or any(child.is_error or child.is_missing for child in node.children)
+        ):
+            return None
+        descriptor = node.child_by_field_name("descriptor")
+        if descriptor is not None and self.raw[descriptor.start_byte : descriptor.end_byte] != b"0":
+            self._issue(
+                ShellIssueReason.UNSUPPORTED_SEMANTICS,
+                self._node_span(descriptor) or self._point_span(descriptor.start_byte),
+            )
+            return None
+        operator = operator_node.type if operator_node is not None else ""
+        operator_start = operator_node.start_byte if operator_node is not None else node.start_byte
+        start_raw = self.raw[start_node.start_byte : start_node.end_byte]
+        if operator not in {"<<", "<<-"} or not start_raw:
+            return None
+        normalized = self._normalized_heredoc_delimiter(start_raw, 0, len(start_raw))
+        if normalized is None:
+            return None
+        delimiter, quoted, word_end = normalized
+        if word_end != len(start_raw):
+            return None
+        end_line_index = max(0, bisect_right(self.local_line_starts, end_node.start_byte) - 1)
+        end_line = self.local_lines[end_line_index]
+        candidate_start = end_line.start
+        if operator == "<<-":
+            while candidate_start < end_line.content_end and self.raw[candidate_start] == 9:
+                candidate_start += 1
+        if (
+            self.raw[candidate_start : end_line.content_end] != delimiter
+            or end_node.start_byte != candidate_start
+            or end_node.end_byte != end_line.content_end
+        ):
+            return None
+        body_line_index = max(0, bisect_right(self.local_line_starts, body_node.start_byte) - 1)
+        body_start = self.local_lines[body_line_index].start
+        operator_span = self._span(operator_start, max(operator_start + 2, start_node.end_byte))
+        if operator_span is None:
+            return None
+        argument = (
+            self._native_expanding_body_argument(
+                body_node,
+                fallback_span=operator_span,
+            )
+            if not quoted and operator == "<<" and body_node.start_byte == body_start
+            else self._fallback_body_argument(
+                body_start,
+                end_line.start,
+                strip_tabs=operator == "<<-",
+                expands=not quoted,
+                fallback_span=operator_span,
+            )
+        )
+        if argument is None:
+            return None
+        self._mask_data_range(body_start, end_line.full_end)
+        return _RedirectFact(
+            _RedirectKind.STDIN_HEREDOC,
+            argument,
+            operator_span,
+            operator_start,
+            expands=not quoted,
+        )
+
+    def _candidate_operator_nodes(
+        self, root: Node
+    ) -> tuple[list[Node], list[tuple[int, bool, Node | None, bool | None]]]:
+        nodes: list[Node] = []
+        candidates: list[tuple[int, bool, Node | None, bool | None]] = []
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            nodes.append(node)
+            children = list(node.children)
+            for index, child in enumerate(children[:-1]):
+                following = children[index + 1]
+                if not child.is_error or following.type != "file_redirect":
+                    continue
+                child_raw_end = child.end_byte
+                if following.start_byte != child_raw_end:
+                    continue
+                error_raw = self.raw[child.start_byte : child.end_byte]
+                if error_raw == b"<<":
+                    candidates.append((child.end_byte - 2, True, following, False))
+                elif error_raw.endswith(b"<"):
+                    named_types = [named.type for named in child.named_children]
+                    separate_segment = (
+                        True
+                        if named_types == ["word", "file_redirect"]
+                        else False
+                        if error_raw == b"<" and not named_types
+                        else None
+                    )
+                    candidates.append((child.end_byte - 1, False, following, separate_segment))
+            if node.type != "heredoc_body":
+                stack.extend(reversed(children))
+        return nodes, candidates
+
+    def _fallback_heredoc_facts(
+        self,
+        statement: Node,
+        heredocs: tuple[Node, ...],
+        function_id: int | None,
+    ) -> tuple[list[_RedirectFact], list[_RecoveredGeneratedDraft]] | None:
+        statement_span = self._node_span(statement) or self._point_span(statement.start_byte)
+        nodes, split_candidates = self._candidate_operator_nodes(statement)
+        if not self._recovery_step(len(nodes), statement_span):
+            return None
+        operator_candidates: dict[int, tuple[bool, Node | None, bool | None]] = {}
+        for heredoc in heredocs:
+            operator = next(
+                (child for child in heredoc.children if child.type in {"<<", "<<-"}),
+                None,
+            )
+            if operator is not None and operator.end_byte > operator.start_byte:
+                operator_candidates[operator.start_byte] = (False, None, False)
+                continue
+            start_node = next(
+                (child for child in heredoc.children if child.type == "heredoc_start"),
+                None,
+            )
+            if start_node is not None:
+                relative = self.raw[start_node.start_byte : start_node.end_byte].find(b"<<")
+                if relative >= 0:
+                    operator_candidates[start_node.start_byte + relative] = (False, None, False)
+        for position, here_candidate, redirect, separate_segment in split_candidates:
+            if position < statement.start_byte or position + 2 > statement.end_byte:
+                continue
+            if here_candidate and self.raw[position : position + 3] == b"<<<":
+                operator_candidates[position] = (True, redirect, False)
+            elif not here_candidate and self.raw[position : position + 2] in {b"<<", b"<<-"}:
+                if separate_segment is None:
+                    return None
+                operator_candidates[position] = (False, redirect, separate_segment)
+        if not operator_candidates:
+            return None
+        ordered_candidates = sorted(operator_candidates.items())
+        first_operator = ordered_candidates[0][0]
+        header_end = first_operator
+        while header_end < len(self.raw):
+            if self.raw[header_end] == 10:
+                backslashes = 0
+                cursor = header_end
+                while cursor > first_operator and self.raw[cursor - 1] == 92:
+                    backslashes += 1
+                    cursor -= 1
+                if backslashes % 2 == 0:
+                    break
+            header_end += 1
+        if header_end >= len(self.raw):
+            return None
+        if not self._recovery_step(header_end - first_operator + 1, statement_span):
+            return None
+
+        specs: list[tuple[int, bytes, bool, bool, bool, int]] = []
+        here_facts: list[_RedirectFact] = []
+        separate_input_positions: set[int] = set()
+        candidate_redirects_by_position: dict[int, Node] = {}
+        for position, (is_here_string, redirect, separate_segment) in ordered_candidates:
+            descriptor_start = position
+            while (
+                descriptor_start > statement.start_byte
+                and 48 <= self.raw[descriptor_start - 1] <= 57
+            ):
+                descriptor_start -= 1
+            descriptor = self.raw[descriptor_start:position]
+            if descriptor not in {b"", b"0"}:
+                self._issue(
+                    ShellIssueReason.UNSUPPORTED_SEMANTICS,
+                    self._span(descriptor_start, position + 2) or statement_span,
+                )
+                return None
+            if is_here_string:
+                if redirect is None:
+                    return None
+                self.consumed_redirect_nodes.add(_node_key(redirect))
+                argument = self._here_string_argument(redirect, position)
+                span = self._span(position, redirect.end_byte)
+                if argument is None or span is None:
+                    return None
+                here_facts.append(
+                    _RedirectFact(
+                        _RedirectKind.STDIN_HERE_STRING,
+                        argument,
+                        span,
+                        position,
+                        expands=True,
+                    )
+                )
+                continue
+            if redirect is not None:
+                self.consumed_redirect_nodes.add(_node_key(redirect))
+                candidate_redirects_by_position[position] = redirect
+            operator_length = 3 if self.raw[position : position + 3] == b"<<-" else 2
+            normalized = self._normalized_heredoc_delimiter(
+                self.raw,
+                position + operator_length,
+                header_end,
+            )
+            if normalized is None:
+                return None
+            delimiter, quoted, word_end = normalized
+            separator_after = self.raw[word_end : word_end + 1] == b";"
+            specs.append(
+                (position, delimiter, quoted, operator_length == 3, separator_after, word_end)
+            )
+            if separate_segment:
+                separate_input_positions.add(position)
+
+        facts: list[_RedirectFact] = list(here_facts)
+        data_cursor = header_end + 1
+        separator_after_by_position: dict[int, bool] = {}
+        word_end_by_position: dict[int, int] = {}
+        for position, delimiter, quoted, strip_tabs, separator_after, word_end in specs:
+            separator_after_by_position[position] = separator_after
+            word_end_by_position[position] = word_end
+            body_start = data_cursor
+            terminator_line: _PhysicalLine | None = None
+            line_index = max(0, bisect_right(self.local_line_starts, data_cursor) - 1)
+            while line_index < len(self.local_lines):
+                line = self.local_lines[line_index]
+                if line.start < data_cursor:
+                    line_index += 1
+                    continue
+                candidate_start = line.start
+                if strip_tabs:
+                    while candidate_start < line.content_end and self.raw[candidate_start] == 9:
+                        candidate_start += 1
+                if self.raw[candidate_start : line.content_end] == delimiter:
+                    terminator_line = line
+                    break
+                line_index += 1
+            body_end = terminator_line.start if terminator_line is not None else len(self.raw)
+            operator_span = self._span(position, position + (3 if strip_tabs else 2))
+            if operator_span is None:
+                return None
+            if not self._recovery_step(max(0, body_end - body_start), operator_span):
+                return None
+            argument = self._fallback_body_argument(
+                body_start,
+                body_end,
+                strip_tabs=strip_tabs,
+                expands=not quoted,
+                fallback_span=operator_span,
+            )
+            if argument is None:
+                return None
+            complete = terminator_line is not None
+            facts.append(
+                _RedirectFact(
+                    _RedirectKind.STDIN_HEREDOC,
+                    argument,
+                    operator_span,
+                    position,
+                    expands=not quoted,
+                    complete=complete,
+                )
+            )
+            data_end = terminator_line.full_end if terminator_line is not None else len(self.raw)
+            self._mask_data_range(body_start, data_end)
+            data_cursor = data_end
+            if not complete:
+                self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, operator_span)
+                break
+
+        recovered: list[_RecoveredGeneratedDraft] = []
+        ordered_inputs = sorted(facts, key=lambda item: item.local_start_byte)
+        if len(separate_input_positions) > 1:
+            self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, statement_span)
+            return None
+        for index, input_fact in enumerate(ordered_inputs[1:], start=1):
+            previous_input = ordered_inputs[index - 1]
+            if input_fact.local_start_byte not in separate_input_positions:
+                continue
+            if not separator_after_by_position.get(previous_input.local_start_byte, False):
+                self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, input_fact.span)
+                return None
+            proxy = candidate_redirects_by_position.get(input_fact.local_start_byte)
+            if proxy is None or proxy.end_byte != word_end_by_position.get(
+                input_fact.local_start_byte
+            ):
+                self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, input_fact.span)
+                return None
+            local_inputs = [input_fact]
+            local_outputs: list[_RedirectFact] = []
+            local_redirect_nodes = sorted(
+                (
+                    node
+                    for node in nodes
+                    if node.type in {"file_redirect", "herestring_redirect"}
+                    and previous_input.local_start_byte < node.start_byte < header_end
+                ),
+                key=lambda node: (node.start_byte, node.end_byte),
+            )
+            for redirect_node in local_redirect_nodes:
+                if _node_key(redirect_node) == _node_key(proxy):
+                    continue
+                if redirect_node.type == "herestring_redirect":
+                    operator = next(
+                        (child for child in redirect_node.children if child.type == "<<<"),
+                        None,
+                    )
+                    if operator is None:
+                        self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, input_fact.span)
+                        return None
+                    here_argument = self._here_string_argument(
+                        redirect_node,
+                        operator.start_byte,
+                    )
+                    here_span = self._span(operator.start_byte, redirect_node.end_byte)
+                    if here_argument is None or here_span is None:
+                        return None
+                    local_inputs.append(
+                        _RedirectFact(
+                            _RedirectKind.STDIN_HERE_STRING,
+                            here_argument,
+                            here_span,
+                            operator.start_byte,
+                            expands=True,
+                        )
+                    )
+                    self.consumed_redirect_nodes.add(_node_key(redirect_node))
+                    continue
+                output, _extras, supported = self._redirect_parts(
+                    _RedirectDraft(redirect_node, None, statement.start_byte),
+                    allow_fact=True,
+                )
+                if not supported or output is None:
+                    return None
+                local_outputs.append(output)
+                self.consumed_redirect_nodes.add(_node_key(redirect_node))
+            if (
+                not any(
+                    output.local_start_byte < input_fact.local_start_byte
+                    for output in local_outputs
+                )
+                or not local_outputs
+            ):
+                continue
+            final_input = max(local_inputs, key=lambda item: item.local_start_byte)
+            final_output = max(local_outputs, key=lambda item: item.local_start_byte)
+            if (
+                final_input.target.value.state is not StaticValueState.EXACT
+                or final_output.target.value.state is not StaticValueState.EXACT
+            ):
+                self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, final_input.span)
+                return None
+            recovered.append(_RecoveredGeneratedDraft(final_input, final_output, function_id))
+            for local_input in local_inputs:
+                if local_input in facts:
+                    facts.remove(local_input)
+
+        for node in nodes:
+            if node.is_missing and node.type == "heredoc_end":
+                self.consumed_error_nodes.add(_node_key(node))
+            elif node.is_error:
+                raw = self.raw[node.start_byte : node.end_byte]
+                allowed = (
+                    raw == b"&"
+                    or raw in {b"<", b"<<"}
+                    or (
+                        raw.endswith(b"<")
+                        and any(child.type == "file_redirect" for child in node.children)
+                    )
+                )
+                if not allowed:
+                    return None
+                self.consumed_error_nodes.add(_node_key(node))
+            elif node.is_missing:
+                return None
+        return facts, recovered
+
+    def _preceding_pending_heredoc_error(self, statement: Node) -> Node | None:
+        separator = statement.prev_sibling
+        candidate = separator.prev_sibling if separator is not None else None
+        follows_pending_statement = candidate is not None and (
+            candidate.end_point.row == statement.start_point.row
+            or (
+                separator is not None
+                and self.raw[separator.end_byte : statement.start_byte].strip(b" \t") == b"\\\n"
+            )
+        )
+        if (
+            separator is None
+            or separator.type not in {";", "&"}
+            or candidate is None
+            or not candidate.is_error
+            or not follows_pending_statement
+        ):
+            return None
+        child_types = {child.type for child in candidate.children}
+        return candidate if child_types & {"<<", "<<-"} and "heredoc_start" in child_types else None
+
+    def _prepare_redirected_statement(self, node: Node, function_id: int | None) -> None:
+        preceding_pending = self._preceding_pending_heredoc_error(node)
+        heredocs = tuple(
+            child
+            for index, child in enumerate(node.children)
+            if node.field_name_for_child(index) == "redirect" and child.type == "heredoc_redirect"
+        )
+        native: list[_RedirectFact] = []
+        native_complete = bool(heredocs)
+        for heredoc in heredocs:
+            fact = self._native_heredoc_fact(heredoc)
+            if fact is None:
+                native_complete = False
+                break
+            native.append(fact)
+        if preceding_pending is not None:
+            pending_span = self._node_span(preceding_pending) or self._point_span(
+                preceding_pending.start_byte
+            )
+            if self._recovery_step(len(preceding_pending.children) + 2, pending_span):
+                self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, pending_span)
+            return
+        direct_children = list(node.children)
+        has_here_string_shape = any(
+            child.is_error
+            and self.raw[child.start_byte : child.end_byte] == b"<<"
+            and index + 1 < len(direct_children)
+            and direct_children[index + 1].type == "file_redirect"
+            and direct_children[index + 1].start_byte == child.end_byte
+            and self.raw[child.start_byte : direct_children[index + 1].start_byte + 1] == b"<<<"
+            for index, child in enumerate(direct_children)
+        )
+        if native_complete and not has_here_string_shape:
+            self.heredoc_facts_by_statement[node.start_byte] = native
+            return
+        if not heredocs and not has_here_string_shape:
+            return
+        recovered = self._fallback_heredoc_facts(node, heredocs, function_id)
+        if recovered is None:
+            return
+        facts, generated = recovered
+        self.heredoc_facts_by_statement[node.start_byte] = facts
+        self.recovered_generated_drafts.extend(generated)
+
     def walk(self, root: Node) -> None:
         stack = [_WalkFrame(root, None, None, None, None, 0, None, None)]
         while stack and not self.halted:
@@ -2332,11 +3285,15 @@ class _ShellLowerer:
                         )
                     )
                 continue
+            if frame.parent_type == "program" and self._is_masked_data_node(node):
+                continue
             node_span = self._node_span(node) or self._point_span(node.start_byte)
             if exhaustion := self.file_budget.charge_shell_cst_visits(self.accounting_unit, 1):
                 self._resource(exhaustion, node_span)
                 break
             if node.is_error:
+                if _node_key(node) in self.consumed_error_nodes:
+                    continue
                 if frame.command_owner_start_byte is not None:
                     self.syntax_error_command_starts.add(frame.command_owner_start_byte)
                 if frame.redirect_owner_start_byte is not None:
@@ -2344,6 +3301,8 @@ class _ShellLowerer:
                 self._issue(ShellIssueReason.SYNTAX_ERROR, node_span)
                 continue
             if node.is_missing:
+                if _node_key(node) in self.consumed_error_nodes:
+                    continue
                 if frame.command_owner_start_byte is not None:
                     self.syntax_error_command_starts.add(frame.command_owner_start_byte)
                 if frame.redirect_owner_start_byte is not None:
@@ -2424,32 +3383,42 @@ class _ShellLowerer:
                     _AssignmentDraft(node, region_id, function_id, prefix, declaration)
                 )
             elif node.type == "redirected_statement":
+                self._prepare_redirected_statement(node, function_id)
                 body = node.child_by_field_name("body")
                 if body is not None:
                     if not self._reserve(1, span=node_span):
                         break
                     self.redirect_owners[node.start_byte] = _RedirectOwner(
+                        node,
                         node.start_byte,
                         body.start_byte,
                         body.end_byte,
                         body.type,
                         substitution_depth,
-                        any(child.is_error or child.is_missing for child in node.children),
+                        any(
+                            (child.is_error or child.is_missing)
+                            and _node_key(child) not in self.consumed_error_nodes
+                            for child in node.children
+                        ),
                         sum(
                             node.field_name_for_child(index) == "redirect"
                             for index in range(len(node.children))
                         ),
                     )
             elif node.type == "file_redirect":
+                if _node_key(node) in self.consumed_redirect_nodes:
+                    continue
                 if not self._reserve(1, span=node_span):
                     break
                 self.redirect_drafts.append(
                     _RedirectDraft(
                         node,
                         frame.parent_start_byte if frame.parent_type == "command" else None,
-                        frame.parent_start_byte
-                        if frame.parent_type == "redirected_statement"
-                        else None,
+                        (
+                            frame.parent_start_byte
+                            if frame.parent_type == "redirected_statement"
+                            else frame.redirect_owner_start_byte
+                        ),
                     )
                 )
             elif node.type == "heredoc_redirect" and frame.parent_type == "redirected_statement":
@@ -2467,6 +3436,9 @@ class _ShellLowerer:
                             cast(int, frame.parent_start_byte),
                         )
                     )
+
+            if node.type == "heredoc_body":
+                continue
 
             child_frames: list[_WalkFrame] = []
             children = list(node.children)
@@ -2646,7 +3618,7 @@ class _ShellLowerer:
             "",
         )
         unsupported = kind is None and (
-            raw_operator in {"&>>", ">&", "<&"}
+            raw_operator in {"<", "<>", "<<", "<<-", "<<<", "&>>", ">&", "<&"}
             or descriptor is not None
             or operator in _SUPPORTED_REDIRECT_OPERATORS
         )
@@ -2669,7 +3641,7 @@ class _ShellLowerer:
             return None, extras, False
         if not self._reserve(1, span=span):
             return None, extras, False
-        return _RedirectFact(kind, target, span), extras, True
+        return _RedirectFact(kind, target, span, node.start_byte), extras, True
 
     def _functions(self) -> tuple[_FunctionContext, ...]:
         functions: list[_FunctionContext] = []
@@ -3104,14 +4076,21 @@ class _ShellLowerer:
     def _has_pipeline_input(self, command: _CommandIR) -> bool:
         if self.pipeline_input_region_ids is None:
             grouped: dict[int | None, list[_ExecutionRegion]] = {}
+            regions_by_id = {region.region_id: region for region in self.regions}
             for region in self.regions:
                 if region.kind is _ExecutionRegionKind.PIPELINE_STAGE:
                     grouped.setdefault(region.parent_region_id, []).append(region)
-            self.pipeline_input_region_ids = frozenset(
-                region.region_id
-                for stages in grouped.values()
-                for region in sorted(stages, key=lambda item: item.local_start_byte)[1:]
-            )
+            input_ids: set[int] = set()
+            for stages in grouped.values():
+                ordered = sorted(stages, key=lambda item: item.local_start_byte)
+                parent_id = ordered[0].parent_region_id if ordered else None
+                pipeline = regions_by_id.get(parent_id) if parent_id is not None else None
+                first_input = bool(
+                    pipeline is not None
+                    and self.raw[pipeline.local_start_byte : pipeline.local_start_byte + 1] == b"|"
+                )
+                input_ids.update(region.region_id for region in ordered[0 if first_input else 1 :])
+            self.pipeline_input_region_ids = frozenset(input_ids)
         stage = next(
             (
                 region
@@ -3230,6 +4209,353 @@ class _ShellLowerer:
             parent.persistent_bindings_unknown or frame.persistent_bindings_unknown
         )
 
+    def _resolve_redirect_fact(
+        self,
+        fact: _RedirectFact,
+        frame: _StateFrame,
+    ) -> _RedirectFact:
+        input_fact = fact.kind in {
+            _RedirectKind.STDIN_HEREDOC,
+            _RedirectKind.STDIN_HERE_STRING,
+        }
+        unquoted_output_variable = not input_fact and any(
+            atom.kind is _ValueAtomKind.VARIABLE and not atom.quoted for atom in fact.target.atoms
+        )
+        value, fragments = self._resolve_value(
+            fact.target.value,
+            fact.target.fragments,
+            fact.target.atoms,
+            frame,
+            assignment_value=input_fact,
+            span=fact.target.span,
+        )
+        if unquoted_output_variable:
+            if value.state is StaticValueState.UNBOUND:
+                value = StaticValue.unknown()
+                fragments = ()
+            proof = None
+        else:
+            proof = self._generated_value_proof(fact.target, value, frame)
+        if fact.expands and value.state is StaticValueState.EXACT:
+            fragments = tuple(
+                fragment
+                for fragment in fragments
+                if fact.target.local_start_byte <= fragment.local_start_byte
+                and fragment.local_end_byte <= fact.target.local_end_byte
+            )
+        return replace(
+            fact,
+            target=replace(
+                fact.target,
+                value=value,
+                fragments=fragments,
+                atoms=(),
+            ),
+            value_proof=proof,
+            execution_limitation_span=(fact.target.span if unquoted_output_variable else None),
+        )
+
+    def _generated_value_proof(
+        self,
+        argument: _ArgumentIR,
+        resolved_value: StaticValue,
+        frame: _StateFrame,
+    ) -> _GeneratedValueProof | None:
+        """Retain only ordered value uncertainty needed by generated-config dispatch."""
+        if resolved_value.state is StaticValueState.UNBOUND:
+            return None
+        output = bytearray()
+        entries: list[_GeneratedProofEntry] = []
+        unknown_ranges: list[tuple[int, int]] = []
+        unknowns_quoted = True
+        saw_variable = False
+        if not argument.atoms:
+            if resolved_value.state is not StaticValueState.EXACT:
+                return None
+            output.extend(cast(bytes, resolved_value.exact_bytes))
+            entries.extend(
+                _GeneratedProofEntry(
+                    fragment.value_start_byte,
+                    fragment.value_end_byte,
+                    fragment.span.start_byte,
+                    fragment.span.end_byte,
+                )
+                for fragment in argument.fragments
+                if fragment.exact and fragment.value_end_byte > fragment.value_start_byte
+            )
+        else:
+            for atom in argument.atoms:
+                child_start = len(output)
+                if atom.kind is _ValueAtomKind.LITERAL:
+                    if atom.value.state is not StaticValueState.EXACT:
+                        return None
+                    literal = cast(bytes, atom.value.exact_bytes)
+                    output.extend(literal)
+                    for fragment in atom.fragments:
+                        if (
+                            not fragment.exact
+                            or fragment.value_end_byte <= fragment.value_start_byte
+                            or fragment.span.end_byte - fragment.span.start_byte
+                            != fragment.value_end_byte - fragment.value_start_byte
+                        ):
+                            return None
+                        entries.append(
+                            _GeneratedProofEntry(
+                                child_start + fragment.value_start_byte,
+                                child_start + fragment.value_end_byte,
+                                fragment.span.start_byte,
+                                fragment.span.end_byte,
+                            )
+                        )
+                    continue
+                saw_variable = True
+                if atom.name is None:
+                    return None
+                binding = self._lookup_binding(frame, atom.name)
+                if binding.value.state is StaticValueState.EXACT:
+                    value = cast(bytes, binding.value.exact_bytes)
+                else:
+                    value = _GENERATED_UNKNOWN_MARKER
+                    unknown_ranges.append((child_start, child_start + len(value)))
+                    unknowns_quoted = unknowns_quoted and atom.quoted
+                output.extend(value)
+                if value:
+                    entries.append(
+                        _GeneratedProofEntry(
+                            child_start,
+                            child_start + len(value),
+                            atom.span.start_byte,
+                            atom.span.end_byte,
+                        )
+                    )
+        entries.sort(key=lambda item: item.child_start_byte)
+        if any(
+            right.child_start_byte < left.child_end_byte
+            or right.physical_start_byte < left.physical_end_byte
+            for left, right in zip(entries, entries[1:], strict=False)
+        ):
+            return None
+        transformed = saw_variable or not entries or entries[0].child_start_byte != 0
+        transformed = transformed or entries[-1].child_end_byte != len(output)
+        transformed = transformed or any(
+            right.child_start_byte != left.child_end_byte
+            or right.physical_start_byte != left.physical_end_byte
+            for left, right in zip(entries, entries[1:], strict=False)
+        )
+        if not transformed:
+            return None
+        if resolved_value.state is StaticValueState.EXACT and bytes(output) != cast(
+            bytes, resolved_value.exact_bytes
+        ):
+            return None
+        if not self._reserve(
+            1 + len(entries) + len(unknown_ranges),
+            value_bytes=len(output),
+            span=argument.span,
+        ):
+            return None
+        parent_map = self.unit.source_map
+        return _GeneratedValueProof(
+            raw_bytes=bytes(output),
+            entries=tuple(entries),
+            unknown_ranges=tuple(unknown_ranges),
+            unknowns_quoted=unknowns_quoted,
+            path=self.unit.origin_span.path,
+            physical_size_bytes=(
+                parent_map.physical_size_bytes if parent_map is not None else len(self.raw)
+            ),
+            physical_line_starts=(
+                parent_map.physical_line_starts
+                if parent_map is not None
+                else self.local_line_starts
+            ),
+        )
+
+    def _generated_source_map(self, content: _ArgumentIR) -> SourceMap | None:
+        if content.value.state is not StaticValueState.EXACT:
+            return None
+        entries: list[SourceMapEntry] = []
+        for fragment in sorted(content.fragments, key=lambda item: item.value_start_byte):
+            if (
+                not fragment.exact
+                or fragment.value_end_byte <= fragment.value_start_byte
+                or fragment.span.end_byte - fragment.span.start_byte
+                != fragment.value_end_byte - fragment.value_start_byte
+            ):
+                return None
+            candidate = SourceMapEntry(
+                fragment.value_start_byte,
+                fragment.value_end_byte,
+                fragment.span.start_byte,
+                fragment.span.end_byte,
+            )
+            if entries and (
+                candidate.child_start_byte < entries[-1].child_end_byte
+                or candidate.physical_start_byte < entries[-1].physical_end_byte
+            ):
+                return None
+            if (
+                entries
+                and entries[-1].child_end_byte == candidate.child_start_byte
+                and entries[-1].physical_end_byte == candidate.physical_start_byte
+            ):
+                previous = entries[-1]
+                entries[-1] = SourceMapEntry(
+                    previous.child_start_byte,
+                    candidate.child_end_byte,
+                    previous.physical_start_byte,
+                    candidate.physical_end_byte,
+                )
+            else:
+                entries.append(candidate)
+        if exhaustion := self.file_budget.charge_source_map_entries(len(entries)):
+            self._resource(exhaustion, content.span)
+            return None
+        parent_map = self.unit.source_map
+        physical_size = parent_map.physical_size_bytes if parent_map is not None else len(self.raw)
+        physical_line_starts = (
+            parent_map.physical_line_starts if parent_map is not None else self.local_line_starts
+        )
+        try:
+            return SourceMap(
+                path=self.unit.origin_span.path,
+                entries=tuple(entries),
+                child_size_bytes=len(cast(bytes, content.value.exact_bytes)),
+                physical_size_bytes=physical_size,
+                physical_line_starts=physical_line_starts,
+            )
+        except ValueError:
+            self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, content.span)
+            return None
+
+    def _generated_config(
+        self,
+        input_fact: _RedirectFact,
+        output_fact: _RedirectFact,
+        *,
+        producer_command_start_byte: int | None,
+        producer_function_id: int | None,
+    ) -> GeneratedConfig | None:
+        target = output_fact.target.value
+        content = input_fact.target.value
+        if target.state is StaticValueState.UNBOUND or content.state is StaticValueState.UNBOUND:
+            return None
+        source_map = self._generated_source_map(input_fact.target)
+        if content.state is StaticValueState.EXACT and source_map is None:
+            self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, input_fact.target.span)
+            return None
+        span = SourceSpan(
+            output_fact.span.path,
+            min(output_fact.span.start_byte, input_fact.span.start_byte),
+            max(output_fact.span.end_byte, input_fact.target.span.end_byte),
+            min(output_fact.span.start_line, input_fact.span.start_line),
+            max(output_fact.span.end_line, input_fact.target.span.end_line),
+        )
+        if not self._reserve(1, span=span):
+            return None
+        parent_map = self.unit.source_map
+        return _ProvenGeneratedConfig(
+            unit_id=self.unit.unit_id,
+            provenance=SiteProvenance.GENERATED_CONFIG,
+            span=span,
+            target=target,
+            content=content,
+            source_map=source_map,
+            target_proof=output_fact.value_proof,
+            content_proof=input_fact.value_proof,
+            physical_size_bytes=(
+                parent_map.physical_size_bytes if parent_map is not None else len(self.raw)
+            ),
+            physical_line_starts=(
+                parent_map.physical_line_starts
+                if parent_map is not None
+                else self.local_line_starts
+            ),
+            producer_program_id=self.unit.unit_id,
+            producer_command_start_byte=producer_command_start_byte,
+            producer_function_id=producer_function_id,
+            execution_limitation_span=output_fact.execution_limitation_span,
+        )
+
+    def _tee_output_fact(self, command: _CommandIR) -> _RedirectFact | None:
+        argv = command.site.argv
+        if (
+            not argv
+            or argv[0].state is not StaticValueState.EXACT
+            or cast(bytes, argv[0].exact_bytes) != b"tee"
+        ):
+            return None
+        if command.resolution.kind is not _CommandResolutionKind.EXTERNAL:
+            self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, command.site.span)
+            return None
+        append = False
+        end_options = False
+        outputs: list[_ArgumentIR] = []
+        for argument in command.arguments[1:]:
+            if argument.value.state is not StaticValueState.EXACT:
+                self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, argument.span)
+                return None
+            literal = cast(bytes, argument.value.exact_bytes)
+            if not end_options and literal == b"--":
+                end_options = True
+                continue
+            if not end_options and literal in {b"-a", b"--append"}:
+                append = True
+                continue
+            if not end_options and literal.startswith(b"-"):
+                self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, argument.span)
+                return None
+            outputs.append(argument)
+        if len(outputs) != 1:
+            if outputs:
+                self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, command.site.span)
+            return None
+        output = outputs[0]
+        return _RedirectFact(
+            _RedirectKind.STDOUT_APPEND if append else _RedirectKind.STDOUT_TRUNCATE,
+            output,
+            output.span,
+            output.local_start_byte,
+        )
+
+    def _generated_from_command(self, command: _CommandIR) -> tuple[GeneratedConfig, ...]:
+        if not command.redirects_complete:
+            return ()
+        stdin: _RedirectFact | None = None
+        stdout: _RedirectFact | None = None
+        for fact in sorted(command.redirects, key=lambda item: item.local_start_byte):
+            if fact.kind in {
+                _RedirectKind.STDIN_HEREDOC,
+                _RedirectKind.STDIN_HERE_STRING,
+            }:
+                stdin = fact
+            elif fact.kind in {
+                _RedirectKind.STDOUT_TRUNCATE,
+                _RedirectKind.STDOUT_CLOBBER,
+                _RedirectKind.STDOUT_APPEND,
+                _RedirectKind.STDOUT_STDERR_TRUNCATE,
+            }:
+                stdout = fact
+        if stdin is None:
+            return ()
+        outputs = [stdout] if stdout is not None else []
+        tee_output = self._tee_output_fact(command)
+        if tee_output is not None:
+            outputs.append(tee_output)
+        return tuple(
+            generated
+            for output in outputs
+            if (
+                generated := self._generated_config(
+                    stdin,
+                    output,
+                    producer_command_start_byte=command.site.span.start_byte,
+                    producer_function_id=command.function_id,
+                )
+            )
+            is not None
+        )
+
     def _model_state(
         self,
         program: _ShellProgramIR,
@@ -3241,6 +4567,7 @@ class _ShellLowerer:
     ) -> Generator[_NestedRequest, _NestedResponse, _ModeledState]:
         commands = list(program.commands)
         assignments = list(program.assignments)
+        generated_configs: list[GeneratedConfig] = []
         commands_by_start = {
             command.local_start_byte: index for index, command in enumerate(commands)
         }
@@ -4306,6 +5633,9 @@ class _ShellLowerer:
                     )
                 )
             argv = tuple(argument.value for argument in arguments)
+            redirects = tuple(
+                self._resolve_redirect_fact(redirect, frame) for redirect in command.redirects
+            )
             resolution = _CommandResolution(_CommandResolutionKind.AMBIGUOUS)
             if argv[0].state is StaticValueState.EXACT:
                 command_name = cast(bytes, argv[0].exact_bytes)
@@ -4354,6 +5684,7 @@ class _ShellLowerer:
                 command,
                 site=replace(command.site, argv=argv),
                 arguments=tuple(arguments),
+                redirects=redirects,
                 prefix_assignments=tuple(
                     assignments[index].site for index in prefix_assignment_indices
                 ),
@@ -4366,6 +5697,14 @@ class _ShellLowerer:
             )
             command_execution_order += 1
             commands[command_index] = command
+            if (
+                command.resolution.kind is _CommandResolutionKind.EXTERNAL
+                and argv[0].state is StaticValueState.EXACT
+                and cast(bytes, argv[0].exact_bytes) == b"tee"
+                and self._has_pipeline_input(command)
+            ):
+                self._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, command.site.span)
+            generated_configs.extend(self._generated_from_command(command))
             modeled_assignment_indices.update(prefix_assignment_indices)
 
             declaration_keyword = (
@@ -4716,6 +6055,31 @@ class _ShellLowerer:
                     updates=updates,
                 )
 
+        for recovered in program.recovered_generated_drafts:
+            input_fact = self._resolve_redirect_fact(recovered.input_fact, root)
+            output_fact = self._resolve_redirect_fact(recovered.output_fact, root)
+            generated = self._generated_config(
+                input_fact,
+                output_fact,
+                producer_command_start_byte=None,
+                producer_function_id=recovered.function_id,
+            )
+            if generated is not None:
+                generated_configs.append(generated)
+
+        generated_configs = list(
+            {
+                (
+                    config.target,
+                    config.content,
+                    config.span.path,
+                    config.span.start_byte,
+                    config.span.end_byte,
+                ): config
+                for config in generated_configs
+            }.values()
+        )
+
         assignments = [
             assignment
             for assignment_index, assignment in enumerate(assignments)
@@ -4769,6 +6133,7 @@ class _ShellLowerer:
                 initial_bindings=retained_initial_bindings,
                 initial_functions=retained_initial_functions,
                 initial_functions_unknown=retained_initial_functions_unknown,
+                generated_configs=tuple(generated_configs),
             ),
             dict(root.bindings),
             dict(root.functions),
@@ -4813,6 +6178,19 @@ class _ShellLowerer:
                     )
                 continue
             redirects_by_command.setdefault(command_start, []).append(redirect)
+
+        heredocs_by_command: dict[int, list[_RedirectFact]] = {}
+        for statement_start, statement_facts in self.heredoc_facts_by_statement.items():
+            owner = self.redirect_owners.get(statement_start)
+            if owner is None:
+                continue
+            command_start = self._redirect_owner_command_start(
+                owner,
+                commands_by_depth,
+                starts_by_depth,
+            )
+            if command_start is not None:
+                heredocs_by_command.setdefault(command_start, []).extend(statement_facts)
 
         wrapper_arguments_by_command: dict[int, list[_NodeGroup]] = {}
         for wrapper in self.wrapper_argument_drafts:
@@ -4946,7 +6324,10 @@ class _ShellLowerer:
             if self.halted:
                 break
 
-            facts: list[_RedirectFact] = []
+            facts: list[_RedirectFact] = list(
+                heredocs_by_command.get(command_draft.node.start_byte, ())
+            )
+            redirects_complete = True
             command_prefix_start = (
                 prefix_groups[persistent_prefix_count].start_byte
                 if persistent_prefix_count < len(prefix_groups)
@@ -4958,37 +6339,13 @@ class _ShellLowerer:
                 redirects_by_command.get(command_draft.node.start_byte, ()),
                 key=lambda item: item.node.start_byte,
             )
-            redirect_chain = (
-                len(command_redirects) + command_draft.non_file_redirect_count > 1
-            ) or any(
-                (
-                    redirect.statement_start_byte is not None
-                    and (owner := self.redirect_owners.get(redirect.statement_start_byte))
-                    is not None
-                    and owner.redirect_count > 1
-                )
-                for redirect in command_redirects
-            )
-            if redirect_chain:
-                chain_span = (
-                    self._span(
-                        command_redirects[0].node.start_byte,
-                        command_redirects[-1].node.end_byte,
-                    )
-                    if command_redirects
-                    else self._node_span(command_draft.node)
-                )
-                self._issue(
-                    ShellIssueReason.UNSUPPORTED_SEMANTICS,
-                    chain_span or self._point_span(command_draft.node.start_byte),
-                )
             for redirect in command_redirects:
                 owner = (
                     self.redirect_owners.get(redirect.statement_start_byte)
                     if redirect.statement_start_byte is not None
                     else None
                 )
-                allow_fact = not redirect_chain and not (
+                allow_fact = not (
                     command_draft.node.start_byte in self.syntax_error_command_starts
                     or (
                         owner is not None
@@ -4998,10 +6355,11 @@ class _ShellLowerer:
                         )
                     )
                 )
-                fact, extras, _supported = self._redirect_parts(
+                fact, extras, supported = self._redirect_parts(
                     redirect,
                     allow_fact=allow_fact,
                 )
+                redirects_complete = redirects_complete and supported and allow_fact
                 if fact is not None:
                     facts.append(fact)
                 arguments.extend(extras)
@@ -5039,7 +6397,8 @@ class _ShellLowerer:
                     command_draft.function_id,
                     tuple(ordered_arguments),
                     prefix_sites,
-                    tuple(facts),
+                    tuple(sorted(facts, key=lambda item: item.local_start_byte)),
+                    redirects_complete,
                     local_start_byte=command_draft.node.start_byte,
                     local_end_byte=command_draft.node.end_byte,
                 )
@@ -5078,6 +6437,7 @@ class _ShellLowerer:
             functions=self._functions() if not self.halted else (),
             commands=tuple(commands),
             assignments=tuple(assignments),
+            recovered_generated_drafts=tuple(self.recovered_generated_drafts),
         )
         return program
 
@@ -5288,6 +6648,327 @@ def _retain_nested_issue(
     exhaustion: DependencyWorkExhaustion | None = None,
 ) -> None:
     lowerer._issue(reason, span, exhaustion=exhaustion)
+
+
+def _retain_typed_function_generated_configs(
+    root_lowerer: _ShellLowerer,
+    root_program: _ShellProgramIR,
+    nested_programs: tuple[_NestedProgramIR, ...],
+    commands: tuple[_CommandIR, ...],
+    configs: list[GeneratedConfig],
+) -> list[GeneratedConfig]:
+    """Publish function-body configs only through exact typed call reachability."""
+
+    type FunctionKey = tuple[str, int]
+    commands_by_key: dict[tuple[str, int], list[_CommandIR]] = {}
+    for command in commands:
+        commands_by_key.setdefault((command.program_id, command.site.span.start_byte), []).append(
+            command
+        )
+
+    programs_by_id: dict[str, list[_ShellProgramIR]] = {}
+    programs_by_id.setdefault(root_program.program_id, []).append(root_program)
+    for nested in nested_programs:
+        programs_by_id.setdefault(nested.program.program_id, []).append(nested.program)
+
+    functions_by_key: dict[FunctionKey, list[_FunctionContext]] = {}
+    function_names: dict[FunctionKey, bytes] = {}
+    for program_id, programs in programs_by_id.items():
+        for program in programs:
+            for function in program.functions:
+                key = (program_id, function.function_id)
+                functions_by_key.setdefault(key, []).append(function)
+                if function.name.state is not StaticValueState.EXACT:
+                    continue
+                name = cast(bytes, function.name.exact_bytes)
+                previous = function_names.get(key)
+                if previous is not None and previous != name:
+                    function_names.pop(key, None)
+                    continue
+                function_names[key] = name
+    functions_by_name: dict[bytes, set[FunctionKey]] = {}
+    functions_by_name_and_id: dict[tuple[bytes, int], set[FunctionKey]] = {}
+    for key, name in function_names.items():
+        functions_by_name.setdefault(name, set()).add(key)
+        functions_by_name_and_id.setdefault((name, key[1]), set()).add(key)
+
+    nested_by_program_id: dict[str, list[_NestedProgramIR]] = {}
+    for nested in nested_programs:
+        nested_by_program_id.setdefault(nested.program.program_id, []).append(nested)
+
+    unique_programs = {
+        program_id: programs[0]
+        for program_id, programs in programs_by_id.items()
+        if len(programs) == 1
+    }
+    initial_functions_by_program = {
+        program_id: dict(program.initial_functions)
+        for program_id, program in unique_programs.items()
+    }
+    regions_by_program = {
+        program_id: {region.region_id: region for region in program.regions}
+        for program_id, program in unique_programs.items()
+    }
+
+    def command_owner(command: _CommandIR) -> FunctionKey | None:
+        if command.function_id is not None:
+            return (command.program_id, command.function_id)
+        if (
+            command.containing_function_program_id is not None
+            and command.containing_function_id is not None
+        ):
+            return (
+                command.containing_function_program_id,
+                command.containing_function_id,
+            )
+        return None
+
+    def parent_program_command(program_id: str) -> tuple[str, _CommandIR] | None:
+        records = nested_by_program_id.get(program_id, ())
+        if len(records) != 1:
+            return None
+        record = records[0]
+        parents = commands_by_key.get(
+            (record.parent_program_id, record.parent_command_start_byte), ()
+        )
+        if len(parents) != 1:
+            return None
+        return record.parent_program_id, parents[0]
+
+    def resolve_function_call(command: _CommandIR) -> FunctionKey | None:
+        if (
+            command.resolution.kind is not _CommandResolutionKind.FUNCTION
+            or type(command.resolution.function_id) is not int
+            or not command.site.argv
+            or command.site.argv[0].state is not StaticValueState.EXACT
+        ):
+            return None
+        name = cast(bytes, command.site.argv[0].exact_bytes)
+        resolved_id = cast(int, command.resolution.function_id)
+        seen_programs: set[str] = set()
+        program_id: str | None = command.program_id
+        reference = command
+        while program_id is not None and program_id not in seen_programs:
+            seen_programs.add(program_id)
+            key = (program_id, resolved_id)
+            functions = functions_by_key.get(key, ())
+            function = functions[0] if len(functions) == 1 else None
+            initial_id = initial_functions_by_program.get(program_id, {}).get(name)
+            definition_region = (
+                regions_by_program.get(program_id, {}).get(function.definition_region_id)
+                if function is not None and function.definition_region_id is not None
+                else None
+            )
+            inherited_id_collision_is_ambiguous = (
+                initial_id == resolved_id
+                and reference.function_id is None
+                and definition_region is not None
+                and definition_region.kind is not _ExecutionRegionKind.PROGRAM
+            )
+            if inherited_id_collision_is_ambiguous:
+                return None
+            if (
+                function is not None
+                and function_names.get(key) == name
+                and (
+                    reference.function_id is not None
+                    or function.local_start_byte < reference.local_start_byte
+                )
+            ):
+                return key
+            if initial_id != resolved_id:
+                break
+            parent = parent_program_command(program_id)
+            if parent is None:
+                break
+            program_id, reference = parent
+        candidates = (
+            functions_by_name.get(name, set())
+            if resolved_id == _IMPORTED_FUNCTION_ID
+            else functions_by_name_and_id.get((name, resolved_id), set())
+        )
+        return next(iter(candidates)) if len(candidates) == 1 else None
+
+    owner_by_config_id: dict[int, FunctionKey | None] = {}
+    invalid_configs: set[int] = set()
+    config_functions: set[FunctionKey] = set()
+    for config in configs:
+        if type(config) is not _ProvenGeneratedConfig:
+            invalid_configs.add(id(config))
+            root_lowerer._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, config.span)
+            continue
+        proven = cast(_ProvenGeneratedConfig, config)
+        owner: FunctionKey | None
+        owner_known = True
+        if proven.producer_function_id is not None:
+            owner = (proven.producer_program_id, proven.producer_function_id)
+        elif proven.producer_command_start_byte is not None:
+            producers = commands_by_key.get(
+                (
+                    proven.producer_program_id,
+                    proven.producer_command_start_byte,
+                ),
+                (),
+            )
+            if len(producers) != 1:
+                owner = None
+                owner_known = False
+            else:
+                owner = command_owner(producers[0])
+        elif proven.producer_program_id == root_program.program_id:
+            owner = None
+        else:
+            records = nested_by_program_id.get(proven.producer_program_id, ())
+            inherited_owners: set[FunctionKey | None] = set()
+            for record in records:
+                parents = commands_by_key.get(
+                    (record.parent_program_id, record.parent_command_start_byte), ()
+                )
+                if len(parents) == 1:
+                    inherited_owners.add(command_owner(parents[0]))
+            if len(inherited_owners) != 1:
+                owner = None
+                owner_known = False
+            else:
+                owner = next(iter(inherited_owners))
+        if owner is not None and (
+            len(functions_by_key.get(owner, ())) != 1 or owner not in function_names
+        ):
+            owner_known = False
+        if not owner_known:
+            invalid_configs.add(id(config))
+            root_lowerer._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, config.span)
+            continue
+        owner_by_config_id[id(config)] = owner
+        if owner is not None:
+            config_functions.add(owner)
+
+    if not config_functions:
+        retained_root_configs: list[GeneratedConfig] = []
+        for config in configs:
+            if id(config) in invalid_configs:
+                continue
+            if owner_by_config_id[id(config)] is not None:
+                continue
+            proven = cast(_ProvenGeneratedConfig, config)
+            if proven.execution_limitation_span is not None:
+                root_lowerer._issue(
+                    ShellIssueReason.UNSUPPORTED_SEMANTICS,
+                    proven.execution_limitation_span,
+                )
+            retained_root_configs.append(config)
+        return retained_root_configs
+
+    calls_by_owner: dict[FunctionKey, set[FunctionKey]] = {}
+    root_calls: set[FunctionKey] = set()
+    unresolved_calls: list[tuple[FunctionKey | None, _CommandIR, bytes | None]] = []
+    for command in commands:
+        if not command.site.argv:
+            continue
+        owner = command_owner(command)
+        command_name: bytes | None = (
+            cast(bytes, command.site.argv[0].exact_bytes)
+            if command.site.argv[0].state is StaticValueState.EXACT
+            else None
+        )
+        if command.resolution.kind is _CommandResolutionKind.FUNCTION:
+            if command_name is None:
+                unresolved_calls.append((owner, command, None))
+                continue
+            target = resolve_function_call(command)
+            if target is None:
+                unresolved_calls.append((owner, command, command_name))
+            elif owner is None:
+                root_calls.add(target)
+            else:
+                calls_by_owner.setdefault(owner, set()).add(target)
+        elif command.resolution.kind is _CommandResolutionKind.AMBIGUOUS:
+            unresolved_calls.append((owner, command, command_name))
+
+    active_functions: set[FunctionKey] = set()
+    pending_functions = list(root_calls)
+    while pending_functions:
+        key = pending_functions.pop()
+        if key in active_functions:
+            continue
+        active_functions.add(key)
+        pending_functions.extend(calls_by_owner.get(key, ()))
+
+    reverse_calls: dict[FunctionKey, set[FunctionKey]] = {}
+    for caller, targets in calls_by_owner.items():
+        for target in targets:
+            reverse_calls.setdefault(target, set()).add(caller)
+
+    unresolved_owners_by_name: dict[bytes, set[FunctionKey]] = {}
+    dynamic_unresolved_owners: set[FunctionKey] = set()
+    for owner, _command, unresolved_name in unresolved_calls:
+        if owner is None:
+            continue
+        if unresolved_name is None:
+            dynamic_unresolved_owners.add(owner)
+        else:
+            unresolved_owners_by_name.setdefault(unresolved_name, set()).add(owner)
+
+    functions_reaching_configs = set(config_functions)
+    pending_functions = [*config_functions, *dynamic_unresolved_owners]
+    expanded_unresolved_names: set[bytes] = set()
+    while pending_functions:
+        key = pending_functions.pop()
+        if key not in functions_reaching_configs:
+            functions_reaching_configs.add(key)
+        for caller in reverse_calls.get(key, ()):
+            if caller in functions_reaching_configs:
+                continue
+            functions_reaching_configs.add(caller)
+            pending_functions.append(caller)
+        reachable_name = function_names.get(key)
+        if reachable_name is None or reachable_name in expanded_unresolved_names:
+            continue
+        expanded_unresolved_names.add(reachable_name)
+        for caller in unresolved_owners_by_name.get(reachable_name, ()):
+            if caller in functions_reaching_configs:
+                continue
+            functions_reaching_configs.add(caller)
+            pending_functions.append(caller)
+
+    reachable_names: set[bytes] = set()
+    for key in functions_reaching_configs:
+        candidate_name = function_names.get(key)
+        if candidate_name is not None:
+            reachable_names.add(candidate_name)
+    for owner, command, unresolved_name in unresolved_calls:
+        if owner is not None and owner not in active_functions:
+            continue
+        if unresolved_name is None or unresolved_name in reachable_names:
+            root_lowerer._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, command.site.span)
+
+    retained: list[GeneratedConfig] = []
+    for config in configs:
+        if id(config) in invalid_configs:
+            continue
+        owner = owner_by_config_id[id(config)]
+        if owner is None:
+            proven = cast(_ProvenGeneratedConfig, config)
+            if proven.execution_limitation_span is not None:
+                root_lowerer._issue(
+                    ShellIssueReason.UNSUPPORTED_SEMANTICS,
+                    proven.execution_limitation_span,
+                )
+            retained.append(config)
+            continue
+        if owner not in active_functions:
+            continue
+        proven = cast(_ProvenGeneratedConfig, config)
+        if proven.execution_limitation_span is not None:
+            root_lowerer._issue(
+                ShellIssueReason.UNSUPPORTED_SEMANTICS,
+                proven.execution_limitation_span,
+            )
+        if proven.target_proof is not None or proven.content_proof is not None:
+            root_lowerer._issue(ShellIssueReason.UNSUPPORTED_SEMANTICS, config.span)
+            continue
+        retained.append(config)
+    return retained
 
 
 def _run_program_queue(
@@ -5618,8 +7299,10 @@ def _run_program_queue(
     ]
 
     assignments = list(root_modeled.program.assignments)
+    generated_configs = list(root_modeled.program.generated_configs)
     for _, program in sorted(completed_nested_programs):
         assignments.extend(program.assignments)
+        generated_configs.extend(program.generated_configs)
     assignments.sort(key=lambda item: (item.site.span.start_byte, item.site.span.end_byte))
     ordered_nested_programs = tuple(sorted(nested_programs, key=lambda item: item.order))
     nested_children: dict[tuple[str, int], list[_NestedProgramIR]] = {}
@@ -5628,17 +7311,37 @@ def _run_program_queue(
             (nested.parent_program_id, nested.parent_command_start_byte), []
         ).append(nested)
     execution_commands: list[_CommandIR] = []
-    execution_stack = list(reversed(root_modeled.program.commands))
+    execution_stack: list[tuple[_CommandIR, tuple[str, int] | None]] = [
+        (command, None) for command in reversed(root_modeled.program.commands)
+    ]
     while execution_stack:
-        command = execution_stack.pop()
+        command, inherited_function = execution_stack.pop()
+        if inherited_function is not None:
+            command = replace(
+                command,
+                containing_function_program_id=inherited_function[0],
+                containing_function_id=inherited_function[1],
+            )
         execution_commands.append(command)
+        child_function = (
+            (command.program_id, command.function_id)
+            if command.function_id is not None
+            else inherited_function
+        )
         children = nested_children.get((command.program_id, command.site.span.start_byte), ())
         for child_record in reversed(children):
             for child_command in reversed(child_record.program.commands):
-                execution_stack.append(child_command)
+                execution_stack.append((child_command, child_function))
 
     ordered_commands = tuple(
         replace(command, order=index) for index, command in enumerate(execution_commands)
+    )
+    generated_configs = _retain_typed_function_generated_configs(
+        root_lowerer,
+        root_modeled.program,
+        ordered_nested_programs,
+        ordered_commands,
+        generated_configs,
     )
     combined = replace(
         root_modeled.program,
@@ -5648,6 +7351,12 @@ def _run_program_queue(
         ),
         execution_commands=ordered_commands,
         nested_programs=ordered_nested_programs,
+        generated_configs=tuple(
+            sorted(
+                generated_configs,
+                key=lambda item: (item.span.start_byte, item.span.end_byte),
+            )
+        ),
     )
     return (
         combined,
@@ -5747,6 +7456,8 @@ def _analyze_shell_unit(
             functions=(),
             commands=(),
             assignments=(),
+            generated_configs=(),
+            recovered_generated_drafts=(),
         )
     nested_work_items: tuple[ShellWorkItem, ...] = ()
     any_partial = lowerer.partial
@@ -5763,7 +7474,7 @@ def _analyze_shell_unit(
     public = ShellFrontendResult(
         commands=tuple(command.site for command in program.commands),
         assignments=tuple(assignment.site for assignment in program.assignments),
-        generated_configs=(),
+        generated_configs=program.generated_configs,
         issues=tuple(lowerer.issues),
         work_items=(_shell_work_item(unit, outcome), *nested_work_items),
     )

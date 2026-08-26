@@ -825,30 +825,37 @@ def test_private_same_parse_ir_retains_bounded_structure_without_repr_content() 
     assert "secretvalue" not in rendered
 
 
+def test_ordered_fd0_fd1_redirect_facts_retain_only_the_final_effective_values() -> None:
+    result, _budget, _unit = _analyze(b"command >first >|second 1>>.npmrc <<<first <<<final\n")
+
+    assert [
+        (config.target.exact_bytes, config.content.exact_bytes)
+        for config in result.generated_configs
+    ] == [(b".npmrc", b"final\n")]
+    assert result.issues == ()
+
+
 @pytest.mark.parametrize(
     "raw",
     [
-        b"command >first >second\n",
-        b"command >first 2>&1\n",
-        b"command <>readwrite\n",
-        b"command <<<data >output arg\n",
-        b"command >output <<EOF\nbody\nEOF\n",
-        b"command <<<first <<<second arg\n",
+        b"command >first 2>&1 <<EOF\nbody\nEOF\n",
+        b"command <>readwrite >.npmrc <<EOF\nbody\nEOF\n",
+        b"command &>>.npmrc <<EOF\nbody\nEOF\n",
+        b"command 1>&2 >.npmrc <<EOF\nbody\nEOF\n",
+        b"command <&0 >.npmrc <<EOF\nbody\nEOF\n",
+        b"command 1<<EOF >.npmrc\nbody\nEOF\n",
+        b"command 3<<EOF >.npmrc\nbody\nEOF\n",
+        b"command <<EOF <input >.npmrc\nbody\nEOF\n",
     ],
 )
-def test_redirect_chains_and_malformed_adjacent_redirects_never_retain_facts(
+def test_unsupported_descriptors_and_nonmodeled_fd_operations_fail_closed(
     raw: bytes,
 ) -> None:
-    budget = DependencyWorkBudget()
-    unit = _extract("scripts/redirect-chain.sh", raw, budget=budget).units[0]
+    result, _budget, _unit = _analyze(raw)
 
-    private = shell_frontend._analyze_shell_unit(unit, budget=budget)
-
-    assert [command.site.argv[0].exact_bytes for command in private.program.commands] == [
-        b"command"
-    ]
-    assert [fact for command in private.program.commands for fact in command.redirects] == []
-    assert private.public.work_items[0].outcome is dependency_types.ShellWorkOutcome.PARTIAL
+    assert result.generated_configs == ()
+    assert result.issues
+    assert result.work_items[0].outcome is dependency_types.ShellWorkOutcome.PARTIAL
 
 
 def test_heredoc_wrapper_argument_field_remains_structurally_proven_argv() -> None:
@@ -856,6 +863,579 @@ def test_heredoc_wrapper_argument_field_remains_structurally_proven_argv() -> No
 
     assert [_argv_bytes(command) for command in result.commands] == [(b"command", b"arg")]
     assert result.issues == ()
+
+
+def test_completed_heredoc_and_here_string_emit_policy_free_generated_configs() -> None:
+    heredoc, _budget, _unit = _analyze(
+        b"writer > .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+    )
+    here_string, _budget, _unit = _analyze(
+        b"writer > .npmrc <<< 'registry=https://packages.example.invalid'\n"
+    )
+
+    assert [
+        (config.target.exact_bytes, config.content.exact_bytes)
+        for config in heredoc.generated_configs
+    ] == [(b".npmrc", b"registry=https://packages.example.invalid\n")]
+    assert [
+        (config.target.exact_bytes, config.content.exact_bytes)
+        for config in here_string.generated_configs
+    ] == [(b".npmrc", b"registry=https://packages.example.invalid\n")]
+    assert heredoc.generated_configs[0].source_map is not None
+    mapped = heredoc.generated_configs[0].source_map.map_range(9, 41)
+    assert mapped is not None
+    assert (mapped.path, mapped.start_line, mapped.end_line) == (
+        "scripts/lower.sh",
+        2,
+        2,
+    )
+    assert heredoc.issues == ()
+    assert here_string.issues == ()
+
+
+def test_generated_target_uses_only_the_modeled_binding_at_its_write_site() -> None:
+    result, _budget, _unit = _analyze(
+        b"CFG=.npmrc\n"
+        b'writer >"$CFG" <<EOF\nregistry=https://packages.example.invalid\nEOF\n'
+        b"CFG=ignored.txt\n"
+    )
+
+    assert [config.target.exact_bytes for config in result.generated_configs] == [b".npmrc"]
+
+
+@pytest.mark.parametrize("value", [b"foo bar", b"*"])
+def test_unquoted_output_target_expansion_never_proves_one_filename(value: bytes) -> None:
+    prefix = b"DIR='" + value + b"'\n"
+    suffix = b" <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+    unquoted, _budget, _unit = _analyze(prefix + b"writer >$DIR/.npmrc" + suffix)
+    quoted, _budget, _unit = _analyze(prefix + b'writer >"$DIR/.npmrc"' + suffix)
+
+    assert len(unquoted.generated_configs) == 1
+    assert unquoted.generated_configs[0].target.state is (dependency_types.StaticValueState.UNKNOWN)
+    assert unquoted.issues
+    assert [config.target.exact_bytes for config in quoted.generated_configs] == [
+        value + b"/.npmrc"
+    ]
+    assert quoted.issues == ()
+
+
+@pytest.mark.timeout(3)
+def test_dynamic_function_calls_without_generated_configs_have_bounded_activation_work() -> None:
+    count = 10_000
+    unit_id = "0" * 32
+    span = dependency_types.SourceSpan("scripts/bounded.sh", 0, 1, 1, 1)
+    functions = tuple(
+        shell_frontend._FunctionContext(
+            index,
+            dependency_types.StaticValue.exact(b"f" + str(index).encode("ascii")),
+            span,
+            (),
+            None,
+            None,
+            index,
+            index + 1,
+        )
+        for index in range(count)
+    )
+    commands = tuple(
+        shell_frontend._CommandIR(
+            dependency_types.CommandSite(
+                unit_id,
+                dependency_types.SiteProvenance.FILE_SUFFIX,
+                span,
+                (dependency_types.StaticValue.unknown(),),
+            ),
+            index,
+            None,
+            None,
+            (),
+            (),
+            (),
+            program_id=unit_id,
+            resolution=shell_frontend._CommandResolution(
+                shell_frontend._CommandResolutionKind.AMBIGUOUS
+            ),
+        )
+        for index in range(count)
+    )
+    program = shell_frontend._ShellProgramIR(
+        program_id=unit_id,
+        functions=functions,
+        commands=commands,
+    )
+
+    class IssueSink:
+        def __init__(self) -> None:
+            self.count = 0
+
+        def _issue(self, *_args: Any, **_kwargs: Any) -> None:
+            self.count += 1
+
+    issue_sink = IssueSink()
+    retained = shell_frontend._retain_typed_function_generated_configs(
+        issue_sink,
+        program,
+        (),
+        commands,
+        [],
+    )
+
+    assert retained == []
+    assert issue_sink.count == 0
+
+    imported_count = 20_000
+    same_name_functions = tuple(
+        shell_frontend._FunctionContext(
+            index,
+            dependency_types.StaticValue.exact(b"f"),
+            span,
+            (),
+            None,
+            None,
+            index,
+            index + 1,
+        )
+        for index in range(imported_count)
+    )
+    imported_calls = tuple(
+        shell_frontend._CommandIR(
+            dependency_types.CommandSite(
+                unit_id,
+                dependency_types.SiteProvenance.FILE_SUFFIX,
+                span,
+                (dependency_types.StaticValue.exact(b"f"),),
+            ),
+            index,
+            None,
+            None,
+            (),
+            (),
+            (),
+            program_id=unit_id,
+            resolution=shell_frontend._CommandResolution(
+                shell_frontend._CommandResolutionKind.FUNCTION,
+                shell_frontend._IMPORTED_FUNCTION_ID,
+            ),
+        )
+        for index in range(imported_count)
+    )
+    imported_program = shell_frontend._ShellProgramIR(
+        program_id=unit_id,
+        functions=same_name_functions,
+        commands=imported_calls,
+    )
+    config = shell_frontend._ProvenGeneratedConfig(
+        unit_id=unit_id,
+        provenance=dependency_types.SiteProvenance.GENERATED_CONFIG,
+        span=span,
+        target=dependency_types.StaticValue.exact(b".npmrc"),
+        content=dependency_types.StaticValue.exact(b"registry=https://x.invalid\n"),
+        physical_size_bytes=1,
+        physical_line_starts=(0,),
+        producer_program_id=unit_id,
+        producer_function_id=0,
+    )
+
+    retained = shell_frontend._retain_typed_function_generated_configs(
+        issue_sink,
+        imported_program,
+        (),
+        imported_calls,
+        [config],
+    )
+
+    assert retained == []
+    assert issue_sink.count == imported_count
+
+
+def test_second_on_line_recovery_emits_only_redirect_evidence() -> None:
+    private, _budget, _unit = _analyze_private(
+        b"cat > /dev/null <<A; cat > .npmrc <<B\n"
+        b"first\n"
+        b"A\n"
+        b"registry=https://packages.example.invalid\n"
+        b"B\n"
+    )
+    result = private.public
+
+    assert [_argv_bytes(command) for command in result.commands] == [(b"cat",)]
+    assert [
+        (config.target.exact_bytes, config.content.exact_bytes)
+        for config in result.generated_configs
+        if config.target.exact_bytes == b".npmrc"
+    ] == [(b".npmrc", b"registry=https://packages.example.invalid\n")]
+    assert [fact.target.value.exact_bytes for fact in private.program.commands[0].redirects] == [
+        b"/dev/null",
+        b"first\n",
+    ]
+    assert result.issues == ()
+
+
+@pytest.mark.parametrize("separator", [b";", b" &"])
+def test_preceding_pending_heredoc_error_cannot_relabel_the_fifo_body(
+    separator: bytes,
+) -> None:
+    result, _budget, _unit = _analyze(
+        b"cat <<A >/dev/null" + separator + b" cat >.npmrc <<B\n"
+        b"first\n"
+        b"A\n"
+        b"registry=https://packages.example.invalid\n"
+        b"B\n"
+    )
+
+    assert result.generated_configs == ()
+    assert [_argv_bytes(command) for command in result.commands] == [(b"cat",), (b"cat",)]
+    assert result.issues
+    assert result.work_items[0].outcome is dependency_types.ShellWorkOutcome.PARTIAL
+
+
+@pytest.mark.parametrize("separator", [b";", b"&"])
+def test_pending_heredoc_guard_follows_one_exact_line_continuation(
+    separator: bytes,
+) -> None:
+    result, _budget, _unit = _analyze(
+        b"cat <<A >/dev/null " + separator + b" \\\ncat >.npmrc <<B\n"
+        b"registry=https://first.example.invalid\n"
+        b"A\n"
+        b"# empty\n"
+        b"B\n"
+    )
+
+    assert result.generated_configs == ()
+    assert result.issues
+    assert result.work_items[0].outcome is dependency_types.ShellWorkOutcome.PARTIAL
+
+
+@pytest.mark.parametrize("gap", [b" \\ \n", b" # not-a-continuation\n"])
+def test_pending_heredoc_guard_does_not_expand_to_near_miss_gaps(gap: bytes) -> None:
+    result, _budget, _unit = _analyze(
+        b"cat <<A >/dev/null; " + gap + b"cat >.npmrc <<B\n"
+        b"registry=https://first.example.invalid\n"
+        b"A\n"
+        b"# empty\n"
+        b"B\n"
+    )
+
+    assert result.generated_configs == ()
+    assert result.issues
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        b'<<EN"D"',
+        b'<<$"END"',
+        b"<<$'END'",
+        b"<<END\\\nMORE",
+    ],
+)
+def test_audited_missing_end_shapes_use_physical_delimiter_quote_removal(
+    header: bytes,
+) -> None:
+    delimiter = b"ENDMORE" if b"\\\n" in header else b"END"
+    result, _budget, _unit = _analyze(
+        b"writer >.npmrc "
+        + header
+        + b"\nregistry=https://packages.example.invalid\n"
+        + delimiter
+        + b"\n"
+    )
+
+    assert [config.content.exact_bytes for config in result.generated_configs] == [
+        b"registry=https://packages.example.invalid\n"
+    ]
+    assert result.issues == ()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"if true; then writer >.npmrc <<EOF\nregistry=x\nEOF\nfi\n",
+        b"command writer >.npmrc <<EOF\nregistry=x\nEOF\n",
+        b"mkdir -p . && writer >.npmrc <<EOF\nregistry=x\nEOF\n",
+        b"writer >.npmrc \\\n  <<EOF\nregistry=x\nEOF\n",
+        b"writer &>.npmrc <<EOF &\nregistry=x\nEOF\nwait\n",
+    ],
+)
+def test_audited_control_and_header_shapes_keep_the_proven_write(raw: bytes) -> None:
+    result, _budget, _unit = _analyze(raw)
+
+    assert [
+        (config.target.exact_bytes, config.content.exact_bytes)
+        for config in result.generated_configs
+    ] == [(b".npmrc", b"registry=x\n")]
+    assert result.issues == ()
+
+
+def test_tab_stripping_and_unquoted_body_line_continuation_preserve_exact_maps() -> None:
+    stripped, _budget, _unit = _analyze(
+        b"writer >.npmrc <<-EOF\n\tregistry=https://packages.example.invalid\n\tEOF\n"
+    )
+    continued, _budget, _unit = _analyze(
+        b"writer >.npmrc <<EOF\nregistry=https://packages.example.inva\\\nlid\nEOF\n"
+    )
+
+    assert stripped.generated_configs[0].content.exact_bytes == (
+        b"registry=https://packages.example.invalid\n"
+    )
+    assert continued.generated_configs[0].content.exact_bytes == (
+        b"registry=https://packages.example.invalid\n"
+    )
+    assert stripped.generated_configs[0].source_map is not None
+    assert continued.generated_configs[0].source_map is not None
+
+
+def test_explicit_fd0_and_multiple_heredocs_are_recovered_fifo_and_masked() -> None:
+    explicit, _budget, _unit = _analyze(
+        b"writer 0<<EOF >.npmrc\nregistry=https://packages.example.invalid\nEOF\n"
+    )
+    multiple, _budget, _unit = _analyze(
+        b"writer >.npmrc <<A <<B\n"
+        b"npm config set registry https://ignored.example.invalid\n"
+        b"A\n"
+        b"registry=https://packages.example.invalid\n"
+        b"B\n"
+    )
+
+    assert [config.content.exact_bytes for config in explicit.generated_configs] == [
+        b"registry=https://packages.example.invalid\n"
+    ]
+    assert [config.content.exact_bytes for config in multiple.generated_configs] == [
+        b"registry=https://packages.example.invalid\n"
+    ]
+    assert [_argv_bytes(command) for command in multiple.commands] == [(b"writer",)]
+    assert explicit.issues == ()
+    assert multiple.issues == ()
+
+
+def test_false_clean_and_unterminated_extents_mask_through_eof_and_report_partial() -> None:
+    false_clean, _budget, _unit = _analyze(
+        b"writer >.npmrc <<EOF\n"
+        b"registry=https://packages.example.invalid\n"
+        b"EOF \n"
+        b"npm config set registry https://not-a-command.example.invalid\n"
+    )
+    inert, _budget, _unit = _analyze(
+        b"writer >/dev/null <<EOF\nnpm config set registry https://not-a-command.example.invalid\n"
+    )
+
+    assert [config.target.exact_bytes for config in false_clean.generated_configs] == [b".npmrc"]
+    assert [_argv_bytes(command) for command in false_clean.commands] == [(b"writer",)]
+    assert [_argv_bytes(command) for command in inert.commands] == [(b"writer",)]
+    assert false_clean.work_items[0].outcome is dependency_types.ShellWorkOutcome.PARTIAL
+    assert inert.work_items[0].outcome is dependency_types.ShellWorkOutcome.PARTIAL
+
+
+def test_backslash_newline_delimiter_body_is_data_for_an_unrelated_target() -> None:
+    result, _budget, _unit = _analyze(
+        b"writer >/dev/null <<END\\\nMORE\n"
+        b"npm config set registry https://not-a-command.example.invalid\n"
+        b"ENDMORE\n"
+    )
+
+    assert [_argv_bytes(command) for command in result.commands] == [(b"writer",)]
+    assert result.issues == ()
+
+
+def test_unquoted_body_uses_bounded_modeled_expansion_but_quoted_body_is_literal() -> None:
+    unquoted, _budget, _unit = _analyze(
+        b"HOST=packages.example.invalid\n"
+        b"writer >.npmrc <<EOF\nregistry=https://$HOST/private\nEOF\n"
+    )
+    quoted, _budget, _unit = _analyze(
+        b"HOST=packages.example.invalid\n"
+        b"writer >.npmrc <<'EOF'\nregistry=https://$HOST/private\nEOF\n"
+    )
+    dynamic, _budget, _unit = _analyze(
+        b"writer >.npmrc <<EOF\nregistry=https://$(hostname)/private\nEOF\n"
+    )
+
+    assert unquoted.generated_configs[0].content.exact_bytes == (
+        b"registry=https://packages.example.invalid/private\n"
+    )
+    assert quoted.generated_configs[0].content.exact_bytes == (b"registry=https://$HOST/private\n")
+    assert dynamic.generated_configs[0].content.state is dependency_types.StaticValueState.UNKNOWN
+    assert dependency_types.ShellIssueReason.UNSUPPORTED_SEMANTICS in {
+        issue.reason for issue in dynamic.issues
+    }
+
+
+def test_recovered_extent_dynamic_content_and_target_remain_limitations() -> None:
+    dynamic_body, _budget, _unit = _analyze(
+        b"writer 0<<EOF >.npmrc\nregistry=https://$(hostname)/private\nEOF\n"
+    )
+    dynamic_target, _budget, _unit = _analyze(
+        b'cat >/dev/null <<A; cat >"$CFG" <<B\n'
+        b"first\nA\nregistry=https://packages.example.invalid\nB\n"
+    )
+
+    assert dynamic_body.generated_configs[0].content.state is (
+        dependency_types.StaticValueState.UNKNOWN
+    )
+    assert dynamic_target.generated_configs == ()
+    assert dynamic_body.issues
+    assert dynamic_target.issues
+
+
+def test_here_string_expansion_retains_the_shell_added_newline() -> None:
+    result, _budget, _unit = _analyze(
+        b'HOST=packages.example.invalid\nwriter >.npmrc <<< "registry=https://$HOST/private"\n'
+    )
+
+    assert result.generated_configs[0].content.exact_bytes == (
+        b"registry=https://packages.example.invalid/private\n"
+    )
+
+
+def test_narrow_external_tee_writer_and_pipeline_and_shadowing_boundaries() -> None:
+    direct, _budget, _unit = _analyze(
+        b"tee -a -- .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+    )
+    pipeline, _budget, _unit = _analyze(
+        b"cat <<EOF | tee .npmrc\nregistry=https://packages.example.invalid\nEOF\n"
+    )
+    shadowed, _budget, _unit = _analyze(
+        b"tee() { :; }\ntee .npmrc <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+    )
+
+    assert [config.target.exact_bytes for config in direct.generated_configs] == [b".npmrc"]
+    assert pipeline.generated_configs == ()
+    assert shadowed.generated_configs == ()
+    assert dependency_types.ShellIssueReason.UNSUPPORTED_SEMANTICS in {
+        issue.reason for issue in pipeline.issues
+    }
+    assert dependency_types.ShellIssueReason.UNSUPPORTED_SEMANTICS in {
+        issue.reason for issue in shadowed.issues
+    }
+
+
+def test_tee_file_operand_is_independent_of_its_stdout_redirection() -> None:
+    result, _budget, _unit = _analyze(
+        b"tee .npmrc >capture.log <<EOF\nregistry=https://packages.example.invalid\nEOF\n"
+    )
+
+    assert {config.target.exact_bytes for config in result.generated_configs} == {
+        b".npmrc",
+        b"capture.log",
+    }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"writer >.npmrc <<EOF )\nregistry=https://packages.example.invalid\nEOF\n",
+        b"writer >.npmrc <<<< value\n",
+        b"writer >.npmrc <<E\x00OF\nregistry=https://packages.example.invalid\nEOF\n",
+        b"writer >.npmrc <<EOF\nregistry=https://packages.example.invalid\x00\nEOF\n",
+        b"writer >.npmrc <<\nregistry=https://packages.example.invalid\n",
+        b"cat >/dev/null <<A cat >.npmrc <<B\nfirst\nA\nregistry=x\nB\n",
+        b"cat >/dev/null <<A; bogus x >.npmrc <<B\nfirst\nA\nregistry=x\nB\n",
+        b"cat >/dev/null <<A; cat >.npmrc <<B )\nfirst\nA\nregistry=x\nB\n",
+        b"cat >/dev/null <<A; cat >.npmrc <<B <y\nfirst\nA\nregistry=x\nB\n",
+        b"cat >/dev/null <<A; cat >.npmrc <<B x<y\nfirst\nA\nregistry=x\nB\n",
+    ],
+)
+def test_cst_recovery_near_misses_never_create_generated_evidence(raw: bytes) -> None:
+    result, _budget, _unit = _analyze(raw)
+
+    assert result.generated_configs == ()
+    assert result.issues
+    assert result.work_items[0].outcome is dependency_types.ShellWorkOutcome.PARTIAL
+
+
+@pytest.mark.parametrize(
+    ("suffix", "target", "content"),
+    [
+        (b"<<<y", b".npmrc", b"y\n"),
+        (b">.yarnrc", b".yarnrc", b"registry=x\n"),
+        (b"1>>pip.conf", b"pip.conf", b"registry=x\n"),
+        (b"&>.yarnrc", b".yarnrc", b"registry=x\n"),
+    ],
+)
+def test_recovered_second_segment_reduces_its_own_final_fd0_fd1_facts(
+    suffix: bytes,
+    target: bytes,
+    content: bytes,
+) -> None:
+    result, _budget, _unit = _analyze(
+        b"cat >/dev/null <<A; cat >.npmrc <<B " + suffix + b"\nfirst\nA\nregistry=x\nB\n"
+    )
+
+    configs = [
+        (config.target.exact_bytes, config.content.exact_bytes)
+        for config in result.generated_configs
+        if config.target.exact_bytes != b"/dev/null"
+    ]
+    assert configs == [(target, content)]
+
+
+def test_recovery_and_generated_mapping_respect_exact_and_one_over_budgets() -> None:
+    raw = (
+        b"cat >/dev/null <<A; cat >.npmrc <<B\n"
+        b"first\nA\nregistry=https://packages.example.invalid\nB\n"
+    )
+    baseline_budget = DependencyWorkBudget()
+    unit = _extract("scripts/recovery-budget.sh", raw, budget=baseline_budget).units[0]
+    baseline = shell_frontend.analyze_shell_unit(unit, budget=baseline_budget)
+    assert baseline.work_items[0].outcome is dependency_types.ShellWorkOutcome.COMPLETED
+    baseline_file = baseline_budget.for_file(unit.origin_span.path)
+    required = {
+        dependency_types.DependencyWorkResource.SHELL_CST_VISITS: (
+            baseline_file.used_for_unit(
+                unit,
+                dependency_types.DependencyWorkResource.SHELL_CST_VISITS,
+            )
+        ),
+        dependency_types.DependencyWorkResource.RETAINED_SHELL_IR: baseline_budget.used(
+            dependency_types.DependencyWorkResource.RETAINED_SHELL_IR
+        ),
+        dependency_types.DependencyWorkResource.SHELL_RETAINED_VALUE_BYTES: (
+            baseline_file.used(dependency_types.DependencyWorkResource.SHELL_RETAINED_VALUE_BYTES)
+        ),
+        dependency_types.DependencyWorkResource.SHELL_SOURCE_MAP_ENTRIES: (
+            baseline_file.used(dependency_types.DependencyWorkResource.SHELL_SOURCE_MAP_ENTRIES)
+        ),
+    }
+    limits = {
+        dependency_types.DependencyWorkResource.SHELL_CST_VISITS: (
+            dependency_types.DEPENDENCY_SHELL_CST_VISIT_FACTOR * len(raw)
+            + dependency_types.DEPENDENCY_SHELL_CST_VISIT_BASE
+        ),
+        dependency_types.DependencyWorkResource.RETAINED_SHELL_IR: (
+            dependency_types.MAX_DEPENDENCY_RETAINED_SHELL_IR
+        ),
+        dependency_types.DependencyWorkResource.SHELL_RETAINED_VALUE_BYTES: (
+            dependency_types.MAX_DEPENDENCY_SHELL_VALUE_BYTES_PER_FILE
+        ),
+        dependency_types.DependencyWorkResource.SHELL_SOURCE_MAP_ENTRIES: (
+            dependency_types.MAX_DEPENDENCY_SOURCE_MAP_ENTRIES_PER_FILE
+        ),
+    }
+
+    for resource, required_count in required.items():
+        assert required_count > 0
+        for extra, expected in [(0, "completed"), (1, "partial")]:
+            budget = DependencyWorkBudget()
+            file_budget = budget.for_file(unit.origin_span.path)
+            file_budget.register_shell_file_size(len(raw))
+            precharge = limits[resource] - required_count + extra
+            if resource is dependency_types.DependencyWorkResource.SHELL_CST_VISITS:
+                exhaustion = file_budget.charge_shell_cst_visits(unit, precharge)
+            elif resource is dependency_types.DependencyWorkResource.RETAINED_SHELL_IR:
+                exhaustion = file_budget.charge_retained_shell_ir(unit, precharge)
+            elif resource is dependency_types.DependencyWorkResource.SHELL_RETAINED_VALUE_BYTES:
+                exhaustion = file_budget.reserve_shell_value_bytes(precharge)
+            else:
+                exhaustion = file_budget.charge_source_map_entries(precharge)
+            assert exhaustion is None
+
+            result = shell_frontend.analyze_shell_unit(unit, budget=budget)
+
+            assert result.work_items[0].outcome.value == expected
+            if extra:
+                assert dependency_types.ShellIssueReason.RESOURCE_LIMIT in {
+                    issue.reason for issue in result.issues
+                }
 
 
 def test_assignment_value_fragments_are_charged_as_retained_private_ir(
