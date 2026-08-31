@@ -46,15 +46,19 @@ ANALYZER_ID = "static_patterns_excessive_agency"
 EA1_PATTERNS = [
     # Same-line wildcard grant. The key may be quoted (JSON). A quoted '*' is
     # unambiguous as a scalar or a top-level list element — the list branch
-    # excludes '{'/'}' so a '*' nested inside an explicit tool object
-    # (tools: [{name: grep, pattern: "*"}]) is an argument value, not a
-    # grant. A bare '*' counts only when it ends the line (optionally closed
-    # by ']' and/or a '#' comment), so a footnote legend like
-    # "Tools: * = requires auth" is not a grant. The gap around the colon
-    # stays on one line so the match can never bridge paragraphs (#405, #444).
+    # excludes '{', '}', and '[' so it never descends into a nested object or
+    # array: in tools: [{name: grep, pattern: "*"}] or
+    # tools: ["search", ["grep", "*"]] the '*' is not a top-level tool-list
+    # element and is not a grant. (Ceiling: a quoted element containing one
+    # of those delimiters before a genuine top-level "*" also stops the scan;
+    # walking quoted strings needs a parser, not a pattern.) A bare '*'
+    # counts only when it ends the line (optionally closed by ']' and/or a
+    # '#' comment), so a footnote legend like "Tools: * = requires auth" is
+    # not a grant. The gap around the colon stays on one line so the match
+    # can never bridge paragraphs (#405, #444).
     (
         r"['\"]?(?:tools?|permissions?)['\"]?[ \t]*:[ \t]*"
-        r"(?:\[[^\]{}\r\n]*['\"]\*['\"]"
+        r"(?:\[[^\][{}\r\n]*['\"]\*['\"]"
         r"|\[?[ \t]*['\"]\*['\"]"
         r"|\[?[ \t]*\*(?![\*\w])[ \t]*\]?[ \t]*(?:#[^\r\n]*)?\r?$)",
         0.85,

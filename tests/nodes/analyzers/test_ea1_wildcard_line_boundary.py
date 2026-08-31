@@ -258,3 +258,21 @@ class TestEA1NestedObjectArgumentNotFlagged:
             "markdown",
         )
         assert any(f.rule_id == "EA1" for f in findings)
+
+    def test_nested_array_wildcard_not_flagged(self) -> None:
+        """A '*' inside a nested array is not a top-level tool-list element."""
+        findings = ea_module.analyze(
+            'tools: ["search", ["grep", "*"]]\n',
+            "SKILL.md",
+            "markdown",
+        )
+        assert not any(f.rule_id == "EA1" for f in findings)
+
+    def test_json_tool_object_with_nested_arguments_not_flagged(self) -> None:
+        """A '*' buried in a named tool's argument object is not a grant."""
+        findings = ea_module.analyze(
+            '"tools": [{"name": "search", "arguments": {"glob": "*"}}]\n',
+            "config.json",
+            "json",
+        )
+        assert not any(f.rule_id == "EA1" for f in findings)
